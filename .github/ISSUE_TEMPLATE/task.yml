@@ -1,0 +1,47 @@
+name: Task
+description: A piece of work to build
+title: "[folder] "
+labels: ["task"]
+body:
+  - type: dropdown
+    id: folder
+    attributes:
+      label: Folder
+      options:
+        - agent
+        - api
+        - store
+        - run
+        - train
+        - infer
+        - drop
+        - console
+        - cli
+        - shared
+        - ops
+        - docs
+        - .github
+    validations:
+      required: true
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What should work when this is done?
+    validations:
+      required: true
+  - type: textarea
+    id: done
+    attributes:
+      label: Done when
+      description: A checklist of what must be true to close this Issue.
+      placeholder: |
+        - [ ]
+        - [ ]
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Links, ideas, blockers.

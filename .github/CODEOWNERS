@@ -1,0 +1,22 @@
+# Each folder has one owner. Replace @QuantumSenpai with the owner's GitHub username.
+# A pull request that changes a folder needs review from that folder's owner.
+
+# Default owner for anything not listed below
+*             @QuantumSenpai
+
+# Services
+/agent/       @QuantumSenpai
+/api/         @QuantumSenpai
+/store/       @QuantumSenpai
+/run/         @QuantumSenpai
+/train/       @QuantumSenpai
+/infer/       @QuantumSenpai
+/drop/        @QuantumSenpai
+/console/     @QuantumSenpai
+/cli/         @QuantumSenpai
+
+# Shared and project files
+/shared/      @QuantumSenpai
+/ops/         @QuantumSenpai
+/docs/        @QuantumSenpai
+/.github/     @QuantumSenpai

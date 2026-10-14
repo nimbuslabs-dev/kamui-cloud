@@ -1,6 +1,41 @@
+# Secrets
 .env
+.env.*
+*.pem
+*.key
+
+# OS and editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Rust
+target/
+
+# Go
+bin/
+*.exe
+*.test
+*.out
+
+# Python
 .venv/
 __pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Node
 node_modules/
-*.pem
-.DS_Store
+.next/
+dist/
+
+# Data and models (never commit)
+*.safetensors
+*.ckpt
+*.pt
+*.gguf
+*.bin
+data/
+datasets/

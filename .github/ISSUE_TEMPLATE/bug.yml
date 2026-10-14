@@ -1,0 +1,55 @@
+name: Bug report
+description: Something is not working
+title: "[folder] bug: "
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: folder
+    attributes:
+      label: Folder
+      options:
+        - agent
+        - api
+        - store
+        - run
+        - train
+        - infer
+        - drop
+        - console
+        - cli
+        - shared
+        - ops
+        - docs
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1.
+        2.
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Machine and OS
+      placeholder: "M5 MacBook, macOS 26 / Windows 11 / Ubuntu 24.04"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      render: shell
