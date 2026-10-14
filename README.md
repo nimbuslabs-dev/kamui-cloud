@@ -149,7 +149,7 @@ Progress is tracked on the project board and in [Issues](https://github.com/nimb
 
 ## Contributing
 
-We use a branch and pull request workflow. Every change goes through review by the folder owner. Please read [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide.
+Everyone works in their own folder and pushes straight to `main`, so nobody gets conflicts. Please read [CONTRIBUTING.md](CONTRIBUTING.md) for the simple workflow.
 
 ## License
 

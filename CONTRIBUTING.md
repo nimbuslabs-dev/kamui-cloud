@@ -1,30 +1,61 @@
 # Contributing to Kamui Cloud
 
-Thank you for helping build Kamui. This guide explains how we work. Please follow it so the project stays clean for everyone.
+A simple workflow, built so nobody gets conflicts.
 
-## Table of contents
+## The idea
 
-- [Ground rules](#ground-rules)
-- [Folders, owners and languages](#folders-owners-and-languages)
-- [Workflow](#workflow)
-- [Branch names](#branch-names)
-- [Commit messages](#commit-messages)
-- [Pull requests](#pull-requests)
-- [Code standards](#code-standards)
-- [What never goes in the repo](#what-never-goes-in-the-repo)
-- [Getting help](#getting-help)
+- Every person owns one folder. Work **only in your folder**.
+- Nobody touches the same files, so conflicts do not happen.
+- Everyone pushes straight to `main`. No pull requests.
 
-## Ground rules
+## One-time setup
 
-1. Never push directly to `main`. Every change goes through a pull request.
-2. Work inside your own folder. For changes in another folder, ask the owner or open an Issue.
-3. Keep pull requests small and focused (one folder, one to two days of work).
-4. Every task starts as an Issue.
-5. Code and decisions live on GitHub. Use WhatsApp only for quick talk.
+1. Accept the invite for the GitHub organization `nimbuslabs-dev` and turn on 2FA.
+2. Install Git, GitHub CLI (`gh`) and VS Code. Rust, Go and Docker come later.
+3. Log in:
+   ```bash
+   gh auth login
+   gh auth setup-git
+   ```
+4. Download the project:
+   ```bash
+   git clone https://github.com/nimbuslabs-dev/kamui-cloud.git
+   cd kamui-cloud
+   ```
 
-## Folders, owners and languages
+## Daily workflow
 
-Each folder has one owner, listed in [`.github/CODEOWNERS`](.github/CODEOWNERS). The owner reviews every pull request that touches the folder.
+```bash
+cd ~/kamui-cloud
+git pull                              # 1. get the latest code
+# 2. work inside your own folder only
+git add agent                         # 3. add ONLY your folder
+git commit -m "agent: add heartbeat"  # 4. save your work
+git pull --rebase                     # 5. get any new changes
+git push                              # 6. upload
+```
+
+Replace `agent` with your own folder name.
+
+- Pull before you start.
+- Commit small.
+- Push at least once a day.
+
+## Rules
+
+**Do**
+- Work only in your own folder.
+- Start every commit message with your folder name: `store: add upload`.
+- Use `git add <your-folder>`, not `git add .`.
+- Ask the owner if you need a change in someone else's folder.
+
+**Do not**
+- Edit another person's folder.
+- Edit the repo root files, `.github/`, `shared/` or `ops/` (head only, ask first).
+- Use `git push --force`.
+- Commit secrets, `.env` files, passwords, datasets or model files. The repo is public.
+
+## Folders and languages
 
 | Folder | Language | Purpose |
 |---|---|---|
@@ -37,113 +68,29 @@ Each folder has one owner, listed in [`.github/CODEOWNERS`](.github/CODEOWNERS).
 | `infer/` | Python | Model serving |
 | `console/` | TypeScript | Web dashboard |
 | `drop/` | TypeScript | File sharing PWA |
-| `shared/` | OpenAPI / Protobuf | API contracts |
-| `ops/` | Shell, Docker | Setup and deployment |
+| `shared/` | OpenAPI | API contracts |
+| `ops/` | Shell, Docker | Setup and deploy scripts |
 | `docs/` | Markdown | Documentation |
 
-## Workflow
+## If something goes wrong
 
-```bash
-# 1. Start from the latest main
-git checkout main
-git pull
+| Problem | Fix |
+|---|---|
+| `git push` says rejected or "fetch first" | `git pull --rebase`, then `git push` |
+| Error 403 or permission denied | `gh auth login`, then `gh auth setup-git` |
+| Message says `CONFLICT` | Do not panic and do not force push. Send a screenshot to the head. |
+| `git status` shows files you did not change | Leave them. Add only your folder. |
+| `not a git repository` | Wrong folder. Run `cd ~/kamui-cloud` |
+| You committed a secret | Tell the head immediately. |
 
-# 2. Create a branch
-git checkout -b agent/add-heartbeat
+## Tasks
 
-# 3. Do your work inside your folder, then commit
-git add agent
-git commit -m "agent: add heartbeat"
+Tasks live on the project board: To do, Doing, Review, Done.
 
-# 4. Push your branch
-git push -u origin agent/add-heartbeat
+1. Take a task and move it to **Doing**. Keep only 1 or 2 there.
+2. After you push, move it to **Review**.
+3. The owner checks it and moves it to **Done**.
 
-# 5. Open a pull request
-gh pr create --fill
-```
+## First task
 
-Step by step:
-
-1. **Pick or create an Issue.** Assign it to yourself and move it to **Doing** on the project board.
-2. **Branch, code, commit, push** as shown above.
-3. **Open a pull request.** Fill in the template. Move the Issue to **Review**.
-4. **The folder owner reviews.** If changes are requested, fix them and push again. The pull request updates automatically.
-5. **Merge.** After approval, the owner merges and deletes the branch. The Issue moves to **Done**.
-
-## Branch names
-
-Format: `<folder>/<short-task>`
-
-Examples: `store/add-upload`, `agent/mdns-discovery`, `docs/fix-readme`
-
-## Commit messages
-
-Start with the folder name, then a short description in the present tense.
-
-```
-agent: add heartbeat
-store: fix upload size check
-docs: update setup steps
-```
-
-## Pull requests
-
-- One pull request touches one folder.
-- Link the Issue with `Closes #12` in the description.
-- Describe how you tested the change.
-- Keep it small. Large changes are hard to review.
-- Do not merge your own pull request without approval.
-
-## Code standards
-
-Run these before you push.
-
-**Rust** (`agent/`)
-```bash
-cargo fmt
-cargo clippy -- -D warnings
-cargo test
-```
-
-**Go** (`api/`, `store/`, `run/`, `cli/`)
-```bash
-gofmt -w .
-go vet ./...
-go test ./...
-```
-
-**Python** (`train/`, `infer/`)
-```bash
-uv run ruff format .
-uv run ruff check .
-uv run pytest
-```
-
-**TypeScript** (`console/`, `drop/`)
-```bash
-npm run lint
-npm test
-```
-
-Every folder should contain a `README.md` that explains how to build and run it, and a `Dockerfile` where it makes sense.
-
-## What never goes in the repo
-
-The repository is public. Never commit:
-
-- Secrets, tokens, passwords, `.env` files, private keys
-- Datasets, model weights, checkpoints
-- Build output (`target/`, `bin/`, `node_modules/`, `.venv/`)
-
-If you commit a secret by mistake, tell the project head immediately so it can be rotated.
-
-## Getting help
-
-Stuck? Try for 30 minutes, then ask. Open an Issue or message the folder owner.
-
-## Onboarding checklist
-
-- [ ] Install Git, GitHub CLI, Rust, Go and Docker
-- [ ] Accept the organization invite and turn on 2FA
-- [ ] Clone the repository
-- [ ] Add your name to `CONTRIBUTORS.md` through a pull request
+Create a `README.md` inside your own folder with one line about what it will do. Push it. This proves your setup works.
