@@ -1,0 +1,118 @@
+name: CI
+
+# Runs on every push to main (and on pull requests, if any).
+# A job only does work if its folder has real code. Empty folders are skipped.
+# Checks: build, lint, tests (where tests exist). Warnings do not fail the run.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  rust:
+    name: Rust (agent)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        if: hashFiles('agent/Cargo.toml') != ''
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Build
+        if: hashFiles('agent/Cargo.toml') != ''
+        working-directory: agent
+        run: cargo build
+      - name: Lint (clippy)
+        if: hashFiles('agent/Cargo.toml') != ''
+        working-directory: agent
+        run: cargo clippy
+      - name: Test
+        if: hashFiles('agent/Cargo.toml') != ''
+        working-directory: agent
+        run: cargo test
+
+  go:
+    name: Go (${{ matrix.dir }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: [api, store, run, cli]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Go
+        if: hashFiles(format('{0}/go.mod', matrix.dir)) != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: Build
+        if: hashFiles(format('{0}/go.mod', matrix.dir)) != ''
+        working-directory: ${{ matrix.dir }}
+        run: go build ./...
+      - name: Lint (go vet)
+        if: hashFiles(format('{0}/go.mod', matrix.dir)) != ''
+        working-directory: ${{ matrix.dir }}
+        run: go vet ./...
+      - name: Test
+        if: hashFiles(format('{0}/go.mod', matrix.dir)) != ''
+        working-directory: ${{ matrix.dir }}
+        run: go test ./...
+
+  python:
+    name: Python (${{ matrix.dir }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: [train, infer]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Python
+        if: hashFiles(format('{0}/**/*.py', matrix.dir)) != ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # No heavy ML packages are installed here, so this checks syntax and lint only.
+      - name: Syntax check
+        if: hashFiles(format('{0}/**/*.py', matrix.dir)) != ''
+        run: python -m compileall -q ${{ matrix.dir }}
+      - name: Lint (ruff)
+        if: hashFiles(format('{0}/**/*.py', matrix.dir)) != ''
+        run: |
+          pip install ruff
+          ruff check ${{ matrix.dir }}
+
+  node:
+    name: TypeScript (${{ matrix.dir }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: [console, drop]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Node
+        if: hashFiles(format('{0}/package.json', matrix.dir)) != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install packages
+        if: hashFiles(format('{0}/package.json', matrix.dir)) != ''
+        working-directory: ${{ matrix.dir }}
+        run: npm install
+      - name: Build
+        if: hashFiles(format('{0}/package.json', matrix.dir)) != ''
+        working-directory: ${{ matrix.dir }}
+        run: npm run build --if-present
+      - name: Lint
+        if: hashFiles(format('{0}/package.json', matrix.dir)) != ''
+        working-directory: ${{ matrix.dir }}
+        run: npm run lint --if-present
+      - name: Test
+        if: hashFiles(format('{0}/package.json', matrix.dir)) != ''
+        working-directory: ${{ matrix.dir }}
+        run: npm test --if-present
