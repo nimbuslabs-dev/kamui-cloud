@@ -1,27 +1,25 @@
 <div align="center">
 
 # Kamui Cloud
-<div align="center">
 
-# Kamui Cloud
+**Turn everyday laptops into your own private cloud.**
 
-**An open-source private cloud built from everyday laptops.**
-
-*Your lab. Your cloud.*
+Storage, compute, model training, model serving and file sharing behind one API, one CLI and one dashboard.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Status](https://img.shields.io/badge/status-early%20development-orange)
 ![Rust](https://img.shields.io/badge/Rust-agent-b7410e?logo=rust&logoColor=white)
 ![Go](https://img.shields.io/badge/Go-services-00ADD8?logo=go&logoColor=white)
-![Platforms](https://img.shields.io/badge/runs%20on-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20ARM-lightgrey)
-[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+![Python](https://img.shields.io/badge/Python-ML-3776AB?logo=python&logoColor=white)
+![TypeScript](https://img.shields.io/badge/TypeScript-web-3178C6?logo=typescript&logoColor=white)
 
-[Overview](#overview) ·
-[Services](#services) ·
-[Architecture](#architecture) ·
-[Tech stack](#tech-stack) ·
-[Repository layout](#repository-layout) ·
-[Roadmap](#roadmap) ·
+[Overview](#overview) |
+[Services](#services) |
+[Architecture](#architecture) |
+[Tech stack](#tech-stack) |
+[Repository layout](#repository-layout) |
+[Getting started](#getting-started) |
+[Roadmap](#roadmap) |
 [Contributing](#contributing)
 
 </div>
@@ -30,129 +28,139 @@
 
 ## Overview
 
-Kamui turns a handful of ordinary laptops into one private cloud. Storage, compute, model training, model serving and file sharing sit behind **one API, one CLI and one dashboard**.
+Kamui connects the laptops you already own into one small cloud. A laptop joins with `kamui up`, shows up on the dashboard, and leaves with `kamui down`.
 
-- **Zero cost.** No cloud bills, no egress fees. Use the hardware you already own.
-- **Offline-first.** Everything runs on your local network. The internet is optional.
-- **Ephemeral by design.** Laptops come and go. Nodes join with `kamui up` and leave with `kamui down`, and jobs and data are handled safely.
-- **Heterogeneous.** Mac (Apple Silicon), Windows, Linux and ARM machines work together in a single scheduler.
+- **Zero cost.** No cloud bills and no egress fees.
+- **Offline first.** Everything runs on your local network. The internet is optional.
+- **Made for laptops that come and go.** Nodes join and leave, and the cluster keeps working.
+- **Mixed hardware.** Mac (Apple Silicon), Windows, Linux and ARM machines work together.
 
-> **Status:** Kamui is in early development. The repository currently contains the project skeleton. APIs and structure will change.
+> **Status:** Kamui is in early development. The repository is a skeleton and the first version (v0.1) is being built now. APIs and folder contents will change.
 
 ## Services
 
 | Service | What it does | Similar to |
 |---|---|---|
-| **Store** | Files, models and datasets with an S3-compatible API | Amazon S3 |
-| **Run** | Run any container or script on a free node | ECS / Lambda |
-| **Train** | ML training jobs on free GPU (CUDA) or Apple Silicon (MLX) nodes | SageMaker Training |
-| **Infer** | Deploy a model as an API endpoint | SageMaker Endpoints |
-| **Drop** | Quick file sharing between phones and laptops | Quick Share / AirDrop |
-| **Console** | Web dashboard for nodes, jobs, storage and logs | AWS Console |
-| **CLI** | `kamui up`, `kamui down`, `kamui submit` | AWS CLI |
+| **Store** | Keep files, datasets and models | Amazon S3 |
+| **Run** | Run a container or script on a free node | ECS |
+| **Train** | Train a machine learning model on a free node | SageMaker Training |
+| **Infer** | Serve a trained model as an API | SageMaker Endpoints |
+| **Drop** | Send files between phone and laptop | AirDrop |
+| **Console** | Web dashboard for nodes, files and jobs | AWS Console |
+| **CLI** | The `kamui` command | AWS CLI |
 
 ## Architecture
 
 ```mermaid
 flowchart TD
-    Drop["Drop (phone PWA)"] --> API
+    Drop["Drop (phone app)"] --> API
     CLI["Kamui CLI"] --> API
     Console["Console (web)"] --> API
 
-    API["Coordinator API<br/>registry · scheduler · auth"]
+    API["Coordinator API: registry and scheduler"]
 
-    API --> Store["Store<br/>S3-compatible"]
-    API --> Run["Run<br/>container jobs"]
-    API --> Train["Train<br/>CUDA / MLX"]
-    API --> Infer["Infer<br/>model endpoints"]
+    API --> Store["Store"]
+    API --> Run["Run"]
+    API --> Train["Train"]
+    API --> Infer["Infer"]
 
-    Agent["Agent on every node<br/>discovery · heartbeat"] --> API
-    Store -. datasets and checkpoints .-> Train
-    Train -. models .-> Store
-    Store -. models .-> Infer
+    Agent["Agent on every node"] --> API
+    Store -.-> Train
+    Train -.-> Store
+    Store -.-> Infer
 ```
 
 **How a cluster forms**
 
-1. A laptop runs `kamui up`. The agent finds other nodes on the network using mDNS.
-2. Each node reports what it can do: RAM, GPU or MLX, free disk.
-3. The coordinator keeps a registry of live nodes and schedules jobs on the best fit.
-4. `kamui down` drains running jobs and removes the node cleanly.
+1. A laptop runs `kamui up`. The agent finds other nodes on the same network using mDNS.
+2. The node registers with the coordinator and sends a heartbeat every 5 seconds.
+3. The coordinator keeps the list of live nodes. A node with no heartbeat for 15 seconds is marked offline.
+4. `kamui down` removes the node cleanly.
 
 ## Tech stack
-
-> Planned stack. It may change as the project matures.
 
 | Area | Technology |
 |---|---|
 | Node agent | Rust |
-| Coordinator, Store, Run, CLI | Go |
-| Train, Infer (ML) | Python (PyTorch, MLX) |
+| Coordinator API, Store, Run, CLI | Go |
+| Train, Infer | Python |
 | Console, Drop | TypeScript (Next.js, PWA) |
-| Discovery | mDNS |
-| API contract | OpenAPI / Protocol Buffers (`shared/`) |
-| Packaging | Docker, native binaries |
+| API contract | OpenAPI (`shared/openapi.yaml`) |
+| Packaging | Docker and native binaries |
+
+The stack is planned and may change as the project grows.
 
 ## Repository layout
 
-```
+```text
 kamui-cloud/
-├── agent/     Node agent: discovery, heartbeat (Rust)
-├── api/       Coordinator: registry, scheduler, auth (Go)
-├── store/     S3-compatible storage service (Go)
-├── run/       Container and job runner (Go)
-├── train/     ML training service (Python)
-├── infer/     Model serving service (Python)
-├── drop/      Quick file sharing PWA (TypeScript)
-├── console/   Web dashboard (TypeScript)
-├── cli/       The `kamui` command-line tool (Go)
-├── shared/    API schemas and shared definitions
-├── ops/       Docker Compose, setup and deployment scripts
-├── docs/      Documentation
-└── .github/   CODEOWNERS, issue and PR templates, workflows
+  agent/     Node agent: discovery and heartbeat (Rust)
+  api/       Coordinator: registry and scheduler (Go)
+  store/     File storage service (Go)
+  run/       Docker job runner (Go)
+  cli/       The kamui command (Go)
+  train/     Model training (Python)
+  infer/     Model serving (Python)
+  console/   Web dashboard (TypeScript)
+  drop/      Phone file sharing app (TypeScript)
+  shared/    API contract
+  ops/       Docker Compose and scripts
+  docs/      Documentation
+  .github/   Issue forms and CI workflow
 ```
 
-Each top-level folder has one owner (see [`.github/CODEOWNERS`](.github/CODEOWNERS)).
+Each folder has its own owner and its own `README.md`.
 
 ## Getting started
 
-Kamui is not usable yet. To set up a development environment:
+Kamui is not ready to use yet. To prepare a development machine:
 
-| Tool | Install |
+| Tool | Needed for |
 |---|---|
-| Git and GitHub CLI | `brew install git gh` · `winget install Git.Git GitHub.cli` |
-| Rust | [rustup.rs](https://rustup.rs) |
-| Go | `brew install go` · `winget install GoLang.Go` |
-| Docker | OrbStack (Mac) · Docker Desktop (Windows) |
-| Python 3.12 and uv | Only for `train/` and `infer/` |
-| Node.js LTS | Only for `console/` and `drop/` |
+| Git and GitHub CLI | everyone |
+| Rust (rustup) | `agent/` |
+| Go | `api/`, `store/`, `run/`, `cli/` |
+| Python 3.12 and uv | `train/`, `infer/` |
+| Node.js LTS | `console/`, `drop/` |
+| Docker | `run/` and testing |
 
-Then clone the repository:
+Clone the repository:
 
 ```bash
 git clone https://github.com/nimbuslabs-dev/kamui-cloud.git
 cd kamui-cloud
 ```
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before you start working.
+Default ports: API `8080`, Store `9000`, Run `8082`, Infer `8090`, Console `3000`, Drop `3001`.
 
 ## Roadmap
 
-- [x] Organization, repository and contribution workflow
-- [ ] **M0:** `kamui up`, node discovery and heartbeat
-- [ ] **M1:** Store
-- [ ] **M2:** Run
-- [ ] **M3:** Train
-- [ ] **M4:** Console
-- [ ] **M5:** Infer
-- [ ] **M6:** CLI polish
-- [ ] **M7:** Drop
+Version 0.1 is built in six short iterations.
+
+- [x] **0. Setup.** Repository, folders, workflow and board.
+- [ ] **1. Nodes see each other.** Discovery, registration, heartbeat, `kamui status`, nodes page.
+- [ ] **2. Store and Run.** Upload, download and list files. Run a Docker job.
+- [ ] **3. Train and Infer.** Train a small model, store it, serve it, get a prediction.
+- [ ] **4. Drop and polish.** Send a file from a phone. Improve the dashboard.
+- [ ] **5. Release.** Test everything together and tag `v0.1.0`.
+
+After v0.1: saved state and leader election, GPU training (CUDA and MLX), security, logs and graphs, and a public release.
 
 Progress is tracked on the project board and in [Issues](https://github.com/nimbuslabs-dev/kamui-cloud/issues).
 
 ## Contributing
 
-We use a branch and pull request workflow. Every change goes through review by the folder owner. Please read [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide.
+Each contributor owns one folder and works only inside it. Changes are pushed straight to `main` in small steps, with the folder name at the start of the commit message:
+
+```bash
+git pull
+git add agent
+git commit -m "agent: add heartbeat"
+git pull --rebase
+git push
+```
+
+Never force push, and never commit secrets, `.env` files, datasets or model files. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide.
 
 ## License
 
@@ -160,167 +168,6 @@ Released under the [MIT License](LICENSE).
 
 <div align="center">
 
-Built by **Nimbus Labs**
-
-</div>
-
-
-
-**An open-source private cloud built from everyday laptops.**
-
-*Your lab. Your cloud.*
-
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Status](https://img.shields.io/badge/status-early%20development-orange)
-![Rust](https://img.shields.io/badge/Rust-agent-b7410e?logo=rust&logoColor=white)
-![Go](https://img.shields.io/badge/Go-services-00ADD8?logo=go&logoColor=white)
-![Platforms](https://img.shields.io/badge/runs%20on-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20ARM-lightgrey)
-[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
-
-[Overview](#overview) ·
-[Services](#services) ·
-[Architecture](#architecture) ·
-[Tech stack](#tech-stack) ·
-[Repository layout](#repository-layout) ·
-[Roadmap](#roadmap) ·
-[Contributing](#contributing)
-
-</div>
-
----
-
-## Overview
-
-Kamui turns a handful of ordinary laptops into one private cloud. Storage, compute, model training, model serving and file sharing sit behind **one API, one CLI and one dashboard**.
-
-- **Zero cost.** No cloud bills, no egress fees. Use the hardware you already own.
-- **Offline-first.** Everything runs on your local network. The internet is optional.
-- **Ephemeral by design.** Laptops come and go. Nodes join with `kamui up` and leave with `kamui down`, and jobs and data are handled safely.
-- **Heterogeneous.** Mac (Apple Silicon), Windows, Linux and ARM machines work together in a single scheduler.
-
-> **Status:** Kamui is in early development. The repository currently contains the project skeleton. APIs and structure will change.
-
-## Services
-
-| Service | What it does | Similar to |
-|---|---|---|
-| **Store** | Files, models and datasets with an S3-compatible API | Amazon S3 |
-| **Run** | Run any container or script on a free node | ECS / Lambda |
-| **Train** | ML training jobs on free GPU (CUDA) or Apple Silicon (MLX) nodes | SageMaker Training |
-| **Infer** | Deploy a model as an API endpoint | SageMaker Endpoints |
-| **Drop** | Quick file sharing between phones and laptops | Quick Share / AirDrop |
-| **Console** | Web dashboard for nodes, jobs, storage and logs | AWS Console |
-| **CLI** | `kamui up`, `kamui down`, `kamui submit` | AWS CLI |
-
-## Architecture
-
-```mermaid
-flowchart TD
-    Drop["Drop (phone PWA)"] --> API
-    CLI["Kamui CLI"] --> API
-    Console["Console (web)"] --> API
-
-    API["Coordinator API<br/>registry · scheduler · auth"]
-
-    API --> Store["Store<br/>S3-compatible"]
-    API --> Run["Run<br/>container jobs"]
-    API --> Train["Train<br/>CUDA / MLX"]
-    API --> Infer["Infer<br/>model endpoints"]
-
-    Agent["Agent on every node<br/>discovery · heartbeat"] --> API
-    Store -. datasets and checkpoints .-> Train
-    Train -. models .-> Store
-    Store -. models .-> Infer
-```
-
-**How a cluster forms**
-
-1. A laptop runs `kamui up`. The agent finds other nodes on the network using mDNS.
-2. Each node reports what it can do: RAM, GPU or MLX, free disk.
-3. The coordinator keeps a registry of live nodes and schedules jobs on the best fit.
-4. `kamui down` drains running jobs and removes the node cleanly.
-
-## Tech stack
-
-> Planned stack. It may change as the project matures.
-
-| Area | Technology |
-|---|---|
-| Node agent | Rust |
-| Coordinator, Store, Run, CLI | Go |
-| Train, Infer (ML) | Python (PyTorch, MLX) |
-| Console, Drop | TypeScript (Next.js, PWA) |
-| Discovery | mDNS |
-| API contract | OpenAPI / Protocol Buffers (`shared/`) |
-| Packaging | Docker, native binaries |
-
-## Repository layout
-
-```
-kamui-cloud/
-├── agent/     Node agent: discovery, heartbeat (Rust)
-├── api/       Coordinator: registry, scheduler, auth (Go)
-├── store/     S3-compatible storage service (Go)
-├── run/       Container and job runner (Go)
-├── train/     ML training service (Python)
-├── infer/     Model serving service (Python)
-├── drop/      Quick file sharing PWA (TypeScript)
-├── console/   Web dashboard (TypeScript)
-├── cli/       The `kamui` command-line tool (Go)
-├── shared/    API schemas and shared definitions
-├── ops/       Docker Compose, setup and deployment scripts
-├── docs/      Documentation
-└── .github/   CODEOWNERS, issue and PR templates, workflows
-```
-
-Each top-level folder has one owner (see [`.github/CODEOWNERS`](.github/CODEOWNERS)).
-
-## Getting started
-
-Kamui is not usable yet. To set up a development environment:
-
-| Tool | Install |
-|---|---|
-| Git and GitHub CLI | `brew install git gh` · `winget install Git.Git GitHub.cli` |
-| Rust | [rustup.rs](https://rustup.rs) |
-| Go | `brew install go` · `winget install GoLang.Go` |
-| Docker | OrbStack (Mac) · Docker Desktop (Windows) |
-| Python 3.12 and uv | Only for `train/` and `infer/` |
-| Node.js LTS | Only for `console/` and `drop/` |
-
-Then clone the repository:
-
-```bash
-git clone https://github.com/nimbuslabs-dev/kamui-cloud.git
-cd kamui-cloud
-```
-
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before you start working.
-
-## Roadmap
-
-- [x] Organization, repository and contribution workflow
-- [ ] **M0:** `kamui up`, node discovery and heartbeat
-- [ ] **M1:** Store
-- [ ] **M2:** Run
-- [ ] **M3:** Train
-- [ ] **M4:** Console
-- [ ] **M5:** Infer
-- [ ] **M6:** CLI polish
-- [ ] **M7:** Drop
-
-Progress is tracked on the project board and in [Issues](https://github.com/nimbuslabs-dev/kamui-cloud/issues).
-
-## Contributing
-
-Everyone works in their own folder and pushes straight to `main`, so nobody gets conflicts. Please read [CONTRIBUTING.md](CONTRIBUTING.md) for the simple workflow.
-
-## License
-
-Released under the [MIT License](LICENSE).
-
-<div align="center">
-
-Built by **Nimbus Labs**
+Built by **Nimbus Labs**. Your lab. Your cloud.
 
 </div>
