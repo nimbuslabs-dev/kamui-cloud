@@ -1,0 +1,1 @@
+Trains a small digits model and saves it to a file.
