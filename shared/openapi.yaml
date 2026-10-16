@@ -1,0 +1,587 @@
+openapi: 3.0.3
+info:
+  title: Kamui Cloud API
+  version: 0.1.0
+  description: One contract for api (8080), store (9000) and infer (8090). Only the head edits this file.
+servers:
+  - url: http://localhost:8080
+security:
+  - bearerAuth: []
+tags:
+  - name: health
+  - name: nodes
+  - name: jobs
+  - name: store
+  - name: infer
+paths:
+  /healthz:
+    get:
+      tags: [health]
+      operationId: healthz
+      summary: Liveness check. Every service exposes it on its own port.
+      security: []
+      responses:
+        "200":
+          description: Service is up
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+  /v1/nodes/register:
+    post:
+      tags: [nodes]
+      operationId: registerNode
+      summary: Agent registers a node
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NodeInfo"
+      responses:
+        "201":
+          description: Node registered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Registration"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/nodes:
+    get:
+      tags: [nodes]
+      operationId: listNodes
+      summary: List all nodes with online or offline status
+      responses:
+        "200":
+          description: All known nodes
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Node"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/nodes/{id}/heartbeat:
+    post:
+      tags: [nodes]
+      operationId: heartbeat
+      summary: Agent heartbeat every 5 s. A node is offline after 15 s without one.
+      parameters:
+        - $ref: "#/components/parameters/NodeId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Load"
+      responses:
+        "204":
+          description: Heartbeat accepted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/nodes/{id}:
+    delete:
+      tags: [nodes]
+      operationId: leaveNode
+      summary: Agent leaves cleanly
+      parameters:
+        - $ref: "#/components/parameters/NodeId"
+      responses:
+        "204":
+          description: Node removed
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/jobs:
+    post:
+      tags: [jobs]
+      operationId: createJob
+      summary: Queue a Docker job
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JobCreate"
+      responses:
+        "201":
+          description: Job queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    get:
+      tags: [jobs]
+      operationId: listJobs
+      summary: List jobs, newest first
+      responses:
+        "200":
+          description: All jobs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Job"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/jobs/claim:
+    post:
+      tags: [jobs]
+      operationId: claimJob
+      summary: A run worker claims the oldest queued job. Atomic, one job goes to one node.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [node_id]
+              properties:
+                node_id:
+                  type: string
+      responses:
+        "200":
+          description: Job claimed, status is now running
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "204":
+          description: No queued job
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/jobs/{id}:
+    get:
+      tags: [jobs]
+      operationId: getJob
+      summary: Get one job with its logs
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: The job
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/jobs/{id}/finish:
+    post:
+      tags: [jobs]
+      operationId: finishJob
+      summary: A run worker reports the result
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [exit_code]
+              properties:
+                exit_code:
+                  type: integer
+                logs:
+                  type: string
+                  maxLength: 65536
+      responses:
+        "200":
+          description: Job finished
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /v1/{bucket}:
+    servers:
+      - url: http://localhost:9000
+    get:
+      tags: [store]
+      operationId: listObjects
+      summary: List objects in a bucket
+      parameters:
+        - $ref: "#/components/parameters/Bucket"
+      responses:
+        "200":
+          description: Objects in the bucket
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/StoredObject"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/{bucket}/{key}:
+    servers:
+      - url: http://localhost:9000
+    parameters:
+      - $ref: "#/components/parameters/Bucket"
+      - $ref: "#/components/parameters/Key"
+    put:
+      tags: [store]
+      operationId: putObject
+      summary: Upload a file. The bucket is created on first upload. Size limit is KAMUI_MAX_MB.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "201":
+          description: Stored
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StoredObject"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "413":
+          $ref: "#/components/responses/TooLarge"
+    get:
+      tags: [store]
+      operationId: getObject
+      summary: Download a file as a stream
+      responses:
+        "200":
+          description: File bytes
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [store]
+      operationId: deleteObject
+      summary: Delete a file
+      responses:
+        "204":
+          description: Deleted
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /predict:
+    servers:
+      - url: http://localhost:8090
+    post:
+      tags: [infer]
+      operationId: predict
+      summary: Predict a digit from an 8x8 image flattened to 64 numbers
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pixels]
+              properties:
+                pixels:
+                  type: array
+                  minItems: 64
+                  maxItems: 64
+                  items:
+                    type: number
+                    minimum: 0
+                    maximum: 16
+      responses:
+        "200":
+          description: Prediction
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [digit, confidence]
+                properties:
+                  digit:
+                    type: integer
+                    minimum: 0
+                    maximum: 9
+                  confidence:
+                    type: number
+                    minimum: 0
+                    maximum: 1
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Send the join token as Authorization Bearer KAMUI_TOKEN. Every endpoint except /healthz needs it.
+  parameters:
+    NodeId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+    JobId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+    Bucket:
+      name: bucket
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: "^[a-z0-9][a-z0-9-]{1,62}$"
+    Key:
+      name: key
+      in: path
+      required: true
+      description: One path segment, no slash. Letters, digits, dot, underscore and hyphen only. Must not start with a dot and must not contain two dots in a row.
+      schema:
+        type: string
+        pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$"
+  responses:
+    BadRequest:
+      description: Invalid input
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Missing or wrong token
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: Not allowed in the current state
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    TooLarge:
+      description: File is larger than KAMUI_MAX_MB
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unavailable:
+      description: Service is not ready, for example the model is not loaded
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [bad_request, invalid_path, unauthorized, not_found, conflict, payload_too_large, unavailable, internal]
+            message:
+              type: string
+      example:
+        error:
+          code: invalid_path
+          message: key must not contain ..
+    Health:
+      type: object
+      required: [status, service, version]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        service:
+          type: string
+          enum: [api, store, run, infer, train, console, drop]
+        version:
+          type: string
+      example:
+        status: ok
+        service: api
+        version: 0.1.0
+    NodeInfo:
+      type: object
+      required: [hostname, os, arch, cpu_cores, ram_mb, ip]
+      properties:
+        hostname:
+          type: string
+        os:
+          type: string
+          enum: [macos, windows, linux]
+        arch:
+          type: string
+          enum: [arm64, amd64]
+        cpu_cores:
+          type: integer
+          minimum: 1
+        ram_mb:
+          type: integer
+          minimum: 1
+        gpu:
+          type: string
+          description: GPU name, empty string if none
+        ip:
+          type: string
+        roles:
+          type: array
+          items:
+            type: string
+            enum: [store, run, train, infer, drop, console]
+      example:
+        hostname: kisu-mac
+        os: macos
+        arch: arm64
+        cpu_cores: 10
+        ram_mb: 16384
+        gpu: Apple M5
+        ip: 192.168.0.10
+        roles: [console]
+    Node:
+      allOf:
+        - $ref: "#/components/schemas/NodeInfo"
+        - type: object
+          required: [id, status, last_seen]
+          properties:
+            id:
+              type: string
+            status:
+              type: string
+              enum: [online, offline]
+            last_seen:
+              type: string
+              format: date-time
+    Registration:
+      type: object
+      required: [id, heartbeat_interval_s, offline_after_s]
+      properties:
+        id:
+          type: string
+        heartbeat_interval_s:
+          type: integer
+        offline_after_s:
+          type: integer
+      example:
+        id: n-7f3a
+        heartbeat_interval_s: 5
+        offline_after_s: 15
+    Load:
+      type: object
+      properties:
+        cpu_pct:
+          type: number
+          minimum: 0
+          maximum: 100
+        mem_pct:
+          type: number
+          minimum: 0
+          maximum: 100
+    JobCreate:
+      type: object
+      required: [image]
+      properties:
+        image:
+          type: string
+        command:
+          type: array
+          items:
+            type: string
+      example:
+        image: alpine:3.20
+        command: [echo, hello]
+    Job:
+      type: object
+      required: [id, image, status, created_at]
+      properties:
+        id:
+          type: string
+        image:
+          type: string
+        command:
+          type: array
+          items:
+            type: string
+        status:
+          type: string
+          enum: [queued, running, succeeded, failed]
+        node_id:
+          type: string
+        exit_code:
+          type: integer
+        logs:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+    StoredObject:
+      type: object
+      required: [bucket, key, size, sha256, modified]
+      properties:
+        bucket:
+          type: string
+        key:
+          type: string
+        size:
+          type: integer
+          minimum: 0
+        sha256:
+          type: string
+        modified:
+          type: string
+          format: date-time
