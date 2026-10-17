@@ -1,22 +1,14 @@
-# Each folder has one owner. Replace @QuantumSenpai with the owner's GitHub username.
-# A pull request that changes a folder needs review from that folder's owner.
-
-# Default owner for anything not listed below
 *             @QuantumSenpai
-
-# Services
-/agent/       @QuantumSenpai
+/agent/       @PritamAddhya @Akash-dutta-001
 /api/         @QuantumSenpai
-/store/       @QuantumSenpai
-/run/         @QuantumSenpai
-/train/       @QuantumSenpai
-/infer/       @QuantumSenpai
-/drop/        @QuantumSenpai
-/console/     @QuantumSenpai
-/cli/         @QuantumSenpai
-
-# Shared and project files
+/store/       @shrutisvoyage @sristipriya449-source
+/run/         @HarshitRaj31
+/cli/         @aniket-tech1005
+/console/     @mddanish-31 @Shreyankita2006
+/train/       @SAGETOAD-source
+/infer/       @snehadas24062006-hue
+/drop/        @Chandrima2507
 /shared/      @QuantumSenpai
 /ops/         @QuantumSenpai
-/docs/        @QuantumSenpai
+/docs/        @Rudra-1612
 /.github/     @QuantumSenpai
