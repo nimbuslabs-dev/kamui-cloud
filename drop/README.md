@@ -15,7 +15,3 @@ Drop is a TypeScript-based file-sharing feature for transferring files from a ph
 - Next.js
 - Progressive Web App (PWA)
 
-## Status
-
-Under development for Kamui Cloud v0.1.
-'@ | Set-Content -Encoding utf8 .\drop\README.md
