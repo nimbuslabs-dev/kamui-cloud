@@ -44,21 +44,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Go
-        if: hashFiles(format('{0}/go.mod', matrix.dir)) != ''
+        if: hashFiles(format('{0}/**/*.go', matrix.dir)) != ''
         uses: actions/setup-go@v5
         with:
           go-version: stable
           cache: false
       - name: Build
-        if: hashFiles(format('{0}/go.mod', matrix.dir)) != ''
+        if: hashFiles(format('{0}/**/*.go', matrix.dir)) != ''
         working-directory: ${{ matrix.dir }}
         run: go build ./...
       - name: Lint (go vet)
-        if: hashFiles(format('{0}/go.mod', matrix.dir)) != ''
+        if: hashFiles(format('{0}/**/*.go', matrix.dir)) != ''
         working-directory: ${{ matrix.dir }}
         run: go vet ./...
       - name: Test
-        if: hashFiles(format('{0}/go.mod', matrix.dir)) != ''
+        if: hashFiles(format('{0}/**/*.go', matrix.dir)) != ''
         working-directory: ${{ matrix.dir }}
         run: go test ./...
 
