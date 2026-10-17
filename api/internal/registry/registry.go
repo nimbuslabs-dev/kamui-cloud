@@ -112,6 +112,14 @@ func (r *Registry) Remove(id string) error {
 	return nil
 }
 
+func (r *Registry) Exists(id string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	_, exists := r.nodes[id]
+	return exists
+}
+
 func (r *Registry) List() []Node {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

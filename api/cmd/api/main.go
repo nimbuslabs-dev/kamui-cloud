@@ -14,6 +14,7 @@ import (
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/config"
 	httpapi "github.com/nimbuslabs-dev/kamui-cloud/api/internal/http"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/registry"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/scheduler"
 )
 
 func main() {
@@ -24,7 +25,8 @@ func main() {
 	}
 
 	reg := registry.NewRegistry()
-	router := httpapi.NewRouter(cfg, reg)
+	queue := scheduler.NewQueue(time.Now)
+	router := httpapi.NewRouter(cfg, reg, queue)
 
 	srv := &http.Server{
 		Addr:              net.JoinHostPort("", cfg.Port),

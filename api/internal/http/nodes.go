@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -27,18 +26,8 @@ func NewNodeHandler(reg *registry.Registry) *NodeHandler {
 }
 
 func (h *NodeHandler) Register(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
-
 	var info registry.NodeInfo
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&info); err != nil {
-		apierr.WriteError(w, http.StatusBadRequest, "bad_request", "invalid json")
-		return
-	}
-
-	var extra struct{}
-	if err := dec.Decode(&extra); err != io.EOF {
+	if err := readJSON(w, r, 64*1024, &info); err != nil {
 		apierr.WriteError(w, http.StatusBadRequest, "bad_request", "invalid json")
 		return
 	}
@@ -117,14 +106,7 @@ func (h *NodeHandler) Heartbeat(w http.ResponseWriter, r *http.Request) {
 	trimmed := strings.TrimSpace(string(body))
 	if len(trimmed) > 0 {
 		var l registry.Load
-		dec := json.NewDecoder(bytes.NewReader(body))
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&l); err != nil {
-			apierr.WriteError(w, http.StatusBadRequest, "bad_request", "invalid json")
-			return
-		}
-		var extra struct{}
-		if err := dec.Decode(&extra); err != io.EOF {
+		if err := decodeJSON(bytes.NewReader(body), &l); err != nil {
 			apierr.WriteError(w, http.StatusBadRequest, "bad_request", "invalid json")
 			return
 		}
