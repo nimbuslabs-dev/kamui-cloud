@@ -19,7 +19,8 @@ func TestRouterBaseEndpoints(t *testing.T) {
 		Token: "test-secret-token",
 		Port:  "8080",
 	}
-	router := NewRouter(cfg)
+	reg := registry.NewRegistry()
+	router := NewRouter(cfg, reg)
 
 	tests := []struct {
 		name         string
@@ -41,12 +42,21 @@ func TestRouterBaseEndpoints(t *testing.T) {
 			isErrorCheck: false,
 		},
 		{
-			name:         "wrong method on healthz returns 400 bad_request",
+			name:         "wrong method on healthz without token returns 401",
 			method:       http.MethodPost,
 			path:         "/healthz",
 			authHeader:   "",
-			wantStatus:   http.StatusBadRequest,
-			wantCode:     "bad_request",
+			wantStatus:   http.StatusUnauthorized,
+			wantCode:     "unauthorized",
+			isErrorCheck: true,
+		},
+		{
+			name:         "wrong method on healthz with valid token returns 404 not_found",
+			method:       http.MethodPost,
+			path:         "/healthz",
+			authHeader:   "Bearer test-secret-token",
+			wantStatus:   http.StatusNotFound,
+			wantCode:     "not_found",
 			isErrorCheck: true,
 		},
 		{
@@ -135,7 +145,8 @@ func TestRouterBaseEndpoints(t *testing.T) {
 
 func TestNodeEndpointsUnauthorized(t *testing.T) {
 	cfg := &config.Config{Token: "test-token", Port: "8080"}
-	router := NewRouter(cfg)
+	reg := registry.NewRegistry()
+	router := NewRouter(cfg, reg)
 
 	endpoints := []struct {
 		name   string
@@ -240,6 +251,23 @@ func TestNodeLifecycleAndValidation(t *testing.T) {
 		}
 	})
 
+	t.Run("register trailing garbage returns 400", func(t *testing.T) {
+		payload := `{"hostname":"worker-trailing","os":"linux","arch":"amd64","cpu_cores":4,"ram_mb":4096,"ip":"10.0.0.5"} trailing_junk`
+		req := httptest.NewRequest(http.MethodPost, "/v1/nodes/register", strings.NewReader(payload))
+		req.Header.Set("Authorization", authHeader)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400, got %d", rec.Code)
+		}
+		var errResp apierr.ErrorResponse
+		_ = json.NewDecoder(rec.Body).Decode(&errResp)
+		if errResp.Error.Code != "bad_request" {
+			t.Fatalf("expected bad_request, got %q", errResp.Error.Code)
+		}
+	})
+
 	var nodeID string
 	t.Run("register valid node returns 201", func(t *testing.T) {
 		payload := `{"hostname":"worker-1","os":"macos","arch":"arm64","cpu_cores":8,"ram_mb":16384,"ip":"192.168.1.10","roles":["run","infer"]}`
@@ -263,6 +291,40 @@ func TestNodeLifecycleAndValidation(t *testing.T) {
 			t.Fatalf("unexpected interval or offline values: %+v", regResp)
 		}
 		nodeID = regResp.ID
+	})
+
+	t.Run("registering twice with the same body returns 201 with the same id and one node in list", func(t *testing.T) {
+		payload := `{"hostname":"worker-1","os":"macos","arch":"arm64","cpu_cores":8,"ram_mb":16384,"ip":"192.168.1.10","roles":["run","infer"]}`
+
+		req := httptest.NewRequest(http.MethodPost, "/v1/nodes/register", strings.NewReader(payload))
+		req.Header.Set("Authorization", authHeader)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("expected 201 on second register, got %d", rec.Code)
+		}
+
+		var regResp RegistrationResponse
+		if err := json.NewDecoder(rec.Body).Decode(&regResp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		if regResp.ID != nodeID {
+			t.Fatalf("expected same id %q on duplicate register, got %q", nodeID, regResp.ID)
+		}
+
+		reqList := httptest.NewRequest(http.MethodGet, "/v1/nodes", nil)
+		reqList.Header.Set("Authorization", authHeader)
+		recList := httptest.NewRecorder()
+		router.ServeHTTP(recList, reqList)
+
+		var list []registry.Node
+		if err := json.NewDecoder(recList.Body).Decode(&list); err != nil {
+			t.Fatalf("failed to decode list: %v", err)
+		}
+		if len(list) != 1 {
+			t.Fatalf("expected exactly 1 node in list, got %d", len(list))
+		}
 	})
 
 	t.Run("list contains registered node", func(t *testing.T) {
@@ -362,7 +424,7 @@ func TestNodeLifecycleAndValidation(t *testing.T) {
 		}
 	})
 
-	t.Run("wrong method on known routes returns 400", func(t *testing.T) {
+	t.Run("wrong method on known routes returns 404 not_found", func(t *testing.T) {
 		wrongMethods := []struct {
 			method string
 			path   string
@@ -371,6 +433,7 @@ func TestNodeLifecycleAndValidation(t *testing.T) {
 			{method: http.MethodGet, path: "/v1/nodes/register"},
 			{method: http.MethodGet, path: "/v1/nodes/n-1234/heartbeat"},
 			{method: http.MethodPost, path: "/v1/nodes/n-1234"},
+			{method: http.MethodPost, path: "/healthz"},
 		}
 
 		for _, wm := range wrongMethods {
@@ -379,13 +442,13 @@ func TestNodeLifecycleAndValidation(t *testing.T) {
 			rec := httptest.NewRecorder()
 			router.ServeHTTP(rec, req)
 
-			if rec.Code != http.StatusBadRequest {
-				t.Fatalf("expected 400 for %s %s, got %d", wm.method, wm.path, rec.Code)
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("expected 404 for %s %s, got %d", wm.method, wm.path, rec.Code)
 			}
 			var errResp apierr.ErrorResponse
 			_ = json.NewDecoder(rec.Body).Decode(&errResp)
-			if errResp.Error.Code != "bad_request" {
-				t.Fatalf("expected bad_request, got %q", errResp.Error.Code)
+			if errResp.Error.Code != "not_found" {
+				t.Fatalf("expected not_found, got %q", errResp.Error.Code)
 			}
 		}
 	})

@@ -75,6 +75,68 @@ func TestRegistryLifecycle(t *testing.T) {
 	}
 }
 
+func TestRegistryDuplicateNode(t *testing.T) {
+	reg := NewRegistry()
+	currentTime := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	reg.Now = func() time.Time {
+		return currentTime
+	}
+
+	info1 := NodeInfo{
+		Hostname: "worker-node",
+		OS:       "linux",
+		Arch:     "amd64",
+		CPUCores: 4,
+		RAMMB:    8192,
+		IP:       "10.0.0.10",
+	}
+
+	id1 := reg.Register(info1)
+
+	currentTime = currentTime.Add(5 * time.Second)
+	info2 := NodeInfo{
+		Hostname: "worker-node",
+		OS:       "linux",
+		Arch:     "amd64",
+		CPUCores: 8,
+		RAMMB:    16384,
+		IP:       "10.0.0.10",
+	}
+
+	id2 := reg.Register(info2)
+	if id1 != id2 {
+		t.Fatalf("expected same id on duplicate registration, got %q and %q", id1, id2)
+	}
+
+	nodes := reg.List()
+	if len(nodes) != 1 {
+		t.Fatalf("expected exactly 1 node, got %d", len(nodes))
+	}
+	if nodes[0].CPUCores != 8 || nodes[0].RAMMB != 16384 {
+		t.Fatalf("expected updated info, got %+v", nodes[0])
+	}
+	expectedTimeStr := currentTime.UTC().Format(time.RFC3339)
+	if nodes[0].LastSeen != expectedTimeStr {
+		t.Fatalf("expected last_seen refreshed to %q, got %q", expectedTimeStr, nodes[0].LastSeen)
+	}
+
+	infoDifferentIP := NodeInfo{
+		Hostname: "worker-node",
+		OS:       "linux",
+		Arch:     "amd64",
+		CPUCores: 4,
+		RAMMB:    8192,
+		IP:       "10.0.0.20",
+	}
+	id3 := reg.Register(infoDifferentIP)
+	if id3 == id1 {
+		t.Fatalf("expected different id for different IP, got %q", id3)
+	}
+	if len(reg.List()) != 2 {
+		t.Fatalf("expected 2 nodes after registering different IP, got %d", len(reg.List()))
+	}
+}
+
 func TestRegistrySorting(t *testing.T) {
 	reg := NewRegistry()
 	reg.Register(NodeInfo{Hostname: "node-c", OS: "linux", Arch: "amd64", CPUCores: 4, RAMMB: 8192, IP: "10.0.0.3"})

@@ -54,13 +54,6 @@ func NewRegistry() *Registry {
 	}
 }
 
-func (r *Registry) now() time.Time {
-	if r.Now != nil {
-		return r.Now()
-	}
-	return time.Now()
-}
-
 func (r *Registry) generateID() string {
 	for {
 		var b [2]byte
@@ -76,11 +69,19 @@ func (r *Registry) Register(info NodeInfo) string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	for _, n := range r.nodes {
+		if n.info.Hostname == info.Hostname && n.info.IP == info.IP {
+			n.info = info
+			n.lastSeen = r.Now()
+			return n.id
+		}
+	}
+
 	id := r.generateID()
 	r.nodes[id] = &storedNode{
 		info:     info,
 		id:       id,
-		lastSeen: r.now(),
+		lastSeen: r.Now(),
 	}
 	return id
 }
@@ -93,7 +94,7 @@ func (r *Registry) Heartbeat(id string, load *Load) error {
 	if !exists {
 		return ErrNotFound
 	}
-	node.lastSeen = r.now()
+	node.lastSeen = r.Now()
 	if load != nil {
 		node.lastLoad = load
 	}
@@ -116,7 +117,7 @@ func (r *Registry) List() []Node {
 	defer r.mu.RUnlock()
 
 	nodes := make([]Node, 0, len(r.nodes))
-	now := r.now()
+	now := r.Now()
 	for _, n := range r.nodes {
 		status := "offline"
 		if now.Sub(n.lastSeen) < 15*time.Second {

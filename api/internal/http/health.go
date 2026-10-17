@@ -13,10 +13,6 @@ type HealthResponse struct {
 }
 
 func HandleHealthz(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		apierr.WriteError(w, http.StatusBadRequest, "bad_request", "method not allowed")
-		return
-	}
 	apierr.WriteJSON(w, http.StatusOK, HealthResponse{
 		Status:  "ok",
 		Service: "api",

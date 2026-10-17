@@ -37,8 +37,9 @@ func (h *NodeHandler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if dec.More() {
-		apierr.WriteError(w, http.StatusBadRequest, "bad_request", "extra data")
+	var extra struct{}
+	if err := dec.Decode(&extra); err != io.EOF {
+		apierr.WriteError(w, http.StatusBadRequest, "bad_request", "invalid json")
 		return
 	}
 
@@ -104,10 +105,6 @@ func (h *NodeHandler) List(w http.ResponseWriter, r *http.Request) {
 
 func (h *NodeHandler) Heartbeat(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if id == "" {
-		apierr.WriteError(w, http.StatusNotFound, "not_found", "node not found")
-		return
-	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
 	body, err := io.ReadAll(r.Body)
@@ -126,8 +123,9 @@ func (h *NodeHandler) Heartbeat(w http.ResponseWriter, r *http.Request) {
 			apierr.WriteError(w, http.StatusBadRequest, "bad_request", "invalid json")
 			return
 		}
-		if dec.More() {
-			apierr.WriteError(w, http.StatusBadRequest, "bad_request", "extra data")
+		var extra struct{}
+		if err := dec.Decode(&extra); err != io.EOF {
+			apierr.WriteError(w, http.StatusBadRequest, "bad_request", "invalid json")
 			return
 		}
 		if l.CPUPct != nil && (*l.CPUPct < 0 || *l.CPUPct > 100) {
@@ -146,7 +144,7 @@ func (h *NodeHandler) Heartbeat(w http.ResponseWriter, r *http.Request) {
 			apierr.WriteError(w, http.StatusNotFound, "not_found", "node not found")
 			return
 		}
-		apierr.WriteError(w, http.StatusBadRequest, "bad_request", err.Error())
+		apierr.WriteError(w, http.StatusInternalServerError, "internal", "internal error")
 		return
 	}
 
@@ -155,17 +153,13 @@ func (h *NodeHandler) Heartbeat(w http.ResponseWriter, r *http.Request) {
 
 func (h *NodeHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if id == "" {
-		apierr.WriteError(w, http.StatusNotFound, "not_found", "node not found")
-		return
-	}
 
 	if err := h.reg.Remove(id); err != nil {
 		if errors.Is(err, registry.ErrNotFound) {
 			apierr.WriteError(w, http.StatusNotFound, "not_found", "node not found")
 			return
 		}
-		apierr.WriteError(w, http.StatusBadRequest, "bad_request", err.Error())
+		apierr.WriteError(w, http.StatusInternalServerError, "internal", "internal error")
 		return
 	}
 

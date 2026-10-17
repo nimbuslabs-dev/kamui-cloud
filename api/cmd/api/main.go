@@ -13,6 +13,7 @@ import (
 
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/config"
 	httpapi "github.com/nimbuslabs-dev/kamui-cloud/api/internal/http"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/registry"
 )
 
 func main() {
@@ -22,7 +23,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	router := httpapi.NewRouter(cfg)
+	reg := registry.NewRegistry()
+	router := httpapi.NewRouter(cfg, reg)
 
 	srv := &http.Server{
 		Addr:              net.JoinHostPort("", cfg.Port),
