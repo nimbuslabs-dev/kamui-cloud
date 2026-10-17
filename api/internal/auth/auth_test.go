@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/apierr"
 )
 
 func TestMiddleware(t *testing.T) {
@@ -79,7 +81,7 @@ func TestMiddleware(t *testing.T) {
 					t.Fatalf("expected Content-Type application/json, got %q", contentType)
 				}
 
-				var body errorResponse
+				var body apierr.ErrorResponse
 				if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
 					t.Fatalf("failed to decode response: %v", err)
 				}

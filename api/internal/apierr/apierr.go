@@ -1,15 +1,15 @@
-package httpapi
+package apierr
 
 import (
 	"encoding/json"
 	"net/http"
 )
 
-type errorResponse struct {
-	Error errorDetail `json:"error"`
+type ErrorResponse struct {
+	Error ErrorDetail `json:"error"`
 }
 
-type errorDetail struct {
+type ErrorDetail struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
 }
@@ -21,8 +21,8 @@ func WriteJSON(w http.ResponseWriter, status int, data any) {
 }
 
 func WriteError(w http.ResponseWriter, status int, code, message string) {
-	WriteJSON(w, status, errorResponse{
-		Error: errorDetail{
+	WriteJSON(w, status, ErrorResponse{
+		Error: ErrorDetail{
 			Code:    code,
 			Message: message,
 		},
