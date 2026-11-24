@@ -60,6 +60,7 @@ services:
       - KAMUI_TOKEN=${KAMUI_TOKEN:-dev}
       - API_URL=http://api:8080
       - DOCKER_HOST=unix:///var/run/docker.sock
+      - DOCKER_NETWORK_NAME=kamui-network
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - kamui-workspaces:/workspaces
@@ -103,3 +104,4 @@ volumes:
 networks:
   kamui-network:
     driver: bridge
+    attachable: true

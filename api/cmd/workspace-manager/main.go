@@ -33,15 +33,16 @@ type WorkspaceConfig struct {
 }
 
 type WorkspaceManager struct {
-	dockerClient *client.Client
-	apiURL       string
-	token        string
-	mu           sync.Mutex
+	dockerClient  *client.Client
+	apiURL        string
+	token         string
+	networkName   string
+	mu            sync.Mutex
 	portAllocator int
-	workspaces   map[string]*WorkspaceConfig
+	workspaces    map[string]*WorkspaceConfig
 }
 
-func NewWorkspaceManager(apiURL, token string) (*WorkspaceManager, error) {
+func NewWorkspaceManager(apiURL, token, networkName string) (*WorkspaceManager, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Docker client: %w", err)
@@ -51,6 +52,7 @@ func NewWorkspaceManager(apiURL, token string) (*WorkspaceManager, error) {
 		dockerClient:  cli,
 		apiURL:        apiURL,
 		token:         token,
+		networkName:   networkName,
 		portAllocator: 8081,
 		workspaces:    make(map[string]*WorkspaceConfig),
 	}, nil
@@ -125,7 +127,13 @@ func (wm *WorkspaceManager) StartWorkspace(ctx context.Context, config Workspace
 		User: "1000:1000",
 	}
 
-	networkingConfig := &network.NetworkingConfig{}
+	networkingConfig := &network.NetworkingConfig{
+		EndpointsConfig: map[string]*network.EndpointSettings{
+			wm.networkName: {
+				NetworkID: wm.networkName,
+			},
+		},
+	}
 
 	resp, err := wm.dockerClient.ContainerCreate(ctx, containerConfig, hostConfig, networkingConfig, nil, containerName)
 	if err != nil {
@@ -397,7 +405,12 @@ func main() {
 		log.Fatal("KAMUI_TOKEN is required")
 	}
 
-	manager, err := NewWorkspaceManager(apiURL, token)
+	networkName := os.Getenv("DOCKER_NETWORK_NAME")
+	if networkName == "" {
+		networkName = "kamui-network"
+	}
+
+	manager, err := NewWorkspaceManager(apiURL, token, networkName)
 	if err != nil {
 		log.Fatalf("Failed to create workspace manager: %v", err)
 	}
