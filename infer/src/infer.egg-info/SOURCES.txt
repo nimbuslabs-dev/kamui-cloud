@@ -1,0 +1,11 @@
+README.md
+pyproject.toml
+src/app.py
+src/model.py
+src/infer.egg-info/PKG-INFO
+src/infer.egg-info/SOURCES.txt
+src/infer.egg-info/dependency_links.txt
+src/infer.egg-info/requires.txt
+src/infer.egg-info/top_level.txt
+tests/test_app.py
+tests/test_model.py
