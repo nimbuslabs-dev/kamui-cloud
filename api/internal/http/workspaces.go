@@ -1,8 +1,11 @@
 package httpapi
 
 import (
+	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -14,17 +17,17 @@ import (
 )
 
 type Workspace struct {
-	ID              string    `json:"id"`
-	Name            string    `json:"name"`
-	RepositoryURL   string    `json:"repository_url"`
-	Branch          string    `json:"branch"`
-	Status          string    `json:"status"` // creating, running, stopped, error
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	ID              string     `json:"id"`
+	Name            string     `json:"name"`
+	RepositoryURL   string     `json:"repository_url"`
+	Branch          string     `json:"branch"`
+	Status          string     `json:"status"` // creating, running, stopped, error
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 	LastActiveAt    *time.Time `json:"last_active_at,omitempty"`
-	ContainerID     string    `json:"container_id,omitempty"`
-	CodeServerPort  int       `json:"code_server_port,omitempty"`
-	CodeServerURL   string    `json:"code_server_url,omitempty"`
+	ContainerID     string     `json:"container_id,omitempty"`
+	CodeServerPort  int        `json:"code_server_port,omitempty"`
+	CodeServerURL   string     `json:"code_server_url,omitempty"`
 }
 
 type WorkspaceCreate struct {
@@ -34,14 +37,18 @@ type WorkspaceCreate struct {
 }
 
 type WorkspaceStore struct {
-	mu       sync.RWMutex
-	workspaces map[string]*Workspace
-	now      func() time.Time
+	mu          sync.RWMutex
+	workspaces  map[string]*Workspace
+	managerURL  string
+	token       string
+	now         func() time.Time
 }
 
-func NewWorkspaceStore() *WorkspaceStore {
+func NewWorkspaceStore(managerURL, token string) *WorkspaceStore {
 	return &WorkspaceStore{
 		workspaces: make(map[string]*Workspace),
+		managerURL: managerURL,
+		token:      token,
 		now:        time.Now,
 	}
 }
@@ -130,14 +137,20 @@ func (s *WorkspaceStore) Delete(id string) error {
 var ErrWorkspaceNotFound = errors.New("workspace not found")
 
 type WorkspaceHandler struct {
-	store *WorkspaceStore
-	reg   *registry.Registry
+	store      *WorkspaceStore
+	reg        *registry.Registry
+	managerURL string
+	token      string
+	httpClient *http.Client
 }
 
-func NewWorkspaceHandler(reg *registry.Registry) *WorkspaceHandler {
+func NewWorkspaceHandler(reg *registry.Registry, managerURL, token string) *WorkspaceHandler {
 	return &WorkspaceHandler{
-		store: NewWorkspaceStore(),
-		reg:   reg,
+		store:      NewWorkspaceStore(managerURL, token),
+		reg:        reg,
+		managerURL: managerURL,
+		token:      token,
+		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
@@ -166,8 +179,54 @@ func (h *WorkspaceHandler) Create(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *WorkspaceHandler) List(w http.ResponseWriter, r *http.Request) {
+	// Sync with workspace manager for actual status
 	workspaces := h.store.List()
+	
+	// Update status from workspace manager
+	for i := range workspaces {
+		h.syncWorkspaceStatus(r.Context(), &workspaces[i])
+	}
+	
 	apierr.WriteJSON(w, http.StatusOK, workspaces)
+}
+
+func (h *WorkspaceHandler) syncWorkspaceStatus(ctx context.Context, ws *Workspace) {
+	url := h.managerURL + "/workspace/status?id=" + ws.ID
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+h.token)
+	
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+	
+	var statusResp struct {
+		Status          string `json:"status"`
+		CodeServerPort  int    `json:"code_server_port"`
+		ContainerID     string `json:"container_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&statusResp); err != nil {
+		return
+	}
+	
+	h.store.Update(ws.ID, func(w *Workspace) {
+		w.Status = statusResp.Status
+		w.CodeServerPort = statusResp.CodeServerPort
+		w.ContainerID = statusResp.ContainerID
+		w.CodeServerURL = "/workspace/" + ws.ID
+		if statusResp.Status == "running" {
+			now := h.store.now()
+			w.LastActiveAt = &now
+		}
+	})
 }
 
 func (h *WorkspaceHandler) Get(w http.ResponseWriter, r *http.Request) {
@@ -177,72 +236,150 @@ func (h *WorkspaceHandler) Get(w http.ResponseWriter, r *http.Request) {
 		apierr.WriteError(w, http.StatusNotFound, "not_found", "workspace not found")
 		return
 	}
+	
+	// Sync status before returning
+	h.syncWorkspaceStatus(r.Context(), ws)
+	
+	// Re-fetch updated workspace
+	ws, _ = h.store.Get(id)
 	apierr.WriteJSON(w, http.StatusOK, ws)
 }
 
 func (h *WorkspaceHandler) Start(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	
-	err := h.store.Update(id, func(ws *Workspace) {
-		ws.Status = "running"
-		now := h.store.now()
-		ws.LastActiveAt = &now
-		// In a real implementation, this would start a code-server container
-		// For now, we simulate with a placeholder URL
-		ws.CodeServerPort = 8080 + len(h.store.workspaces) // Simplified
-		ws.CodeServerURL = "/workspace/" + id
-		ws.ContainerID = "simulated-" + id
-	})
-	
+	ws, err := h.store.Get(id)
 	if err != nil {
-		if errors.Is(err, ErrWorkspaceNotFound) {
-			apierr.WriteError(w, http.StatusNotFound, "not_found", "workspace not found")
-			return
-		}
-		apierr.WriteError(w, http.StatusInternalServerError, "internal", "internal error")
+		apierr.WriteError(w, http.StatusNotFound, "not_found", "workspace not found")
 		return
 	}
 	
-	ws, _ := h.store.Get(id)
+	if ws.Status == "running" {
+		apierr.WriteError(w, http.StatusConflict, "conflict", "workspace already running")
+		return
+	}
+	
+	// Call workspace manager to start
+	url := h.managerURL + "/workspace/start"
+	body := map[string]interface{}{
+		"id":              ws.ID,
+		"name":            ws.Name,
+		"repository_url":  ws.RepositoryURL,
+		"branch":          ws.Branch,
+	}
+	jsonBody, _ := json.Marshal(body)
+	
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(jsonBody))
+	if err != nil {
+		apierr.WriteError(w, http.StatusInternalServerError, "internal", "internal error")
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+h.token)
+	req.Header.Set("Content-Type", "application/json")
+	
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		apierr.WriteError(w, http.StatusInternalServerError, "internal", "failed to contact workspace manager")
+		return
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode >= 400 {
+		var errResp apierr.ErrorResponse
+		_ = json.NewDecoder(resp.Body).Decode(&errResp)
+		apierr.WriteError(w, resp.StatusCode, errResp.Error.Code, errResp.Error.Message)
+		return
+	}
+	
+	// Sync status
+	h.syncWorkspaceStatus(r.Context(), ws)
+	ws, _ = h.store.Get(id)
 	apierr.WriteJSON(w, http.StatusOK, ws)
 }
 
 func (h *WorkspaceHandler) Stop(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	
-	err := h.store.Update(id, func(ws *Workspace) {
-		ws.Status = "stopped"
-		ws.CodeServerPort = 0
-		ws.CodeServerURL = ""
-		ws.ContainerID = ""
-	})
-	
+	ws, err := h.store.Get(id)
 	if err != nil {
-		if errors.Is(err, ErrWorkspaceNotFound) {
-			apierr.WriteError(w, http.StatusNotFound, "not_found", "workspace not found")
-			return
-		}
-		apierr.WriteError(w, http.StatusInternalServerError, "internal", "internal error")
+		apierr.WriteError(w, http.StatusNotFound, "not_found", "workspace not found")
 		return
 	}
 	
-	ws, _ := h.store.Get(id)
+	if ws.Status != "running" {
+		apierr.WriteError(w, http.StatusConflict, "conflict", "workspace not running")
+		return
+	}
+	
+	url := h.managerURL + "/workspace/stop"
+	body := map[string]string{"workspace_id": ws.ID}
+	jsonBody, _ := json.Marshal(body)
+	
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(jsonBody))
+	if err != nil {
+		apierr.WriteError(w, http.StatusInternalServerError, "internal", "internal error")
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+h.token)
+	req.Header.Set("Content-Type", "application/json")
+	
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		apierr.WriteError(w, http.StatusInternalServerError, "internal", "failed to contact workspace manager")
+		return
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode >= 400 {
+		var errResp apierr.ErrorResponse
+		_ = json.NewDecoder(resp.Body).Decode(&errResp)
+		apierr.WriteError(w, resp.StatusCode, errResp.Error.Code, errResp.Error.Message)
+		return
+	}
+	
+	h.syncWorkspaceStatus(r.Context(), ws)
+	ws, _ = h.store.Get(id)
 	apierr.WriteJSON(w, http.StatusOK, ws)
 }
 
 func (h *WorkspaceHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	
-	err := h.store.Delete(id)
+	ws, err := h.store.Get(id)
 	if err != nil {
-		if errors.Is(err, ErrWorkspaceNotFound) {
-			apierr.WriteError(w, http.StatusNotFound, "not_found", "workspace not found")
-			return
-		}
-		apierr.WriteError(w, http.StatusInternalServerError, "internal", "internal error")
+		apierr.WriteError(w, http.StatusNotFound, "not_found", "workspace not found")
 		return
 	}
 	
+	// Call workspace manager to delete
+	url := h.managerURL + "/workspace/delete"
+	body := map[string]string{"workspace_id": ws.ID}
+	jsonBody, _ := json.Marshal(body)
+	
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(jsonBody))
+	if err != nil {
+		apierr.WriteError(w, http.StatusInternalServerError, "internal", "internal error")
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+h.token)
+	req.Header.Set("Content-Type", "application/json")
+	
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		apierr.WriteError(w, http.StatusInternalServerError, "internal", "failed to contact workspace manager")
+		return
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode >= 400 {
+		var errResp apierr.ErrorResponse
+		_ = json.NewDecoder(resp.Body).Decode(&errResp)
+		apierr.WriteError(w, resp.StatusCode, errResp.Error.Code, errResp.Error.Message)
+		return
+	}
+	
+	// Remove from local store
+	_ = h.store.Delete(id)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -298,11 +435,11 @@ func (h *WorkspaceHandler) Update(w http.ResponseWriter, r *http.Request) {
 
 // Git status types
 type GitStatus struct {
-	Branch   string   `json:"branch"`
-	Ahead    int      `json:"ahead"`
-	Behind   int      `json:"behind"`
-	Staged   []string `json:"staged"`
-	Unstaged []string `json:"unstaged"`
+	Branch    string   `json:"branch"`
+	Ahead     int      `json:"ahead"`
+	Behind    int      `json:"behind"`
+	Staged    []string `json:"staged"`
+	Unstaged  []string `json:"unstaged"`
 	Untracked []string `json:"untracked"`
 }
 
@@ -332,15 +469,55 @@ func (h *WorkspaceHandler) GitStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
-	// In a real implementation, this would query the workspace container
-	// For now, return a simulated status
+	// Call workspace manager for git status
+	url := h.managerURL + "/workspace/git"
+	body := map[string]interface{}{
+		"workspace_id": ws.ID,
+		"command":      "status",
+	}
+	jsonBody, _ := json.Marshal(body)
+	
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(jsonBody))
+	if err != nil {
+		apierr.WriteError(w, http.StatusInternalServerError, "internal", "internal error")
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+h.token)
+	req.Header.Set("Content-Type", "application/json")
+	
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		apierr.WriteError(w, http.StatusInternalServerError, "internal", "failed to contact workspace manager")
+		return
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode >= 400 {
+		var errResp apierr.ErrorResponse
+		_ = json.NewDecoder(resp.Body).Decode(&errResp)
+		apierr.WriteError(w, resp.StatusCode, errResp.Error.Code, errResp.Error.Message)
+		return
+	}
+	
+	var gitResp struct {
+		Branch     string   `json:"branch"`
+		Staged     []string `json:"staged"`
+		Unstaged   []string `json:"unstaged"`
+		Untracked  []string `json:"untracked"`
+		RawOutput  string   `json:"raw_output"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&gitResp); err != nil {
+		apierr.WriteError(w, http.StatusInternalServerError, "internal", "failed to parse git status")
+		return
+	}
+	
 	status := GitStatus{
-		Branch:    ws.Branch,
-		Ahead:     0,
+		Branch:    gitResp.Branch,
+		Ahead:     0, // Would need git rev-list to compute
 		Behind:    0,
-		Staged:    []string{},
-		Unstaged:  []string{},
-		Untracked: []string{},
+		Staged:    gitResp.Staged,
+		Unstaged:  gitResp.Unstaged,
+		Untracked: gitResp.Untracked,
 	}
 	apierr.WriteJSON(w, http.StatusOK, status)
 }
@@ -358,14 +535,42 @@ func (h *WorkspaceHandler) GitAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
-	var req GitAddRequest
-	if err := readJSON(w, r, 64*1024, &req); err != nil {
+	var addReq GitAddRequest
+	if err := readJSON(w, r, 64*1024, &addReq); err != nil {
 		apierr.WriteError(w, http.StatusBadRequest, "bad_request", "invalid json")
 		return
 	}
 	
-	// In a real implementation, this would run `git add` in the workspace container
-	// For now, just acknowledge
+	url := h.managerURL + "/workspace/git"
+	body := map[string]interface{}{
+		"workspace_id": ws.ID,
+		"command":      "add",
+		"args":         addReq.Files,
+	}
+	jsonBody, _ := json.Marshal(body)
+	
+	httpReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(jsonBody))
+	if err != nil {
+		apierr.WriteError(w, http.StatusInternalServerError, "internal", "internal error")
+		return
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+h.token)
+	httpReq.Header.Set("Content-Type", "application/json")
+	
+	resp, err := h.httpClient.Do(httpReq)
+	if err != nil {
+		apierr.WriteError(w, http.StatusInternalServerError, "internal", "failed to contact workspace manager")
+		return
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode >= 400 {
+		var errResp apierr.ErrorResponse
+		_ = json.NewDecoder(resp.Body).Decode(&errResp)
+		apierr.WriteError(w, resp.StatusCode, errResp.Error.Code, errResp.Error.Message)
+		return
+	}
+	
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -382,21 +587,72 @@ func (h *WorkspaceHandler) GitCommit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
-	var req GitCommitRequest
-	if err := readJSON(w, r, 64*1024, &req); err != nil {
+	var commitReq GitCommitRequest
+	if err := readJSON(w, r, 64*1024, &commitReq); err != nil {
 		apierr.WriteError(w, http.StatusBadRequest, "bad_request", "invalid json")
 		return
 	}
 	
-	if req.Message == "" {
+	if commitReq.Message == "" {
 		apierr.WriteError(w, http.StatusBadRequest, "bad_request", "message is required")
 		return
 	}
 	
-	// In a real implementation, this would run `git commit` in the workspace container
-	// For now, return a simulated commit hash
+	url := h.managerURL + "/workspace/git"
+	body := map[string]interface{}{
+		"workspace_id": ws.ID,
+		"command":      "commit",
+		"args":         []string{commitReq.Message},
+	}
+	jsonBody, _ := json.Marshal(body)
+	
+	httpReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(jsonBody))
+	if err != nil {
+		apierr.WriteError(w, http.StatusInternalServerError, "internal", "internal error")
+		return
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+h.token)
+	httpReq.Header.Set("Content-Type", "application/json")
+	
+	resp, err := h.httpClient.Do(httpReq)
+	if err != nil {
+		apierr.WriteError(w, http.StatusInternalServerError, "internal", "failed to contact workspace manager")
+		return
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode >= 400 {
+		var errResp apierr.ErrorResponse
+		_ = json.NewDecoder(resp.Body).Decode(&errResp)
+		apierr.WriteError(w, resp.StatusCode, errResp.Error.Code, errResp.Error.Message)
+		return
+	}
+	
+	var result struct {
+		Output string `json:"output"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&result)
+	
+	// Extract commit hash from output
+	lines := strings.Split(result.Output, "\n")
+	commitHash := ""
+	for _, line := range lines {
+		if strings.HasPrefix(line, "[") && strings.Contains(line, "]") {
+			parts := strings.Split(line, " ")
+			for _, p := range parts {
+				if len(p) >= 7 && len(p) <= 40 {
+					commitHash = p
+					break
+				}
+			}
+		}
+	}
+	if commitHash == "" {
+		commitHash = "committed-" + time.Now().Format("20060102150405")
+	}
+	
 	apierr.WriteJSON(w, http.StatusOK, map[string]string{
-		"hash": "simulated-" + time.Now().Format("20060102150405"),
+		"hash": commitHash,
 	})
 }
 
@@ -413,10 +669,39 @@ func (h *WorkspaceHandler) GitPush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
-	var req GitPushPullRequest
-	_ = readJSON(w, r, 64*1024, &req)
+	var pushReq GitPushPullRequest
+	_ = readJSON(w, r, 64*1024, &pushReq)
 	
-	// In a real implementation, this would run `git push` in the workspace container
+	url := h.managerURL + "/workspace/git"
+	body := map[string]interface{}{
+		"workspace_id": ws.ID,
+		"command":      "push",
+		"args":         []string{pushReq.Remote, pushReq.Branch},
+	}
+	jsonBody, _ := json.Marshal(body)
+	
+	httpReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(jsonBody))
+	if err != nil {
+		apierr.WriteError(w, http.StatusInternalServerError, "internal", "internal error")
+		return
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+h.token)
+	httpReq.Header.Set("Content-Type", "application/json")
+	
+	resp, err := h.httpClient.Do(httpReq)
+	if err != nil {
+		apierr.WriteError(w, http.StatusInternalServerError, "internal", "failed to contact workspace manager")
+		return
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode >= 400 {
+		var errResp apierr.ErrorResponse
+		_ = json.NewDecoder(resp.Body).Decode(&errResp)
+		apierr.WriteError(w, resp.StatusCode, errResp.Error.Code, errResp.Error.Message)
+		return
+	}
+	
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -433,9 +718,38 @@ func (h *WorkspaceHandler) GitPull(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
-	var req GitPushPullRequest
-	_ = readJSON(w, r, 64*1024, &req)
+	var pullReq GitPushPullRequest
+	_ = readJSON(w, r, 64*1024, &pullReq)
 	
-	// In a real implementation, this would run `git pull` in the workspace container
+	url := h.managerURL + "/workspace/git"
+	body := map[string]interface{}{
+		"workspace_id": ws.ID,
+		"command":      "pull",
+		"args":         []string{pullReq.Remote, pullReq.Branch},
+	}
+	jsonBody, _ := json.Marshal(body)
+	
+	httpReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(jsonBody))
+	if err != nil {
+		apierr.WriteError(w, http.StatusInternalServerError, "internal", "internal error")
+		return
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+h.token)
+	httpReq.Header.Set("Content-Type", "application/json")
+	
+	resp, err := h.httpClient.Do(httpReq)
+	if err != nil {
+		apierr.WriteError(w, http.StatusInternalServerError, "internal", "failed to contact workspace manager")
+		return
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode >= 400 {
+		var errResp apierr.ErrorResponse
+		_ = json.NewDecoder(resp.Body).Decode(&errResp)
+		apierr.WriteError(w, resp.StatusCode, errResp.Error.Code, errResp.Error.Message)
+		return
+	}
+	
 	w.WriteHeader(http.StatusNoContent)
 }

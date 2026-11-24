@@ -27,7 +27,7 @@ func NewRouter(cfg *config.Config, reg *registry.Registry, queue *scheduler.Queu
 	mux.HandleFunc("GET /v1/jobs/{id}", jobHandler.Get)
 	mux.HandleFunc("POST /v1/jobs/{id}/finish", jobHandler.Finish)
 
-	workspaceHandler := NewWorkspaceHandler(reg)
+	workspaceHandler := NewWorkspaceHandler(reg, cfg.WorkspaceManagerURL, cfg.Token)
 	mux.HandleFunc("POST /v1/workspaces", workspaceHandler.Create)
 	mux.HandleFunc("GET /v1/workspaces", workspaceHandler.List)
 	mux.HandleFunc("GET /v1/workspaces/{id}", workspaceHandler.Get)
