@@ -1,0 +1,105 @@
+version: '3.8'
+
+services:
+  # Kamui Coordinator API
+  api:
+    build:
+      context: ../api
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - KAMUI_TOKEN=${KAMUI_TOKEN:-dev}
+    volumes:
+      - kamui-api-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - kamui-network
+
+  # Kamui Console (Next.js) - Mobile Workspace UI
+  console:
+    build:
+      context: ../console
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://api:8080
+      - KAMUI_TOKEN=${KAMUI_TOKEN:-dev}
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - kamui-network
+
+  # Workspace Reverse Proxy (nginx) - routes to code-server instances
+  workspace-proxy:
+    image: nginx:alpine
+    ports:
+      - "8081:80"
+    volumes:
+      - ./nginx/workspace-proxy.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - console
+    restart: unless-stopped
+    networks:
+      - kamui-network
+
+  # Workspace Manager - manages code-server containers via Docker API
+  workspace-manager:
+    build:
+      context: ../api
+      dockerfile: Dockerfile.workspace-manager
+    environment:
+      - KAMUI_TOKEN=${KAMUI_TOKEN:-dev}
+      - API_URL=http://api:8080
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - kamui-workspaces:/workspaces
+    depends_on:
+      - api
+    restart: unless-stopped
+    networks:
+      - kamui-network
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+  # Tailscale for remote access (optional)
+  tailscale:
+    image: tailscale/tailscale:latest
+    hostname: kamui-server
+    environment:
+      - TS_AUTHKEY=${TAILSCALE_AUTHKEY}
+      - TS_HOSTNAME=kamui-server
+      - TS_EXTRA_ARGS=--advertise-routes=192.168.0.0/16,10.0.0.0/8 --accept-routes
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    restart: unless-stopped
+    network_mode: host
+    profiles:
+      - remote
+
+volumes:
+  kamui-api-data:
+  kamui-workspaces:
+  tailscale-state:
+
+networks:
+  kamui-network:
+    driver: bridge

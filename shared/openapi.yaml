@@ -11,6 +11,7 @@ tags:
   - name: health
   - name: nodes
   - name: jobs
+  - name: workspaces
   - name: store
   - name: infer
 paths:
@@ -217,6 +218,259 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+  /v1/workspaces:
+    post:
+      tags: [workspaces]
+      operationId: createWorkspace
+      summary: Create a new coding workspace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WorkspaceCreate"
+      responses:
+        "201":
+          description: Workspace created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Workspace"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    get:
+      tags: [workspaces]
+      operationId: listWorkspaces
+      summary: List all workspaces
+      responses:
+        "200":
+          description: All workspaces
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Workspace"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/workspaces/{id}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      tags: [workspaces]
+      operationId: getWorkspace
+      summary: Get workspace details
+      responses:
+        "200":
+          description: The workspace
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Workspace"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [workspaces]
+      operationId: updateWorkspace
+      summary: Update workspace status (used by workspace manager)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WorkspaceUpdate"
+      responses:
+        "200":
+          description: Workspace updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Workspace"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [workspaces]
+      operationId: deleteWorkspace
+      summary: Delete a workspace
+      responses:
+        "204":
+          description: Workspace deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/workspaces/{id}/start:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      tags: [workspaces]
+      operationId: startWorkspace
+      summary: Start a workspace (launch code-server container)
+      responses:
+        "200":
+          description: Workspace started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Workspace"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /v1/workspaces/{id}/stop:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      tags: [workspaces]
+      operationId: stopWorkspace
+      summary: Stop a workspace
+      responses:
+        "200":
+          description: Workspace stopped
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Workspace"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /v1/workspaces/{id}/git/status:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      tags: [workspaces]
+      operationId: getGitStatus
+      summary: Get git status for workspace
+      responses:
+        "200":
+          description: Git status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GitStatus"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /v1/workspaces/{id}/git/add:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      tags: [workspaces]
+      operationId: gitAdd
+      summary: Stage files for commit
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GitAddRequest"
+      responses:
+        "204":
+          description: Files staged
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /v1/workspaces/{id}/git/commit:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      tags: [workspaces]
+      operationId: gitCommit
+      summary: Commit staged changes
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GitCommitRequest"
+      responses:
+        "200":
+          description: Commit created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [hash]
+                properties:
+                  hash:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /v1/workspaces/{id}/git/push:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      tags: [workspaces]
+      operationId: gitPush
+      summary: Push commits to remote
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GitPushPullRequest"
+      responses:
+        "204":
+          description: Pushed to remote
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /v1/workspaces/{id}/git/pull:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      tags: [workspaces]
+      operationId: gitPull
+      summary: Pull changes from remote
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GitPushPullRequest"
+      responses:
+        "204":
+          description: Pulled from remote
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
   /v1/{bucket}:
     servers:
       - url: http://localhost:9000
@@ -362,6 +616,12 @@ components:
       schema:
         type: string
     JobId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+    WorkspaceId:
       name: id
       in: path
       required: true
@@ -585,3 +845,145 @@ components:
         modified:
           type: string
           format: date-time
+    WorkspaceCreate:
+      type: object
+      required: [name, repository_url]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+        repository_url:
+          type: string
+          format: uri
+        branch:
+          type: string
+          default: main
+      example:
+        name: my-project
+        repository_url: https://github.com/user/repo.git
+        branch: main
+    Workspace:
+      type: object
+      required: [id, name, repository_url, branch, status, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        repository_url:
+          type: string
+        branch:
+          type: string
+        status:
+          type: string
+          enum: [creating, running, stopped, error]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        last_active_at:
+          type: string
+          format: date-time
+        container_id:
+          type: string
+        code_server_port:
+          type: integer
+        code_server_url:
+          type: string
+      example:
+        id: ws-7f3a9b2c
+        name: my-project
+        repository_url: https://github.com/user/repo.git
+        branch: main
+        status: running
+        created_at: "2026-01-15T10:00:00Z"
+        updated_at: "2026-01-15T10:05:00Z"
+        last_active_at: "2026-01-15T10:05:00Z"
+        container_id: abc123def456
+        code_server_port: 8081
+        code_server_url: /workspace/ws-7f3a9b2c
+    GitStatus:
+      type: object
+      required: [branch, ahead, behind, staged, unstaged, untracked]
+      properties:
+        branch:
+          type: string
+        ahead:
+          type: integer
+          minimum: 0
+        behind:
+          type: integer
+          minimum: 0
+        staged:
+          type: array
+          items:
+            type: string
+        unstaged:
+          type: array
+          items:
+            type: string
+        untracked:
+          type: array
+          items:
+            type: string
+      example:
+        branch: main
+        ahead: 1
+        behind: 0
+        staged: ["src/main.go"]
+        unstaged: ["README.md"]
+        untracked: ["temp.log"]
+    GitAddRequest:
+      type: object
+      required: [files]
+      properties:
+        files:
+          type: array
+          items:
+            type: string
+      example:
+        files: ["src/main.go", "README.md"]
+    GitCommitRequest:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+          minLength: 1
+      example:
+        message: "Add new feature"
+    GitPushPullRequest:
+      type: object
+      properties:
+        remote:
+          type: string
+          default: origin
+        branch:
+          type: string
+      example:
+        remote: origin
+        branch: main
+    WorkspaceUpdate:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [creating, running, stopped, error]
+        code_server_port:
+          type: integer
+        code_server_url:
+          type: string
+        container_id:
+          type: string
+        last_active_at:
+          type: string
+          format: date-time
+      example:
+        status: running
+        code_server_port: 8081
+        code_server_url: /workspace/ws-7f3a9b2c
+        container_id: abc123def456
+        last_active_at: "2026-01-15T10:05:00Z"

@@ -1,0 +1,23 @@
+# Workspace Manager - manages code-server containers
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /app
+RUN apk add --no-cache git
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o workspace-manager ./cmd/workspace-manager
+
+FROM alpine:3.20
+RUN apk add --no-cache docker-cli git
+
+WORKDIR /app
+COPY --from=builder /app/workspace-manager .
+
+# Create non-root user
+RUN adduser -D -u 1000 coder
+USER coder
+
+ENTRYPOINT ["./workspace-manager"]

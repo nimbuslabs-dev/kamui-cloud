@@ -27,6 +27,20 @@ func NewRouter(cfg *config.Config, reg *registry.Registry, queue *scheduler.Queu
 	mux.HandleFunc("GET /v1/jobs/{id}", jobHandler.Get)
 	mux.HandleFunc("POST /v1/jobs/{id}/finish", jobHandler.Finish)
 
+	workspaceHandler := NewWorkspaceHandler(reg)
+	mux.HandleFunc("POST /v1/workspaces", workspaceHandler.Create)
+	mux.HandleFunc("GET /v1/workspaces", workspaceHandler.List)
+	mux.HandleFunc("GET /v1/workspaces/{id}", workspaceHandler.Get)
+	mux.HandleFunc("PATCH /v1/workspaces/{id}", workspaceHandler.Update)
+	mux.HandleFunc("POST /v1/workspaces/{id}/start", workspaceHandler.Start)
+	mux.HandleFunc("POST /v1/workspaces/{id}/stop", workspaceHandler.Stop)
+	mux.HandleFunc("DELETE /v1/workspaces/{id}", workspaceHandler.Delete)
+	mux.HandleFunc("GET /v1/workspaces/{id}/git/status", workspaceHandler.GitStatus)
+	mux.HandleFunc("POST /v1/workspaces/{id}/git/add", workspaceHandler.GitAdd)
+	mux.HandleFunc("POST /v1/workspaces/{id}/git/commit", workspaceHandler.GitCommit)
+	mux.HandleFunc("POST /v1/workspaces/{id}/git/push", workspaceHandler.GitPush)
+	mux.HandleFunc("POST /v1/workspaces/{id}/git/pull", workspaceHandler.GitPull)
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		apierr.WriteError(w, http.StatusNotFound, "not_found", "not found")
 	})
