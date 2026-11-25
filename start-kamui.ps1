@@ -7,7 +7,7 @@
     - Validates Docker environment
     - Creates .env from .env.example if missing
     - Generates secure KAMUI_TOKEN if not present
-    - Builds and starts all services
+    - Builds and starts all services (detached by default)
     - Waits for health checks
     - Reports LAN-accessible URLs
 
@@ -19,13 +19,14 @@
     .\start-kamui.ps1
     .\start-kamui.ps1 -CleanBuild
     .\start-kamui.ps1 -SkipBuild
+    .\start-kamui.ps1 -Attach
 #>
 
 [CmdletBinding()]
 param(
     [switch]$CleanBuild,
     [switch]$SkipBuild,
-    [switch]$Detach,
+    [switch]$Attach,
     [string]$ComposeFile = "ops/docker-compose.yml",
     [string]$EnvFile = "ops/.env",
     [string]$EnvExampleFile = "ops/.env.example",
@@ -171,7 +172,15 @@ function Setup-Environment {
     $envContent = Get-Content $EnvPath -Raw
     
     # Check if KAMUI_TOKEN needs generation
-    if ($envContent -match '^KAMUI_TOKEN\s*=\s*(dev-change-me-in-production|$)' -or $envContent -notmatch '^KAMUI_TOKEN\s*=') {
+    # Pattern: empty, missing, or default placeholder
+    $needsToken = $false
+    if ($envContent -notmatch '(?m)^KAMUI_TOKEN\s*=\s*\S+') {
+        $needsToken = $true
+    } elseif ($envContent -match '(?m)^KAMUI_TOKEN\s*=\s*dev-change-me-in-production') {
+        $needsToken = $true
+    }
+    
+    if ($needsToken) {
         Write-Info "Generating secure KAMUI_TOKEN..."
         $bytes = New-Object byte[] 32
         $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
@@ -179,13 +188,16 @@ function Setup-Environment {
         $token = [System.BitConverter]::ToString($bytes).Replace('-', '').ToLower()
         
         # Update or add KAMUI_TOKEN
-        if ($envContent -match '^KAMUI_TOKEN\s*=') {
-            $envContent = $envContent -replace '^KAMUI_TOKEN\s*=.*', "KAMUI_TOKEN=$token"
+        if ($envContent -match '(?m)^KAMUI_TOKEN\s*=') {
+            $envContent = $envContent -replace '(?m)^KAMUI_TOKEN\s*=.*', "KAMUI_TOKEN=$token"
         } else {
             $envContent += "`nKAMUI_TOKEN=$token"
         }
         
-        Set-Content $EnvPath -Value $envContent -NoNewline
+        # Ensure no trailing newline issues
+        $envContent = $envContent.TrimEnd("`r", "`n") + "`n"
+        
+        Set-Content $EnvPath -Value $envContent -NoNewline -Encoding UTF8
         Write-Success "Generated secure KAMUI_TOKEN (not displayed for security)"
     } else {
         Write-Success "KAMUI_TOKEN already configured"
@@ -201,9 +213,8 @@ function Build-Images {
     }
     
     Write-Info "Building Docker images..."
-    $buildArgs = @("compose", "-f", $ComposePath)
+    $buildArgs = @("compose", "-f", $ComposePath, "build")
     if ($CleanBuild) { $buildArgs += "--no-cache" }
-    $buildArgs += "build"
     
     try {
         $result = docker @buildArgs 2>&1
@@ -223,14 +234,14 @@ function Build-Images {
 }
 
 function Start-Services {
-    Write-Info "Starting Kamui Cloud services..."
-    $upArgs = @("compose", "-f", $ComposePath, "up")
-    if ($Detach) { $upArgs += "-d" }
+    Write-Info "Starting Kamui Cloud services (detached)..."
+    $upArgs = @("compose", "-f", $ComposePath, "up", "-d")
+    if ($Attach) { $upArgs = @("compose", "-f", $ComposePath, "up") }
     
     try {
         $result = docker @upArgs 2>&1
         $lastExitCode = $LASTEXITCODE
-        if ($lastExitCode -eq 0 -or $Detach) {
+        if ($lastExitCode -eq 0) {
             Write-Success "Services started"
             return $true
         } else {
@@ -244,37 +255,58 @@ function Start-Services {
     }
 }
 
+function Get-ServiceHealth {
+    param([string]$ServiceName)
+    try {
+        $status = docker compose -f $ComposePath ps -a --format json $ServiceName 2>$null | ConvertFrom-Json
+        if ($status) {
+            return @{
+                State = $status.State
+                Health = if ($status.Health) { $status.Health } else { "none" }
+            }
+        }
+    } catch {}
+    return @{ State = "unknown"; Health = "unknown" }
+}
+
 function Wait-For-Health {
     Write-Info "Waiting for services to become healthy (timeout: ${HealthTimeoutSeconds}s)..."
     $startTime = Get-Date
     $timeout = New-TimeSpan -Seconds $HealthTimeoutSeconds
     $services = @("api", "console", "workspace-proxy", "workspace-manager")
-    $healthy = @{}
+    $serviceHealth = @{}
     
     while ((Get-Date) - $startTime -lt $timeout) {
-        $allHealthy = $true
+        $allReady = $true
         foreach ($svc in $services) {
-            if ($healthy.ContainsKey($svc)) { continue }
+            if ($serviceHealth.ContainsKey($svc)) { continue }
             
-            try {
-                $status = docker compose -f $ComposePath ps -a --format json $svc 2>$null | ConvertFrom-Json
-                if ($status -and $status.Health -eq "healthy") {
-                    $healthy[$svc] = $true
-                    Write-Success "$svc is healthy"
-                } elseif ($status -and $status.State -eq "running") {
-                    Write-Status "  $svc: running (waiting for health check...)" $Yellow
-                    $allHealthy = $false
-                } else {
-                    Write-Status "  $svc: $($status.State)" $Yellow
-                    $allHealthy = $false
-                }
-            } catch {
-                $allHealthy = $false
+            $health = Get-ServiceHealth $svc
+            $state = $health.State
+            $healthStatus = $health.Health
+            
+            # Service is ready if: healthy, or running with no health check configured
+            $isReady = $false
+            if ($healthStatus -eq "healthy") {
+                $isReady = $true
+            } elseif ($state -eq "running" -and $healthStatus -eq "none") {
+                # Services without health checks (like nginx) are ready when running
+                $isReady = $true
+            } elseif ($state -eq "healthy") {
+                $isReady = $true
+            }
+            
+            if ($isReady) {
+                $serviceHealth[$svc] = $true
+                Write-Success "$svc is ready (state: $state, health: $healthStatus)"
+            } else {
+                $allReady = $false
+                Write-Status "  $svc: state=$state, health=$healthStatus" $Yellow
             }
         }
         
-        if ($healthy.Count -eq $services.Count) {
-            Write-Success "All services healthy!"
+        if ($serviceHealth.Count -eq $services.Count) {
+            Write-Success "All services ready!"
             return $true
         }
         
@@ -288,12 +320,63 @@ function Wait-For-Health {
 
 function Get-LanIP {
     try {
+        # Get physical network adapters only (exclude virtual, loopback, tunnel adapters)
+        $adapters = Get-NetAdapter -Physical 2>$null | Where-Object { $_.Status -eq "Up" }
+        if ($adapters) {
+            $ips = $adapters | Get-NetIPAddress -AddressFamily IPv4 | Where-Object { 
+                $_.PrefixOrigin -in @("Dhcp", "Manual") -and 
+                $_.IPAddress -notlike "127.*" -and 
+                $_.IPAddress -notlike "169.254.*" -and
+                $_.IPAddress -notlike "172.16.*" -and  # Docker default
+                $_.IPAddress -notlike "172.17.*" -and  # Docker default
+                $_.IPAddress -notlike "172.18.*" -and  # Docker default
+                $_.IPAddress -notlike "172.19.*" -and  # Docker default
+                $_.IPAddress -notlike "172.20.*" -and  # Docker default
+                $_.IPAddress -notlike "172.21.*" -and  # Docker default
+                $_.IPAddress -notlike "172.22.*" -and  # Docker default
+                $_.IPAddress -notlike "172.23.*" -and  # Docker default
+                $_.IPAddress -notlike "172.24.*" -and  # Docker default
+                $_.IPAddress -notlike "172.25.*" -and  # Docker default
+                $_.IPAddress -notlike "172.26.*" -and  # Docker default
+                $_.IPAddress -notlike "172.27.*" -and  # Docker default
+                $_.IPAddress -notlike "172.28.*" -and  # Docker default
+                $_.IPAddress -notlike "172.29.*" -and  # Docker default
+                $_.IPAddress -notlike "172.30.*" -and  # Docker default
+                $_.IPAddress -notlike "172.31.*" -and  # Docker default
+                $_.IPAddress -notlike "10.0.75.*" -and  # WSL2 typical
+                $_.IPAddress -notlike "10.255.*"       # VPN typical
+            } | Select-Object -ExpandProperty IPAddress
+            if ($ips) { return $ips[0] }
+        }
+        
+        # Fallback: try Get-NetIPAddress with more specific filtering
         $ips = Get-NetIPAddress -AddressFamily IPv4 | Where-Object { 
-            $_.PrefixOrigin -ne "WellKnown" -and 
+            $_.PrefixOrigin -in @("Dhcp", "Manual") -and 
             $_.IPAddress -notlike "127.*" -and 
-            $_.IPAddress -notlike "169.254.*" 
+            $_.IPAddress -notlike "169.254.*" -and
+            $_.IPAddress -notlike "172.16.*" -and
+            $_.IPAddress -notlike "172.17.*" -and
+            $_.IPAddress -notlike "172.18.*" -and
+            $_.IPAddress -notlike "172.19.*" -and
+            $_.IPAddress -notlike "172.20.*" -and
+            $_.IPAddress -notlike "172.21.*" -and
+            $_.IPAddress -notlike "172.22.*" -and
+            $_.IPAddress -notlike "172.23.*" -and
+            $_.IPAddress -notlike "172.24.*" -and
+            $_.IPAddress -notlike "172.25.*" -and
+            $_.IPAddress -notlike "172.26.*" -and
+            $_.IPAddress -notlike "172.27.*" -and
+            $_.IPAddress -notlike "172.27.*" -and
+            $_.IPAddress -notlike "172.28.*" -and
+            $_.IPAddress -notlike "172.29.*" -and
+            $_.IPAddress -notlike "172.30.*" -and
+            $_.IPAddress -notlike "172.31.*" -and
+            $_.IPAddress -notlike "10.0.75.*" -and
+            $_.IPAddress -notlike "10.255.*"
         } | Select-Object -ExpandProperty IPAddress
-        return $ips[0]
+        if ($ips) { return $ips[0] }
+        
+        return "unknown"
     } catch {
         return "unknown"
     }

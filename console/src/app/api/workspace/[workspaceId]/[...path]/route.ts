@@ -1,5 +1,6 @@
-// Workspace Info - Returns workspace details for the frontend
-// Actual proxying to code-server is handled by nginx
+// Workspace Proxy - Proxies requests to code-server containers
+// Note: Actual proxying is handled by nginx in production.
+// This endpoint provides workspace metadata only.
 
 import { NextRequest, NextResponse } from 'next/server';
 

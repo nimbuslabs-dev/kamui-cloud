@@ -1,4 +1,4 @@
-// Workspaces API Routes - Proxy to Kamui Go API
+// Workspaces API Routes - Proxy to Kamui Go API (server-side only)
 
 import { NextRequest, NextResponse } from 'next/server';
 
@@ -17,14 +17,13 @@ async function proxyRequest(
   options: RequestInit = {}
 ): Promise<Response> {
   const url = `${API_BASE}${path}`;
-  const response = await fetch(url, {
+  return fetch(url, {
     ...options,
     headers: {
       ...getAuthHeaders(),
       ...options.headers,
     },
   });
-  return response;
 }
 
 // GET /api/workspaces - List all workspaces

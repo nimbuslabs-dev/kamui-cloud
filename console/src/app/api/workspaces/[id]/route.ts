@@ -44,6 +44,28 @@ export async function GET(
   }
 }
 
+// PATCH /api/workspaces/[id] - Update workspace (used by workspace manager)
+export async function PATCH(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  try {
+    const { id } = await params;
+    const body = await request.json();
+    const response = await proxyRequest(`/v1/workspaces/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    });
+    const data = await response.json();
+    return NextResponse.json(data, { status: response.status });
+  } catch (error) {
+    return NextResponse.json(
+      { error: { code: 'internal', message: 'Failed to update workspace' } },
+      { status: 500 }
+    );
+  }
+}
+
 // DELETE /api/workspaces/[id] - Delete workspace
 export async function DELETE(
   request: NextRequest,

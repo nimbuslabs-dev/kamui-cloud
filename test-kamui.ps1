@@ -117,7 +117,7 @@ if (-not (Test-Path $EnvPath)) {
 
 # Load token from .env
 $envContent = Get-Content $EnvPath -Raw
-$tokenMatch = [regex]::Match($envContent, '^KAMUI_TOKEN\s*=\s*(\S+)', [System.Text.RegularExpressions.RegexOptions]::Multiline)
+$tokenMatch = [regex]::Match($envContent, '(?m)^KAMUI_TOKEN\s*=\s*(\S+)')
 if (-not $tokenMatch.Success) {
     Write-Error "KAMUI_TOKEN not found in .env"
     exit 1

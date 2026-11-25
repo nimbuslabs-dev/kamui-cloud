@@ -139,15 +139,30 @@ Workspace Manager connects to Docker Engine via read-only socket mount.
 
 ## GitHub Authentication
 
-For private repositories, use HTTPS URLs with a Personal Access Token:
+**Warning: Embedding tokens in repository URLs is insecure.** Tokens in URLs can leak into:
+- Git configuration (`.git/config`)
+- Shell history
+- Browser history and referrer headers
+- Docker build logs
+- CI/CD logs
 
+**Recommended: Use GitHub CLI or credential helper instead.**
+
+```bash
+# In the code-server terminal, authenticate once:
+gh auth login
+
+# Or configure Git credential helper:
+git config --global credential.helper store
+# Then on first push, enter token as password (not saved in URL)
 ```
-https://<TOKEN>@github.com/user/private-repo.git
-```
 
-Create token at: GitHub Settings → Developer settings → Personal access tokens → Tokens (classic)
+If you must use HTTPS URLs with tokens (e.g., for automation), use a **fine-grained personal access token** with minimal scopes:
+- Repository access: Only the specific repository
+- Permissions: Contents (read/write), Metadata (read)
+- Expiration: Set reasonable expiry
 
-Required scopes: `repo` (full control of private repositories)
+Never use classic tokens with `repo` scope in URLs.
 
 ## Persistence
 
@@ -174,7 +189,9 @@ Workspaces use Docker volumes:
 - Workspace Manager has read-only Docker socket access (privileged component)
 - Tailscale provides encrypted mesh network (optional)
 - All inter-service communication on isolated Docker network
-- GitHub tokens only in repository URLs (never in logs or browser)
+- GitHub credentials handled via Git credential helper, never in URLs
+- API token never exposed to browser (used only by frontend to call API)
+- code-server runs with `--auth none` for simplicity; enable password for production
 
 ## Testing Checklist
 
@@ -207,7 +224,7 @@ Workspaces use Docker volumes:
 1. **Single-user only** - No multi-user isolation yet (single shared KAMUI_TOKEN)
 2. **No resource quotas** - Can start unlimited workspaces (recommend max 2-3 on 16GB)
 3. **No HTTPS on LAN** - Self-signed certs needed for production (use mkcert)
-4. **GitHub tokens in URLs** - Tokens embedded in repository URLs (use GitHub App for production)
+4. **GitHub auth via credential helper** - Tokens not embedded in URLs; use `gh auth login` in terminal
 5. **Tailscale optional** - Remote access requires manual Tailscale setup
 6. **code-server auth disabled** - `--auth none` for simplicity; enable password for production
 
@@ -237,10 +254,11 @@ Workspaces use Docker volumes:
 - Ensure workspace is in "running" state (not "creating" or "stopped")
 
 ### "Git push fails"
-- Verify GitHub token has `repo` scope
-- Check repository URL format: `https://TOKEN@github.com/...`
+- Verify GitHub authentication: run `gh auth status` in code-server terminal
+- If using HTTPS URL with token: check token is valid and not expired
 - Check network access to github.com
 - Check workspace is running: `.\status-kamui.ps1`
+- Ensure Git credential helper is configured: `git config --global credential.helper store`
 
 ### Phone can't reach server
 - Verify both on same Wi-Fi (not guest network)
@@ -260,13 +278,13 @@ Workspaces use Docker volumes:
 ### Automated Scripts
 
 ```powershell
-# One-command startup (Windows)
+# One-command startup (Windows) - detached by default
 .\start-kamui.ps1
 
 # Check status
 .\status-kamui.ps1
 
-# Run smoke tests
+# Run smoke tests (15 automated tests)
 .\test-kamui.ps1
 
 # Stop services (preserves data)
@@ -289,6 +307,12 @@ KAMUI_TOKEN=dev go run ./cmd/api
 cd api && go test -race ./...
 cd console && npm run type-check && npm run lint
 ```
+
+### Security Model
+
+The frontend never sees the `KAMUI_TOKEN`. All API calls go through Next.js API routes (`/api/...`) which run server-side and inject the `Bearer` token before proxying to the Go API. This keeps the token server-side and never exposes it to the browser.
+
+Workspace code-server is proxied through nginx at `/workspace/{id}/*` with WebSocket support for the terminal/editor.
 
 ## License
 
