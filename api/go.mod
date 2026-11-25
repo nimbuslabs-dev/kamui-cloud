@@ -1,6 +1,6 @@
 module github.com/nimbuslabs-dev/kamui-cloud/api
 
-go 1.27.2
+go 1.26.0
 
 require (
 	github.com/docker/docker v28.5.2+incompatible

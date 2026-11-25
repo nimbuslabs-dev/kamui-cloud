@@ -1,6 +1,9 @@
 # Workspace Manager - manages code-server containers
 FROM golang:1.22-alpine AS builder
 
+# Note: Go version matches api/go.mod (go 1.22)
+# Update both together if upgrading Go version
+
 WORKDIR /app
 RUN apk add --no-cache git
 

@@ -6,39 +6,39 @@ A working prototype for coding from your phone using a real browser-based IDE (c
 
 ### Prerequisites
 
-- Docker and Docker Compose
+- Windows 10/11 with Docker Desktop 29+ (WSL2 backend)
 - GitHub account (for private repos)
 - Android phone on same Wi-Fi (for mobile testing)
 - Tailscale account (optional, for remote access)
 
-### 1. Configure Environment
+### 1. One-Command Startup (Windows PowerShell)
 
-```bash
-cd /Users/kyzenn/Projects/kamui-cloud/ops
-
-# Copy and edit environment
-cp .env.example .env
-# Edit .env with your values:
-# KAMUI_TOKEN=your-secure-token
-# TAILSCALE_AUTHKEY=tskey-xxx (optional)
+```powershell
+# From repository root (C:\Users\lifeg\Downloads\kamui-cloud)
+.\start-kamui.ps1
 ```
 
-### 2. Start Services
+This single command:
+- Validates Docker environment
+- Creates `.env` with secure `KAMUI_TOKEN` if missing
+- Builds all Docker images
+- Starts all services (API, Console, nginx Proxy, Workspace Manager)
+- Waits for health checks
+- Reports the LAN-accessible URL for your phone
+
+### Manual Startup (if needed)
 
 ```bash
 # From ops directory
+cd ops
+cp .env.example .env
+# Edit .env if needed (token auto-generated on first run)
 docker compose up -d --build
 ```
 
-This starts:
-- **API** (port 8080) - Kamui coordinator with workspace management
-- **Console** (port 3000) - Next.js mobile UI
-- **Workspace Proxy** (port 8081) - Nginx reverse proxy for code-server instances
-- **Tailscale** (optional) - For remote access
-
 ### 3. Access from Phone
 
-1. Find your server's LAN IP: `ip addr show` (Linux) or `ipconfig` (Windows)
+1. Find your server's LAN IP (shown by `start-kamui.ps1` or run `.\status-kamui.ps1`)
 2. On your Android phone, open browser to `http://<SERVER_IP>:8081`
 3. You should see the Kamui Cloud mobile workspace UI
 
@@ -51,11 +51,11 @@ This starts:
    - **Branch**: `main` (default)
 3. Tap "Create Workspace"
 4. Tap "Start" on the workspace card
-5. Tap "Open IDE" → code-server opens in new tab
+4. Tap "Open IDE" → code-server opens in new tab
 
 ### 5. Code and Push
 
-1. In code-server: edit files, use terminal (`Ctrl+``)
+1. In code-server: edit files, use terminal (`Ctrl+\``)
 2. Back in Kamui UI: tap the workspace to see Git panel
 3. Stage files → enter commit message → "Commit"
 4. Tap "Push" → changes go to GitHub
@@ -70,31 +70,45 @@ This starts:
 ## Architecture
 
 ```
-Phone Browser
+Phone Browser (Android)
     │
     ▼
-┌─────────────────────────────────────┐
-│  Workspace Proxy (nginx:8081)       │
-│  - Routes /workspace/{id}/*         │
-│  - WebSocket proxy for code-server  │
-└─────────────────────────────────────┘
-    │
-    ├──────────────────┬──────────────────┐
-    ▼                  ▼                  ▼
-┌─────────┐      ┌─────────────┐   ┌───────────┐
-│ Console │      │    API      │   │code-server│
-│(Next.js)│      │   (Go)      │   │containers │
-│ Port 3000│      │  Port 8080  │   │  Port 8081+│
-└─────────┘      └─────────────┘   └───────────┘
-                      │
-                      ▼
-               ┌─────────────┐
-               │  Docker     │
-               │  Volumes    │
-               │ (workspace  │
-               │  data)      │
-               └─────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│  Workspace Proxy (nginx:8081)                               │
+│  - Routes /                    → Console (Next.js)          │
+│  - Routes /api/               → API (Go)                    │
+│  - Routes /workspace/{id}/*   → code-server container       │
+│  - WebSocket proxy for code-server terminal/editor          │
+└─────────────────────────────────────────────────────────────┘
+    │                          │                          │
+    ▼                          ▼                          ▼
+┌──────────────┐         ┌──────────────┐         ┌──────────────────┐
+│  Console     │         │    API       │         │ code-server      │
+│  (Next.js)   │         │   (Go)       │         │ containers       │
+│  Port 3000   │         │  Port 8080   │         │  Port 8080       │
+│              │         │              │         │  (per workspace) │
+└──────────────┘         └──────────────┘         └──────────────────┘
+                                                      │
+                                                      ▼
+                                               ┌──────────────────┐
+                                               │  Workspace       │
+                                               │  Manager         │
+                                               │  (Go + Docker    │
+                                               │   API)           │
+                                               │  Port 8082       │
+                                               └──────────────────┘
+                                                      │
+                                                      ▼
+                                               ┌──────────────────┐
+                                               │  Docker Volumes  │
+                                               │  kamui-workspaces│
+                                               │  kamui-api-data  │
+                                               │  tailscale-state │
+                                               └──────────────────┘
 ```
+
+All services communicate on the `kamui-network` (attachable bridge).
+Workspace Manager connects to Docker Engine via read-only socket mount.
 
 ## Services
 
@@ -104,6 +118,7 @@ Phone Browser
 | Console | 3000 | Next.js mobile UI |
 | Workspace Proxy | 8081 | Nginx reverse proxy + WebSocket |
 | code-server | 8081+ | VS Code in browser (per workspace) |
+| Workspace Manager | 8082 | Docker container lifecycle manager |
 | Tailscale | - | VPN for remote access |
 
 ## API Endpoints (Workspace)
@@ -137,8 +152,10 @@ Required scopes: `repo` (full control of private repositories)
 ## Persistence
 
 Workspaces use Docker volumes:
-- `kamui-workspace-{id}` - Workspace source code and Git history
-- Survives container restarts, server reboots
+- `kamui-workspace-{id}` - Workspace source code and Git history (bind-mounted to `/workspaces/{id}`)
+- `kamui-api-data` - API database
+- `tailscale-state` - Tailscale identity
+- All survive container restarts, server reboots, and `docker compose down` (not `down -v`)
 
 ## Mobile UI Features
 
@@ -154,7 +171,10 @@ Workspaces use Docker volumes:
 - code-server runs as non-root user (UID 1000)
 - No Docker socket mounted in workspace containers
 - Workspace containers have resource limits (2 CPU, 4GB RAM)
-- Tailscale provides encrypted mesh network
+- Workspace Manager has read-only Docker socket access (privileged component)
+- Tailscale provides encrypted mesh network (optional)
+- All inter-service communication on isolated Docker network
+- GitHub tokens only in repository URLs (never in logs or browser)
 
 ## Testing Checklist
 
@@ -184,12 +204,12 @@ Workspaces use Docker volumes:
 
 ## Known Limitations (MVP)
 
-1. **code-server containers not fully implemented** - Currently simulated in Go API
-2. **No real Docker container orchestration** - Workspace start/stop is in-memory
-3. **Git operations simulated** - Need to exec into workspace containers
-4. **Single-user only** - No multi-user isolation yet
-5. **No resource quotas** - Can start unlimited workspaces
-6. **No HTTPS on LAN** - Self-signed certs needed for production
+1. **Single-user only** - No multi-user isolation yet (single shared KAMUI_TOKEN)
+2. **No resource quotas** - Can start unlimited workspaces (recommend max 2-3 on 16GB)
+3. **No HTTPS on LAN** - Self-signed certs needed for production (use mkcert)
+4. **GitHub tokens in URLs** - Tokens embedded in repository URLs (use GitHub App for production)
+5. **Tailscale optional** - Remote access requires manual Tailscale setup
+6. **code-server auth disabled** - `--auth none` for simplicity; enable password for production
 
 ## Next Steps
 
@@ -208,38 +228,66 @@ Workspaces use Docker volumes:
 - Check `KAMUI_TOKEN` matches in `.env` and API
 - Verify API container is healthy: `docker compose logs api`
 - Check firewall allows port 8080
+- Run `.\status-kamui.ps1` to diagnose
 
 ### "code-server won't load"
 - Check workspace proxy logs: `docker compose logs workspace-proxy`
 - Verify WebSocket upgrade works (nginx config)
 - Try direct access: `http://<SERVER_IP>:3000`
+- Ensure workspace is in "running" state (not "creating" or "stopped")
 
 ### "Git push fails"
 - Verify GitHub token has `repo` scope
 - Check repository URL format: `https://TOKEN@github.com/...`
 - Check network access to github.com
+- Check workspace is running: `.\status-kamui.ps1`
 
 ### Phone can't reach server
 - Verify both on same Wi-Fi (not guest network)
-- Check server firewall: `sudo ufw allow 8081`
+- Check Windows firewall: `Allow 8081` in Windows Defender Firewall
 - Try server's hostname: `http://kamui-server:8081`
 - Disable AP isolation on router
+- Run `.\status-kamui.ps1` to get correct LAN IP
+
+### Workspace stuck in "creating" or "error"
+- Check workspace-manager logs: `docker compose logs workspace-manager`
+- Verify Docker socket access: workspace-manager needs `/var/run/docker.sock`
+- Check disk space: `docker system df`
+- Restart workspace-manager: `docker compose restart workspace-manager`
 
 ## Development
 
+### Automated Scripts
+
+```powershell
+# One-command startup (Windows)
+.\start-kamui.ps1
+
+# Check status
+.\status-kamui.ps1
+
+# Run smoke tests
+.\test-kamui.ps1
+
+# Stop services (preserves data)
+.\stop-kamui.ps1
+```
+
+### Local Development
+
 ```bash
 # Run console locally (hot reload)
-cd ../console
+cd console
 npm install
 npm run dev
 
 # Run API locally
-cd ../api
+cd api
 KAMUI_TOKEN=dev go run ./cmd/api
 
 # Run tests
-cd ../api && go test -race ./...
-cd ../console && npm run type-check && npm run lint
+cd api && go test -race ./...
+cd console && npm run type-check && npm run lint
 ```
 
 ## License

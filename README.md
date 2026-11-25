@@ -21,6 +21,7 @@ Storage, compute, model training, model serving and file sharing behind one API,
 [Why Kamui](#why-kamui) |
 [Services](#services) |
 [How it works](#how-it-works) |
+[Mobile Workspace MVP](#mobile-workspace-mvp) |
 [Roadmap](#roadmap) |
 [Repository layout](#repository-layout) |
 [Contributing](#contributing) |
@@ -129,6 +130,19 @@ kamui run alpine echo hello      # run a Docker job on a free node
 | Packaging | Docker and native binaries |
 
 The stack is planned and may change as the project grows.
+
+## Mobile Workspace MVP
+
+A working prototype for coding from your phone using a real browser-based IDE (code-server) with GitHub integration.
+
+**One-command startup on Windows:**
+```powershell
+.\start-kamui.ps1
+```
+
+This starts the complete stack (API, Console, nginx Proxy, Workspace Manager) and reports the LAN URL for phone access.
+
+See [docs/MOBILE_WORKSPACE_MVP.md](docs/MOBILE_WORKSPACE_MVP.md) for full documentation, setup, testing, and troubleshooting.
 
 ## Roadmap
 
