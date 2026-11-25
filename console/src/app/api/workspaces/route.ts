@@ -1,6 +1,7 @@
-// Workspaces API Routes - Proxy to Kamui Go API (server-side only)
+// Workspaces API Routes - Proxy to Kamui Go API (server-side only, with auth)
 
 import { NextRequest, NextResponse } from 'next/server';
+import { requireAuth, requireCsrf, getSessionFromRequest } from '@/lib/auth/session';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
 const TOKEN = process.env.KAMUI_TOKEN || '';
@@ -27,8 +28,12 @@ async function proxyRequest(
 }
 
 // GET /api/workspaces - List all workspaces
-export async function GET() {
+export async function GET(request: NextRequest) {
   try {
+    // Require authentication
+    const auth = requireAuth(request);
+    if (auth.response) return auth.response;
+    
     const response = await proxyRequest('/v1/workspaces', { method: 'GET' });
     const data = await response.json();
     return NextResponse.json(data, { status: response.status });
@@ -43,6 +48,14 @@ export async function GET() {
 // POST /api/workspaces - Create a new workspace
 export async function POST(request: NextRequest) {
   try {
+    // Require authentication
+    const auth = requireAuth(request);
+    if (auth.response) return auth.response;
+    
+    // Require CSRF for state-changing operation
+    const csrfError = requireCsrf(request, auth.session);
+    if (csrfError) return csrfError;
+    
     const body = await request.json();
     const response = await proxyRequest('/v1/workspaces', {
       method: 'POST',

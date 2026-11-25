@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
 import { Header } from '@/components/layout/Header';
 import { WorkspaceList } from '@/components/workspace/WorkspaceList';
 import { GitPanel } from '@/components/workspace/GitPanel';
@@ -9,12 +10,14 @@ import { Badge } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
 import { Wifi, WifiOff, Loader2, Info, AlertTriangle } from 'lucide-react';
 import { cn, formatRelativeTime } from '@/lib/utils';
-import { listWorkspaces, createWorkspace, startWorkspace, stopWorkspace, deleteWorkspace, checkHealth } from '@/lib/api';
+import { listWorkspaces, createWorkspace, startWorkspace, stopWorkspace, deleteWorkspace, checkHealth, checkAuth, logout } from '@/lib/api';
 import type { Workspace, ConnectionState, HealthResponse } from '@/types';
 
 export default function Dashboard() {
+  const router = useRouter();
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [authLoading, setAuthLoading] = useState(true);
   const [connectionState, setConnectionState] = useState<ConnectionState>('disconnected');
   const [hostName, setHostName] = useState('Loading...');
   const [localIP, setLocalIP] = useState('Detecting...');
@@ -24,6 +27,23 @@ export default function Dashboard() {
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string | null>(null);
   const [showGitPanel, setShowGitPanel] = useState(false);
   const [refreshInterval, setRefreshInterval] = useState<NodeJS.Timeout | null>(null);
+
+  // Check authentication on mount
+  useEffect(() => {
+    const verifyAuth = async () => {
+      try {
+        const auth = await checkAuth();
+        if (!auth.authenticated) {
+          router.push('/login');
+        }
+      } catch {
+        router.push('/login');
+      } finally {
+        setAuthLoading(false);
+      }
+    };
+    verifyAuth();
+  }, [router]);
 
   const fetchData = useCallback(async () => {
     try {
@@ -57,7 +77,6 @@ export default function Dashboard() {
   const getHostName = useCallback(async () => {
     try {
       const response = await fetch('https://api.hostname.com/');
-      // This won't work cross-origin, fallback to a generic name
       setHostName('kamui-server');
     } catch {
       setHostName('kamui-server');
@@ -126,7 +145,26 @@ export default function Dashboard() {
     setShowGitPanel(true);
   };
 
+  const handleLogout = async () => {
+    try {
+      await logout();
+      router.push('/login');
+      router.refresh();
+    } catch {
+      router.push('/login');
+    }
+  };
+
   const selectedWorkspace = workspaces.find(w => w.id === selectedWorkspaceId);
+
+  // Show loading while checking auth
+  if (authLoading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-neutral-50 dark:bg-neutral-950">
+        <Loader2 className="h-8 w-8 animate-spin text-kamui-indigo-600" />
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen">
@@ -255,7 +293,7 @@ export default function Dashboard() {
               {!selectedWorkspace && (
                 <Card>
                   <CardContent className="py-8 text-center">
-                    <Info className="h-12 w-12 text-neutral-300 dark:text-neutral-600 mx-auto mb-4" />
+                    <div className="text-2xl mb-2">📂</div>
                     <h3 className="text-lg font-medium text-neutral-900 dark:text-neutral-100 mb-1">
                       Select a workspace
                     </h3>

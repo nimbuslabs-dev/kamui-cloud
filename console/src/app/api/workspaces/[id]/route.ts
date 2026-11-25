@@ -1,6 +1,7 @@
 // Individual Workspace API Routes
 
 import { NextRequest, NextResponse } from 'next/server';
+import { requireAuth, requireCsrf } from '@/lib/auth/session';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
 const TOKEN = process.env.KAMUI_TOKEN || '';
@@ -32,6 +33,9 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    const auth = requireAuth(request);
+    if (auth.response) return auth.response;
+    
     const { id } = await params;
     const response = await proxyRequest(`/v1/workspaces/${id}`, { method: 'GET' });
     const data = await response.json();
@@ -50,6 +54,9 @@ export async function PATCH(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    const auth = requireAuth(request);
+    if (auth.response) return auth.response;
+    
     const { id } = await params;
     const body = await request.json();
     const response = await proxyRequest(`/v1/workspaces/${id}`, {
@@ -72,6 +79,12 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    const auth = requireAuth(request);
+    if (auth.response) return auth.response;
+    
+    const csrfError = requireCsrf(request, auth.session);
+    if (csrfError) return csrfError;
+    
     const { id } = await params;
     const response = await proxyRequest(`/v1/workspaces/${id}`, { method: 'DELETE' });
     return new NextResponse(null, { status: response.status });

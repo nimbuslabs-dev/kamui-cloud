@@ -1,6 +1,7 @@
 // Start Workspace
 
 import { NextRequest, NextResponse } from 'next/server';
+import { requireAuth, requireCsrf } from '@/lib/auth/session';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
 const TOKEN = process.env.KAMUI_TOKEN || '';
@@ -25,6 +26,12 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    const auth = requireAuth(request);
+    if (auth.response) return auth.response;
+    
+    const csrfError = requireCsrf(request, auth.session);
+    if (csrfError) return csrfError;
+    
     const { id } = await params;
     const response = await proxyRequest(`/v1/workspaces/${id}/start`, { method: 'POST' });
     const data = await response.json();

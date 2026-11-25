@@ -267,6 +267,18 @@ Workspaces use Docker volumes:
 - Disable AP isolation on router
 - Run `.\status-kamui.ps1` to get correct LAN IP
 
+### "Authentication failed" or redirected to login
+- Check `KAMUI_ADMIN_PASSWORD` in `.env` matches what you're entering
+- Clear browser cookies for the site and try again
+- Ensure browser accepts cookies (not blocking third-party cookies)
+- Check console logs for CSRF errors (missing `x-csrf-token` header)
+- Verify `KAMUI_ADMIN_PASSWORD` is set in `.env` (not default `changeme` in production)
+
+### "CSRF token invalid" errors
+- Ensure you're including `x-csrf-token` header in API calls
+- Refresh the page to get a new CSRF token via `/api/auth/csrf`
+- Check that cookies are being sent with requests (`credentials: 'include'`)
+
 ### Workspace stuck in "creating" or "error"
 - Check workspace-manager logs: `docker compose logs workspace-manager`
 - Verify Docker socket access: workspace-manager needs `/var/run/docker.sock`
@@ -311,6 +323,19 @@ cd console && npm run type-check && npm run lint
 ### Security Model
 
 The frontend never sees the `KAMUI_TOKEN`. All API calls go through Next.js API routes (`/api/...`) which run server-side and inject the `Bearer` token before proxying to the Go API. This keeps the token server-side and never exposes it to the browser.
+
+**Authentication:**
+- Session-based authentication with HttpOnly cookies (secure, sameSite=lax)
+- Password authentication via `/api/auth/login` endpoint
+- CSRF protection for all state-changing operations (double-submit cookie pattern)
+- Session expiry: 24 hours
+- Logout endpoint clears session and cookies
+
+**Authorization:**
+- All workspace API routes require valid session
+- Git operations require CSRF token
+- code-server proxied through nginx at `/workspace/{id}/*` with WebSocket support
+- Unauthenticated requests to API routes return 401
 
 Workspace code-server is proxied through nginx at `/workspace/{id}/*` with WebSocket support for the terminal/editor.
 

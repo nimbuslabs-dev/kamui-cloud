@@ -29,6 +29,7 @@ services:
     environment:
       - NEXT_PUBLIC_API_URL=http://api:8080
       - KAMUI_TOKEN=${KAMUI_TOKEN:-dev}
+      - KAMUI_ADMIN_PASSWORD=${KAMUI_ADMIN_PASSWORD:-changeme}
     depends_on:
       api:
         condition: service_healthy

@@ -1,6 +1,5 @@
-// API Client for Kamui Cloud - Server-side only via Next.js API routes
-// This module provides type-safe API calls that go through Next.js API routes
-// to keep the KAMUI_TOKEN server-side and never expose it to the browser.
+// API Client for Kamui Cloud - Uses Next.js API routes with cookie-based auth
+// The KAMUI_TOKEN is never exposed to the browser - all calls go through Next.js API routes
 
 import type {
   Node,
@@ -36,6 +35,40 @@ async function handleResponse<T>(response: Response): Promise<T> {
   return response.json();
 }
 
+// Auth endpoints
+export async function login(password: string): Promise<{ csrfToken: string }> {
+  const response = await fetch(`${API_BASE}/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password }),
+    credentials: 'include', // Include cookies
+  });
+  return handleResponse<{ csrfToken: string }>(response);
+}
+
+export async function logout(): Promise<void> {
+  const response = await fetch(`${API_BASE}/auth/logout`, {
+    method: 'POST',
+    credentials: 'include',
+  });
+  await handleResponse<void>(response);
+}
+
+export async function getCsrfToken(): Promise<string> {
+  const response = await fetch(`${API_BASE}/auth/csrf`, {
+    credentials: 'include',
+  });
+  const data = await handleResponse<{ csrfToken: string }>(response);
+  return data.csrfToken;
+}
+
+export async function checkAuth(): Promise<{ authenticated: boolean; userId: string; csrfToken: string }> {
+  const response = await fetch(`${API_BASE}/auth/me`, {
+    credentials: 'include',
+  });
+  return handleResponse<{ authenticated: boolean; userId: string; csrfToken: string }>(response);
+}
+
 // Health
 export async function checkHealth(): Promise<HealthResponse> {
   const response = await fetch(`${API_BASE}/healthz`, {
@@ -50,6 +83,7 @@ export async function listWorkspaces(): Promise<Workspace[]> {
   const response = await fetch(`${API_BASE}/workspaces`, {
     method: 'GET',
     headers: getHeaders(),
+    credentials: 'include',
   });
   return handleResponse<Workspace[]>(response);
 }
@@ -58,6 +92,7 @@ export async function createWorkspace(workspace: WorkspaceCreate): Promise<Works
   const response = await fetch(`${API_BASE}/workspaces`, {
     method: 'POST',
     headers: getHeaders(),
+    credentials: 'include',
     body: JSON.stringify(workspace),
   });
   return handleResponse<Workspace>(response);
@@ -67,6 +102,7 @@ export async function getWorkspace(workspaceId: string): Promise<Workspace> {
   const response = await fetch(`${API_BASE}/workspaces/${workspaceId}`, {
     method: 'GET',
     headers: getHeaders(),
+    credentials: 'include',
   });
   return handleResponse<Workspace>(response);
 }
@@ -75,6 +111,7 @@ export async function startWorkspace(workspaceId: string): Promise<Workspace> {
   const response = await fetch(`${API_BASE}/workspaces/${workspaceId}/start`, {
     method: 'POST',
     headers: getHeaders(),
+    credentials: 'include',
   });
   return handleResponse<Workspace>(response);
 }
@@ -83,6 +120,7 @@ export async function stopWorkspace(workspaceId: string): Promise<Workspace> {
   const response = await fetch(`${API_BASE}/workspaces/${workspaceId}/stop`, {
     method: 'POST',
     headers: getHeaders(),
+    credentials: 'include',
   });
   return handleResponse<Workspace>(response);
 }
@@ -91,6 +129,7 @@ export async function deleteWorkspace(workspaceId: string): Promise<void> {
   const response = await fetch(`${API_BASE}/workspaces/${workspaceId}`, {
     method: 'DELETE',
     headers: getHeaders(),
+    credentials: 'include',
   });
   await handleResponse<void>(response);
 }
@@ -100,6 +139,7 @@ export async function getGitStatus(workspaceId: string): Promise<GitStatus> {
   const response = await fetch(`${API_BASE}/workspaces/${workspaceId}/git/status`, {
     method: 'GET',
     headers: getHeaders(),
+    credentials: 'include',
   });
   return handleResponse<GitStatus>(response);
 }
@@ -108,6 +148,7 @@ export async function gitAdd(workspaceId: string, files: string[]): Promise<void
   const response = await fetch(`${API_BASE}/workspaces/${workspaceId}/git/add`, {
     method: 'POST',
     headers: getHeaders(),
+    credentials: 'include',
     body: JSON.stringify({ files }),
   });
   await handleResponse<void>(response);
@@ -117,6 +158,7 @@ export async function gitCommit(workspaceId: string, message: string): Promise<{
   const response = await fetch(`${API_BASE}/workspaces/${workspaceId}/git/commit`, {
     method: 'POST',
     headers: getHeaders(),
+    credentials: 'include',
     body: JSON.stringify({ message }),
   });
   return handleResponse<{ hash: string }>(response);
@@ -126,6 +168,7 @@ export async function gitPush(workspaceId: string, remote?: string, branch?: str
   const response = await fetch(`${API_BASE}/workspaces/${workspaceId}/git/push`, {
     method: 'POST',
     headers: getHeaders(),
+    credentials: 'include',
     body: JSON.stringify({ remote, branch }),
   });
   await handleResponse<void>(response);
@@ -135,6 +178,7 @@ export async function gitPull(workspaceId: string, remote?: string, branch?: str
   const response = await fetch(`${API_BASE}/workspaces/${workspaceId}/git/pull`, {
     method: 'POST',
     headers: getHeaders(),
+    credentials: 'include',
     body: JSON.stringify({ remote, branch }),
   });
   await handleResponse<void>(response);
