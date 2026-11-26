@@ -104,6 +104,17 @@ func gitFailure(op string, result commandResult) error {
 		strings.Contains(diagnostic, "write access to repository not granted") {
 		return &managerError{http.StatusUnprocessableEntity, "git_auth", "GitHub denied access or the repository was not found. Check the repository and workspace credentials."}
 	}
+	if (op == "push" && pushNeedsReconciliation(result.out)) ||
+		(op == "pull" && strings.Contains(diagnostic, "not possible to fast-forward")) {
+		return &managerError{http.StatusConflict, "git_conflict", "Reconcile your branch with the remote in the workspace terminal before trying again."}
+	}
+	if op == "clone" || op == "push" || op == "pull" {
+		for _, failure := range []string{"could not resolve host", "failed to connect to", "connection timed out", "connection refused", "connection reset by peer"} {
+			if strings.Contains(diagnostic, failure) {
+				return &managerError{http.StatusBadGateway, "git_network", "Git could not connect to GitHub. Check the workspace network and try again."}
+			}
+		}
+	}
 	if op == "commit" && (strings.Contains(diagnostic, "author identity unknown") || strings.Contains(diagnostic, "unable to auto-detect email")) {
 		return &managerError{http.StatusUnprocessableEntity, "git_identity", "Configure Git user.name and user.email in the workspace terminal."}
 	}
@@ -114,6 +125,18 @@ func gitFailure(op string, result commandResult) error {
 		return &managerError{http.StatusUnprocessableEntity, "git_branch", "The requested branch was not found in the repository."}
 	}
 	return &managerError{http.StatusUnprocessableEntity, "git_failed", fmt.Sprintf("Git %s failed (exit %d). Check the workspace terminal for repository state.", op, result.exitCode)}
+}
+
+func pushNeedsReconciliation(output string) bool {
+	// git push --porcelain writes one tab-delimited status line per ref.
+	for line := range strings.SplitSeq(output, "\n") {
+		fields := strings.SplitN(line, "\t", 3)
+		if len(fields) == 3 && fields[0] == "!" &&
+			(fields[2] == "[rejected] (non-fast-forward)" || fields[2] == "[rejected] (fetch first)") {
+			return true
+		}
+	}
+	return false
 }
 
 func (wm *WorkspaceManager) cloneRepository(ctx context.Context, id, repo, branch string) error {
@@ -218,7 +241,7 @@ func buildGitArgs(req gitRequest) ([]string, error) {
 		if len(args) == 2 && args[1] != "" {
 			ref += ":refs/heads/" + args[1]
 		}
-		return []string{"push", "--set-upstream", "--recurse-submodules=no", "--", "origin", ref}, nil
+		return []string{"push", "--porcelain", "--set-upstream", "--recurse-submodules=no", "--", "origin", ref}, nil
 	}
 	return nil, invalid
 }

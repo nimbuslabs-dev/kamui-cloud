@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -134,5 +136,54 @@ func TestParseRealGitStatusAndPushArguments(t *testing.T) {
 	want := gitStatus{Branch: "test-branch", Staged: []string{"renamed file.txt"}, Unstaged: []string{"renamed file.txt"}, Untracked: []string{"new file.txt"}}
 	if !reflect.DeepEqual(status, want) {
 		t.Fatalf("status = %#v, want %#v", status, want)
+	}
+
+	peer := filepath.Join(dir, "peer")
+	git("clone", "-q", "-b", "test-branch", remote, peer)
+	git("-C", peer, "-c", "user.name=Kamui Tests", "-c", "user.email=kamui-tests@example.invalid", "commit", "--allow-empty", "-qm", "peer update")
+	git("-C", peer, "push", "-q", "origin", "HEAD")
+	peerSHA := git("-C", peer, "rev-parse", "HEAD")
+	git("-C", repo, "commit", "-qm", "local update")
+	localSHA = git("-C", repo, "rev-parse", "HEAD")
+	for _, operation := range []string{"push", "pull"} {
+		args, err := buildGitArgs(gitRequest{Command: operation, Args: []string{"origin", "test-branch"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var stdout, stderr bytes.Buffer
+		cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+		cmd.Env = append(os.Environ(), "LC_ALL=C")
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		var exitError *exec.ExitError
+		if err := cmd.Run(); !errors.As(err, &exitError) {
+			t.Fatalf("diverged Git %s: expected subprocess rejection, got %v", operation, err)
+		}
+		err = gitFailure(operation, commandResult{out: stdout.String(), stderr: stderr.String(), exitCode: exitError.ExitCode()})
+		var gitErr *managerError
+		if !errors.As(err, &gitErr) || gitErr.status != http.StatusConflict || gitErr.code != "git_conflict" {
+			t.Errorf("diverged Git %s: got %#v, want conflict", operation, err)
+		}
+	}
+	if got := git("--git-dir", remote, "rev-parse", "refs/heads/test-branch"); got != peerSHA {
+		t.Fatalf("remote SHA = %q, want peer SHA %q", got, peerSHA)
+	}
+	if got := git("-C", repo, "rev-parse", "HEAD"); got != localSHA {
+		t.Fatalf("local SHA = %q, want local update %q", got, localSHA)
+	}
+}
+
+func TestGitTransportFailuresAreSanitized(t *testing.T) {
+	for _, stderr := range []string{
+		"ssh: connect to host private-host.invalid port 22: Connection timed out",
+		"fatal: unable to access 'https://private-host.invalid/repo/': Could not resolve host: private-host.invalid",
+	} {
+		err := gitFailure("push", commandResult{exitCode: 128, stderr: stderr})
+		var gitErr *managerError
+		if !errors.As(err, &gitErr) || gitErr.status != http.StatusBadGateway || gitErr.code != "git_network" {
+			t.Errorf("network failure: got %#v, want bad gateway", err)
+		}
+		if strings.Contains(err.Error(), "private-host.invalid") {
+			t.Fatal("Git diagnostics exposed the raw remote address")
+		}
 	}
 }
