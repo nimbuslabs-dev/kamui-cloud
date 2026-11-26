@@ -41,6 +41,8 @@ if [ ! -s "$dir/ca.pem" ] || [ ! -s "$dir/ca.key" ]; then
     echo "TLS certificate authority is incomplete. Restore its certificate and key from backup." >&2
     exit 1
 fi
+# Host clients must be able to read the public CA even when Docker created it as root.
+chmod 0644 "$dir/ca.pem"
 
 leaf="$dir/serving/server.pem"
 key="$dir/serving/server.key"
