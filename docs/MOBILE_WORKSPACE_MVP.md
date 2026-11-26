@@ -1,344 +1,83 @@
-# Kamui Cloud — Mobile Workspace MVP
+# Mobile Workspace MVP
 
-A working prototype for coding from your phone using a real browser-based IDE (code-server) with GitHub integration.
+Kamui runs a single-owner coding environment. The Console creates and manages a workspace backed by Docker. code-server provides the editor, explorer and terminal. Files and Git history live on a named volume, and the coordinator stores workspace records on a separate named volume.
 
-## Quick Start
+## Start on Windows
 
-### Prerequisites
+Install and start Docker Desktop with the WSL2 backend and Linux containers. Use an up-to-date Compose plugin, Windows PowerShell 5.1 or newer, Git, and `curl.exe`. Allocate at least 3 GiB of RAM and two CPUs to Docker. Allow several GB of free Docker storage for images, builds and your work. The first build and GitHub operations use the internet.
 
-- Windows 10/11 with Docker Desktop 29+ (WSL2 backend)
-- GitHub account (for private repos)
-- Android phone on same Wi-Fi (for mobile testing)
-- Tailscale account (optional, for remote access)
-
-### 1. One-Command Startup (Windows PowerShell)
+From the root of the feature checkout on the HP Victus or Lenovo LOQ, run:
 
 ```powershell
-# From repository root (C:\Users\lifeg\Downloads\kamui-cloud)
 .\start-kamui.ps1
-```
-
-This single command:
-- Validates Docker environment
-- Creates `.env` with secure `KAMUI_TOKEN` if missing
-- Builds all Docker images
-- Starts all services (API, Console, nginx Proxy, Workspace Manager)
-- Waits for health checks
-- Reports the LAN-accessible URL for your phone
-
-### Manual Startup (if needed)
-
-```bash
-# From ops directory
-cd ops
-cp .env.example .env
-# Edit .env if needed (token auto-generated on first run)
-docker compose up -d --build
-```
-
-### 3. Access from Phone
-
-1. Find your server's LAN IP (shown by `start-kamui.ps1` or run `.\status-kamui.ps1`)
-2. On your Android phone, open browser to `http://<SERVER_IP>:8081`
-3. You should see the Kamui Cloud mobile workspace UI
-
-### 4. Create a Workspace
-
-1. Tap "New Workspace"
-2. Enter:
-   - **Name**: `my-project`
-   - **Repository URL**: `https://github.com/youruser/yourrepo.git`
-   - **Branch**: `main` (default)
-3. Tap "Create Workspace"
-4. Tap "Start" on the workspace card
-4. Tap "Open IDE" → code-server opens in new tab
-
-### 5. Code and Push
-
-1. In code-server: edit files, use terminal (`Ctrl+\``)
-2. Back in Kamui UI: tap the workspace to see Git panel
-3. Stage files → enter commit message → "Commit"
-4. Tap "Push" → changes go to GitHub
-
-### 6. Remote Access (Tailscale)
-
-1. Install Tailscale on server and phone
-2. Add `TAILSCALE_AUTHKEY` to `.env`
-3. Restart: `docker compose up -d`
-4. On phone: use Tailscale IP (e.g., `http://100.x.x.x:8081`)
-
-## Architecture
-
-```
-Phone Browser (Android)
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Workspace Proxy (nginx:8081)                               │
-│  - Routes /                    → Console (Next.js)          │
-│  - Routes /api/               → API (Go)                    │
-│  - Routes /workspace/{id}/*   → code-server container       │
-│  - WebSocket proxy for code-server terminal/editor          │
-└─────────────────────────────────────────────────────────────┘
-    │                          │                          │
-    ▼                          ▼                          ▼
-┌──────────────┐         ┌──────────────┐         ┌──────────────────┐
-│  Console     │         │    API       │         │ code-server      │
-│  (Next.js)   │         │   (Go)       │         │ containers       │
-│  Port 3000   │         │  Port 8080   │         │  Port 8080       │
-│              │         │              │         │  (per workspace) │
-└──────────────┘         └──────────────┘         └──────────────────┘
-                                                      │
-                                                      ▼
-                                               ┌──────────────────┐
-                                               │  Workspace       │
-                                               │  Manager         │
-                                               │  (Go + Docker    │
-                                               │   API)           │
-                                               │  Port 8082       │
-                                               └──────────────────┘
-                                                      │
-                                                      ▼
-                                               ┌──────────────────┐
-                                               │  Docker Volumes  │
-                                               │  kamui-workspaces│
-                                               │  kamui-api-data  │
-                                               │  tailscale-state │
-                                               └──────────────────┘
-```
-
-All services communicate on the `kamui-network` (attachable bridge).
-Workspace Manager connects to Docker Engine via read-only socket mount.
-
-## Services
-
-| Service | Port | Description |
-|---------|------|-------------|
-| API | 8080 | Go coordinator (nodes, jobs, workspaces) |
-| Console | 3000 | Next.js mobile UI |
-| Workspace Proxy | 8081 | Nginx reverse proxy + WebSocket |
-| code-server | 8081+ | VS Code in browser (per workspace) |
-| Workspace Manager | 8082 | Docker container lifecycle manager |
-| Tailscale | - | VPN for remote access |
-
-## API Endpoints (Workspace)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/v1/workspaces` | Create workspace |
-| GET | `/v1/workspaces` | List workspaces |
-| GET | `/v1/workspaces/{id}` | Get workspace |
-| POST | `/v1/workspaces/{id}/start` | Start code-server |
-| POST | `/v1/workspaces/{id}/stop` | Stop code-server |
-| DELETE | `/v1/workspaces/{id}` | Delete workspace |
-| GET | `/v1/workspaces/{id}/git/status` | Git status |
-| POST | `/v1/workspaces/{id}/git/add` | Stage files |
-| POST | `/v1/workspaces/{id}/git/commit` | Commit changes |
-| POST | `/v1/workspaces/{id}/git/push` | Push to remote |
-| POST | `/v1/workspaces/{id}/git/pull` | Pull from remote |
-
-## GitHub Authentication
-
-**Warning: Embedding tokens in repository URLs is insecure.** Tokens in URLs can leak into:
-- Git configuration (`.git/config`)
-- Shell history
-- Browser history and referrer headers
-- Docker build logs
-- CI/CD logs
-
-**Recommended: Use GitHub CLI or credential helper instead.**
-
-```bash
-# In the code-server terminal, authenticate once:
-gh auth login
-
-# Or configure Git credential helper:
-git config --global credential.helper store
-# Then on first push, enter token as password (not saved in URL)
-```
-
-If you must use HTTPS URLs with tokens (e.g., for automation), use a **fine-grained personal access token** with minimal scopes:
-- Repository access: Only the specific repository
-- Permissions: Contents (read/write), Metadata (read)
-- Expiration: Set reasonable expiry
-
-Never use classic tokens with `repo` scope in URLs.
-
-## Persistence
-
-Workspaces use Docker volumes:
-- `kamui-workspace-{id}` - Workspace source code and Git history (bind-mounted to `/workspaces/{id}`)
-- `kamui-api-data` - API database
-- `tailscale-state` - Tailscale identity
-- All survive container restarts, server reboots, and `docker compose down` (not `down -v`)
-
-## Mobile UI Features
-
-- Responsive design (360px+ width)
-- Touch-friendly controls (44px+ targets)
-- Offline-capable (cached via service worker)
-- PWA installable on Android
-- Dark mode support
-
-## Security
-
-- All API endpoints require `Bearer KAMUI_TOKEN`
-- code-server runs as non-root user (UID 1000)
-- No Docker socket mounted in workspace containers
-- Workspace containers have resource limits (2 CPU, 4GB RAM)
-- Workspace Manager has read-only Docker socket access (privileged component)
-- Tailscale provides encrypted mesh network (optional)
-- All inter-service communication on isolated Docker network
-- GitHub credentials handled via Git credential helper, never in URLs
-- API token never exposed to browser (used only by frontend to call API)
-- code-server runs with `--auth none` for simplicity; enable password for production
-
-## Testing Checklist
-
-### LAN Access
-- [ ] Phone connects to `http://<LAN_IP>:8081`
-- [ ] Console loads, shows server info
-- [ ] Create workspace → starts → opens code-server
-- [ ] Edit file in code-server → save
-- [ ] Git panel shows changes → commit → push
-- [ ] Verify commit on GitHub
-
-### Remote Access (Tailscale)
-- [ ] Tailscale connected on server and phone
-- [ ] Access via `http://<TAILSCALE_IP>:8081`
-- [ ] Full workflow works over VPN
-
-### Persistence
-- [ ] Stop workspace → start again → files intact
-- [ ] Restart Docker Compose → workspaces survive
-- [ ] Git history preserved
-
-### Error Handling
-- [ ] Invalid repo URL → clear error
-- [ ] Private repo without token → auth error
-- [ ] Network offline → graceful degradation
-- [ ] Push rejected → shows Git error
-
-## Known Limitations (MVP)
-
-1. **Single-user only** - No multi-user isolation yet (single shared KAMUI_TOKEN)
-2. **No resource quotas** - Can start unlimited workspaces (recommend max 2-3 on 16GB)
-3. **No HTTPS on LAN** - Self-signed certs needed for production (use mkcert)
-4. **GitHub auth via credential helper** - Tokens not embedded in URLs; use `gh auth login` in terminal
-5. **Tailscale optional** - Remote access requires manual Tailscale setup
-6. **code-server auth disabled** - `--auth none` for simplicity; enable password for production
-
-## Next Steps
-
-1. Implement real code-server container lifecycle (Docker API)
-2. Add workspace container exec for Git operations
-3. Add resource limits and quotas
-4. Implement HTTPS with mkcert for LAN
-5. Add multi-user support with separate tokens
-6. Add workspace templates (Node, Python, Go, Rust)
-7. Add file browser in mobile UI
-8. Add terminal access in mobile UI
-
-## Troubleshooting
-
-### "Cannot connect to API"
-- Check `KAMUI_TOKEN` matches in `.env` and API
-- Verify API container is healthy: `docker compose logs api`
-- Check firewall allows port 8080
-- Run `.\status-kamui.ps1` to diagnose
-
-### "code-server won't load"
-- Check workspace proxy logs: `docker compose logs workspace-proxy`
-- Verify WebSocket upgrade works (nginx config)
-- Try direct access: `http://<SERVER_IP>:3000`
-- Ensure workspace is in "running" state (not "creating" or "stopped")
-
-### "Git push fails"
-- Verify GitHub authentication: run `gh auth status` in code-server terminal
-- If using HTTPS URL with token: check token is valid and not expired
-- Check network access to github.com
-- Check workspace is running: `.\status-kamui.ps1`
-- Ensure Git credential helper is configured: `git config --global credential.helper store`
-
-### Phone can't reach server
-- Verify both on same Wi-Fi (not guest network)
-- Check Windows firewall: `Allow 8081` in Windows Defender Firewall
-- Try server's hostname: `http://kamui-server:8081`
-- Disable AP isolation on router
-- Run `.\status-kamui.ps1` to get correct LAN IP
-
-### "Authentication failed" or redirected to login
-- Check `KAMUI_ADMIN_PASSWORD` in `.env` matches what you're entering
-- Clear browser cookies for the site and try again
-- Ensure browser accepts cookies (not blocking third-party cookies)
-- Check console logs for CSRF errors (missing `x-csrf-token` header)
-- Verify `KAMUI_ADMIN_PASSWORD` is set in `.env` (not default `changeme` in production)
-
-### "CSRF token invalid" errors
-- Ensure you're including `x-csrf-token` header in API calls
-- Refresh the page to get a new CSRF token via `/api/auth/csrf`
-- Check that cookies are being sent with requests (`credentials: 'include'`)
-
-### Workspace stuck in "creating" or "error"
-- Check workspace-manager logs: `docker compose logs workspace-manager`
-- Verify Docker socket access: workspace-manager needs `/var/run/docker.sock`
-- Check disk space: `docker system df`
-- Restart workspace-manager: `docker compose restart workspace-manager`
-
-## Development
-
-### Automated Scripts
-
-```powershell
-# One-command startup (Windows) - detached by default
-.\start-kamui.ps1
-
-# Check status
 .\status-kamui.ps1
-
-# Run smoke tests (15 automated tests)
 .\test-kamui.ps1
-
-# Stop services (preserves data)
 .\stop-kamui.ps1
 ```
 
-### Local Development
+`start-kamui.ps1 -CleanBuild` pulls base images and rebuilds from scratch. `-SkipBuild` reuses built images. Startup waits for all four services to become healthy and probes the HTTPS gateway and anonymous API access. The test script checks nginx, HTTPS trust and rejection of unauthenticated API, IDE and WebSocket upgrade requests.
 
-```bash
-# Run console locally (hot reload)
-cd console
-npm install
-npm run dev
+The script creates distinct secrets in `ops/.env` and preserves saved credentials. If a previous install has a short or example credential, replace it with 32 random bytes encoded as hex before starting. Read `KAMUI_ADMIN_PASSWORD` from the file in a private editor to sign in. The coordinator token is an internal service credential. Keep the file private.
 
-# Run API locally
-cd api
-KAMUI_TOKEN=dev go run ./cmd/api
+The local URL defaults to `https://127.0.0.1:8081`. Trust the public certificate `ops/tls-local/ca.pem` in the browser's trust store before opening it. This is an explicit one-time device action. Keep `ca.key` on the host. A startup that reports healthy has verified local access through its CA.
 
-# Run tests
-cd api && go test -race ./...
-cd console && npm run type-check && npm run lint
+## Phone on a private LAN
+
+1. Connect Windows and the phone to a private network or personal hotspot.
+2. Run `Get-NetIPConfiguration` on Windows and find the IPv4 address of the active physical Wi-Fi or Ethernet adapter.
+3. Set `KAMUI_BIND_IP` in `ops/.env` to that exact private IPv4 address and rerun startup. The generated HTTPS certificate covers the IP and reuses the same CA. Set `KAMUI_PORT` if the default port is occupied.
+4. Transfer only `ca.pem` through a trusted channel and install it as a user CA on the phone with the owner's consent. Open the HTTPS URL printed by startup. Remove the CA from the borrowed client after testing.
+5. If the phone cannot connect, check that both devices are on the same private network and that client isolation or the host firewall has not blocked the connection. Use an authorized network and firewall configuration.
+
+The gateway binds one address. When a LAN IP is selected, use that IP from Windows too. Port 8081 is the default host port. The API, coordinator token endpoints, workspace manager and each code-server instance have no published host port. Keep the deployment on a trusted network without router forwarding.
+
+## Edit and push
+
+1. Sign in. Create a workspace with a public GitHub HTTPS URL and an optional branch. Start it and open the IDE. One workspace can run at a time.
+2. Use the file explorer, editor and terminal. In the project terminal, set a workspace-local commit identity with `git config user.name "Your Name"` and `git config user.email "your-git-email"`.
+3. Use the Console Git controls to select or create a branch, stage changes and commit. Check the returned full commit SHA.
+4. For a writable test repository that permits deploy keys, generate a dedicated temporary key in the workspace terminal. Add the public key to the repository with write access, then load the private key into the temporary workspace agent.
+
+```sh
+ssh-keygen -t ed25519 -f /tmp/kamui-deploy-key
+eval "$(ssh-agent -a /tmp/kamui-git-agent)"
+ssh-add -t 15m /tmp/kamui-deploy-key
+rm /tmp/kamui-deploy-key
+git remote set-url --push origin git@github.com:OWNER/REPO.git
 ```
 
-### Security Model
+Push from the Console or terminal, then independently compare `refs/heads/BRANCH` on GitHub with the local SHA. Revoke the test deploy key. Stopping the workspace clears the SSH agent and temporary files. The Git dashboard accepts GitHub remotes and has no credential input. Initial cloning through the dashboard supports public GitHub repositories. If your organization restricts deploy keys, use an authorized disposable repository that permits a dedicated test key.
 
-The frontend never sees the `KAMUI_TOKEN`. All API calls go through Next.js API routes (`/api/...`) which run server-side and inject the `Bearer` token before proxying to the Go API. This keeps the token server-side and never exposes it to the browser.
+Stop and start the workspace, then confirm the file and Git history. Use the scripts to stop or start the deployment. Named volumes survive application restarts. Deleting a workspace removes its container and dashboard record while retaining its project volume for recovery. Back up the coordinator and workspace volumes before replacing the host. Preserve the project name when restarting an existing stack and keep older Docker data until you have checked it for files.
 
-**Authentication:**
-- Session-based authentication with HttpOnly cookies (secure, sameSite=lax)
-- Password authentication via `/api/auth/login` endpoint
-- CSRF protection for all state-changing operations (double-submit cookie pattern)
-- Session expiry: 24 hours
-- Logout endpoint clears session and cookies
+## Reproduce the Docker checks
 
-**Authorization:**
-- All workspace API routes require valid session
-- Git operations require CSRF token
-- code-server proxied through nginx at `/workspace/{id}/*` with WebSocket support
-- Unauthenticated requests to API routes return 401
+For Linux/macOS using a Docker engine whose daemon can see the checkout directory:
 
-Workspace code-server is proxied through nginx at `/workspace/{id}/*` with WebSocket support for the terminal/editor.
+```sh
+umask 077
+if [ ! -e ops/.env ]; then
+  printf 'KAMUI_TOKEN=%s\nKAMUI_ADMIN_PASSWORD=%s\n' "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" > ops/.env
+fi
+docker compose --env-file ops/.env -f ops/docker-compose.yml --profile tools config --quiet
+docker compose --env-file ops/.env -f ops/docker-compose.yml build --no-cache --pull workspace-image api workspace-manager console workspace-proxy
+docker compose --env-file ops/.env -f ops/docker-compose.yml run --rm --no-deps tls-init
+docker compose --env-file ops/.env -f ops/docker-compose.yml up -d --no-build --wait --wait-timeout 120
+docker compose --env-file ops/.env -f ops/docker-compose.yml exec -T workspace-proxy nginx -t
+curl --fail --cacert ops/tls-local/ca.pem https://127.0.0.1:8081/healthz
+```
 
-## License
+For CI-style lifecycle testing, start the commands above with `COMPOSE_PROJECT_NAME=kamui-ci-qa` exported, then run `KAMUI_QA_PROJECT=kamui-ci-qa python3 ops/tests/stack.py`. The test requires an empty project and exercises the public GitHub clone, Git operations, a disposable local Git remote, workspace limits and persistence. For a real GitHub push, set `KAMUI_QA_GITHUB_REPO` to a private disposable `OWNER/kamui-workspace-qa-DATE` repository and `KAMUI_QA_GITHUB_KEY` to its temporary write deploy key file. An authenticated `gh` CLI independently reads the pushed ref. Revoke the key after the test. Enable editor, terminal and WebSocket checks with the browser test. Run it against the same isolated project with Playwright and Chromium available locally.
 
-MIT - Part of Kamui Cloud project.
+```sh
+KAMUI_TEST_ENV="$PWD/ops/.env" KAMUI_TEST_URL=https://127.0.0.1:8081 node ops/tests/browser.cjs
+```
+
+The browser test permits the local test certificate in its isolated Chromium context. The earlier `curl` probe verifies the CA and hostname separately.
+
+## Operational boundaries
+
+- This is a single-owner deployment. Only open repositories and extensions you trust. Dashboard and IDE share the HTTPS origin, and a signed-in browser can exercise the owner's permissions.
+- A workspace gets 1 CPU, 2 GiB of memory and 256 processes by default. File storage uses the Docker disk, with no per-volume hard disk quota. The manager has daemon access and therefore must be treated as a privileged infrastructure service.
+- Logout and session expiration reject new IDE connections. An already upgraded WebSocket can remain open until it disconnects or the workspace stops. Coordinator and workspace data survive restarts, and restarting the Console requires signing in again.
+- Windows PowerShell 5.1, the target Windows Docker Desktop hosts and physical Android LAN access require testing on those devices. Desktop and mobile viewport browser tests can be run independently.

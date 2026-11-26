@@ -39,3 +39,7 @@ dist/
 *.bin
 data/
 datasets/
+
+# Local Kamui HTTPS files
+/ops/tls-local/
+/api/workspaces.json

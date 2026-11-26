@@ -1,0 +1,11 @@
+FROM codercom/code-server:4.146.0@sha256:fc708b18f6c613b5a9d00f1d1801e58376d3df9c5b5de77f5c02d67b711f99c9
+
+USER root
+RUN install -d -o coder -g coder -m 0755 /home/coder/project \
+    && rm -f /etc/sudoers.d/nopasswd \
+    && printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >> /etc/ssh/ssh_known_hosts
+
+USER 1000:1000
+WORKDIR /home/coder/project
+ENV HOME=/home/coder SSH_AUTH_SOCK=/tmp/kamui-git-agent
+ENTRYPOINT ["/usr/bin/code-server"]

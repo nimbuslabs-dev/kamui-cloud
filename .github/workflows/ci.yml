@@ -1,14 +1,13 @@
 name: CI
 
-# Runs on every push to main (and on pull requests, if any).
-# A job only does work if its folder has real code. Empty folders are skipped.
-# Checks: build, lint, tests (where tests exist). Warnings do not fail the run.
-
 on:
   push:
-    branches: [main]
+    branches: [main, feat/mobile-workspace-mvp]
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   rust:
@@ -47,7 +46,7 @@ jobs:
         if: hashFiles(format('{0}/**/*.go', matrix.dir)) != ''
         uses: actions/setup-go@v5
         with:
-          go-version: stable
+          go-version-file: ${{ matrix.dir }}/go.mod
           cache: false
       - name: Build
         if: hashFiles(format('{0}/**/*.go', matrix.dir)) != ''
@@ -60,7 +59,7 @@ jobs:
       - name: Test
         if: hashFiles(format('{0}/**/*.go', matrix.dir)) != ''
         working-directory: ${{ matrix.dir }}
-        run: go test ./...
+        run: go test -race ./...
 
   python:
     name: Python (${{ matrix.dir }})
@@ -100,10 +99,10 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Install packages
-        if: hashFiles(format('{0}/package.json', matrix.dir)) != ''
+      - name: Install locked packages
+        if: hashFiles(format('{0}/package-lock.json', matrix.dir)) != ''
         working-directory: ${{ matrix.dir }}
-        run: npm install
+        run: npm ci --ignore-scripts
       - name: Build
         if: hashFiles(format('{0}/package.json', matrix.dir)) != ''
         working-directory: ${{ matrix.dir }}
@@ -116,3 +115,53 @@ jobs:
         if: hashFiles(format('{0}/package.json', matrix.dir)) != ''
         working-directory: ${{ matrix.dir }}
         run: npm test --if-present
+
+      - name: Check Console types and authentication
+        if: matrix.dir == 'console' && hashFiles('console/package.json') != ''
+        working-directory: console
+        run: |
+          npm run type-check
+          npm run test:auth
+
+  mobile-workspace:
+    name: Docker and Mobile Workspace
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      COMPOSE_PROJECT_NAME: kamui-ci-qa
+      KAMUI_QA_PROJECT: kamui-ci-qa
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Dockerfiles and build toolchain
+        shell: bash
+        run: |
+          set -eu
+          test -f console/Dockerfile
+          test -f ops/Dockerfile.workspace
+          test -f ops/nginx/Dockerfile
+          version="$(awk '$1 == "go" {print $2}' api/go.mod)"
+          for file in api/Dockerfile api/Dockerfile.workspace-manager; do
+            grep -Fx "FROM golang:$version-alpine AS builder" "$file"
+            grep -Fx "ENV GOTOOLCHAIN=local" "$file"
+          done
+      - name: Configure isolated instance
+        shell: bash
+        run: |
+          umask 077
+          echo "KAMUI_TOKEN=$(openssl rand -hex 32)" > ops/.env
+          echo "KAMUI_ADMIN_PASSWORD=$(openssl rand -hex 32)" >> ops/.env
+          docker compose --env-file ops/.env -f ops/docker-compose.yml --profile tools config --quiet
+      - name: Build with a clean cache
+        run: docker compose --env-file ops/.env -f ops/docker-compose.yml build --pull --no-cache api console workspace-manager workspace-proxy workspace-image
+      - name: Start and validate nginx
+        run: |
+          docker compose --env-file ops/.env -f ops/docker-compose.yml run --rm --no-deps tls-init
+          docker compose --env-file ops/.env -f ops/docker-compose.yml up -d --no-build --wait --wait-timeout 120
+          docker compose --env-file ops/.env -f ops/docker-compose.yml exec -T workspace-proxy nginx -t
+      - name: Test authenticated workspace lifecycle
+        run: python3 ops/tests/stack.py
+      - name: Diagnose failure
+        if: failure()
+        run: |
+          docker compose --env-file ops/.env -f ops/docker-compose.yml ps -a
+          docker compose --env-file ops/.env -f ops/docker-compose.yml logs --tail=100

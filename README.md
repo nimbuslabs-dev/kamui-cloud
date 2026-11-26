@@ -133,14 +133,14 @@ The stack is planned and may change as the project grows.
 
 ## Mobile Workspace MVP
 
-A working prototype for coding from your phone using a real browser-based IDE (code-server) with GitHub integration.
+A single-owner coding workspace with code-server, GitHub integration and Docker-backed project storage.
 
 **One-command startup on Windows:**
 ```powershell
 .\start-kamui.ps1
 ```
 
-This starts the complete stack (API, Console, nginx Proxy, Workspace Manager) and reports the LAN URL for phone access.
+This starts the API, Console, nginx and Workspace Manager. Startup verifies local HTTPS. A private LAN bind and trust of the local CA require one-time device setup.
 
 See [docs/MOBILE_WORKSPACE_MVP.md](docs/MOBILE_WORKSPACE_MVP.md) for full documentation, setup, testing, and troubleshooting.
 
