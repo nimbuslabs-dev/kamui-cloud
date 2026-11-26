@@ -1,33 +1,17 @@
 # Kamui Cloud Console
 
-## Overview
+The Console is the Next.js dashboard for the Mobile Workspace MVP. It uses the Go workspace API for lifecycle and Git controls. nginx serves the Console over HTTPS and checks its session before forwarding IDE requests, including WebSocket upgrades.
 
-The Kamui Cloud Console is the web-based dashboard for managing and monitoring the Kamui Cloud platform.
+Use the [Mobile Workspace guide](../docs/MOBILE_WORKSPACE_MVP.md) for the complete stack. Node.js 22 and npm are enough to build and test the Console in isolation.
 
-It will provide users with a simple interface to view connected nodes, monitor jobs, manage storage, and configure platform settings.
+```sh
+npm ci --ignore-scripts
+npm run lint
+npm run type-check
+npm run build
+npm run test:auth
+```
 
-## Planned Features
+The auth regression test starts the production Console and a fixture API on ephemeral loopback ports. It covers login, logout, expiry, rate limiting, protected routes, CSRF, IDE origin checks and upstream response handling. It leaves Docker, code-server and GitHub testing to the stack acceptance tests.
 
-- **Dashboard:** Overview of the cloud platform.
-- **Nodes:** View connected nodes and their status.
-- **Jobs:** Monitor job execution and status.
-- **Storage:** View storage usage and stored data.
-- **Settings:** Manage console preferences and configuration.
-
-## Technology Stack
-
-- Next.js
-- React
-- TypeScript
-
-## Development Plan
-
-1. Build the initial console interface.
-2. Create reusable UI components.
-3. Implement loading, empty, and error states.
-4. Use mock data during initial frontend development.
-5. Integrate with the Kamui Cloud API using the shared OpenAPI contract.
-
-## Current Status
-
-The console is in the initial development stage. Features will be implemented incrementally as the platform evolves.
+The Console needs a single instance. Sessions last eight hours, and signing out or restarting the Console invalidates future requests using the affected session. An IDE WebSocket established before sign-out can remain connected until it closes or the workspace stops.

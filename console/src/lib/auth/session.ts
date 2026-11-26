@@ -1,186 +1,155 @@
-// Session-based authentication for Kamui Console
-// Single-user MVP with secure HttpOnly cookie sessions
-
-import { cookies } from 'next/headers';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { NextRequest, NextResponse } from 'next/server';
 
-// Session configuration
-const SESSION_COOKIE_NAME = 'kamui_session';
-const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
-const CSRF_COOKIE_NAME = 'kamui_csrf';
-const CSRF_HEADER_NAME = 'x-csrf-token';
+const cookieName = '__Host-kamui_session';
+const lifetimeSeconds = 8 * 60 * 60;
+const failureLimit = 8;
+const failureWindowMs = 60_000;
 
-// In-memory session store (single-user MVP)
-interface SessionData {
-  userId: string;
-  createdAt: number;
-  expiresAt: number;
+interface Session {
   csrfToken: string;
+  expiresAt: number;
 }
 
-const sessions = new Map<string, SessionData>();
+// Next.js can bundle route handlers separately. Share the revocable sessions
+// across handlers in the one Console process. A restart signs everyone out.
+const globals = globalThis as typeof globalThis & {
+  kamuiAuth?: {
+    sessions: Map<string, Session>;
+    loginLimit: { failures: number; resetAt: number };
+  };
+};
+const state = globals.kamuiAuth ??= {
+  sessions: new Map(),
+  loginLimit: { failures: 0, resetAt: 0 },
+};
 
-// Generate secure random token
-function generateToken(length: number = 32): string {
-  const bytes = new Uint8Array(length);
-  crypto.getRandomValues(bytes);
-  return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
-}
+export function authConfiguration() {
+  const password = process.env.KAMUI_ADMIN_PASSWORD;
+  const token = process.env.KAMUI_TOKEN;
+  const address = process.env.KAMUI_API_URL;
+  if (!password || password.length < 24 || password.length > 256 ||
+      !token || token.length < 32 || password === token || !address) return null;
 
-// Generate CSRF token
-function generateCsrfToken(): string {
-  return generateToken(32);
-}
-
-// Create a new session
-export function createSession(userId: string = 'kamui-user'): { sessionId: string; csrfToken: string } {
-  const sessionId = generateToken(32);
-  const csrfToken = generateCsrfToken();
-  const now = Date.now();
-  
-  sessions.set(sessionId, {
-    userId,
-    createdAt: now,
-    expiresAt: now + SESSION_TTL_MS,
-    csrfToken,
-  });
-  
-  return { sessionId, csrfToken };
-}
-
-// Validate session and return session data if valid
-export function validateSession(sessionId: string): SessionData | null {
-  const session = sessions.get(sessionId);
-  if (!session) return null;
-  
-  if (Date.now() > session.expiresAt) {
-    sessions.delete(sessionId);
+  try {
+    const api = new URL(address);
+    if (!['http:', 'https:'].includes(api.protocol) || api.username || api.password ||
+        api.pathname !== '/' || api.search || api.hash) return null;
+    return { password, token, api: api.origin };
+  } catch {
     return null;
   }
-  
+}
+
+function digest(value: string) {
+  return createHash('sha256').update(value).digest();
+}
+
+export function compareSecret(a: string, b: string): boolean {
+  return timingSafeEqual(digest(a), digest(b));
+}
+
+export function apiError(status: number, code: string, message: string) {
+  return NextResponse.json({ error: { code, message } }, {
+    status,
+    headers: { 'Cache-Control': 'no-store' },
+  });
+}
+
+export function sessionResponse(data: object) {
+  return NextResponse.json(data, { headers: { 'Cache-Control': 'no-store' } });
+}
+
+export function isSameOrigin(request: NextRequest): boolean {
+  // The unpublished Console trusts only nginx to overwrite these headers.
+  const host = request.headers.get('host');
+  if (!host || request.headers.get('x-forwarded-proto') !== 'https') return false;
+  try {
+    return request.headers.get('origin') === new URL('https://' + host).origin;
+  } catch {
+    return false;
+  }
+}
+
+export function loginRateLimit() {
+  const now = Date.now();
+  if (now >= state.loginLimit.resetAt) {
+    state.loginLimit.failures = 0;
+    state.loginLimit.resetAt = now + failureWindowMs;
+  }
+  if (state.loginLimit.failures < failureLimit) return null;
+  const response = apiError(429, 'rate_limited', 'Too many login attempts. Try again in a minute.');
+  response.headers.set('Retry-After', String(Math.ceil((state.loginLimit.resetAt - now) / 1000)));
+  return response;
+}
+
+export function recordLoginFailure() {
+  state.loginLimit.failures++;
+}
+
+export function sessionFromRequest(request: NextRequest): Session | null {
+  const id = request.cookies.get(cookieName)?.value;
+  if (request.headers.get('x-forwarded-proto') !== 'https' ||
+      !id || !/^[a-f0-9]{64}$/.test(id) || !authConfiguration()) return null;
+  const session = state.sessions.get(id);
+  if (!session || session.expiresAt <= Date.now()) {
+    state.sessions.delete(id);
+    return null;
+  }
   return session;
 }
 
-// Delete session (logout)
-export function deleteSession(sessionId: string): void {
-  sessions.delete(sessionId);
-}
-
-// Get session from request cookies
-export function getSessionFromRequest(request: NextRequest): SessionData | null {
-  const cookieStore = request.cookies;
-  const sessionCookie = cookieStore.get(SESSION_COOKIE_NAME);
-  
-  if (!sessionCookie?.value) return null;
-  
-  return validateSession(sessionCookie.value);
-}
-
-// Set session cookie in response
-export function setSessionCookie(response: NextResponse, sessionId: string, csrfToken: string): void {
-  response.cookies.set(SESSION_COOKIE_NAME, sessionId, {
+function setSessionCookie(response: NextResponse, value: string, maxAge: number) {
+  response.cookies.set(cookieName, value, {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',
-    maxAge: SESSION_TTL_MS / 1000,
-    path: '/',
-  });
-  
-  response.cookies.set(CSRF_COOKIE_NAME, csrfToken, {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',
-    maxAge: SESSION_TTL_MS / 1000,
+    secure: true,
+    sameSite: 'strict',
+    maxAge,
     path: '/',
   });
 }
 
-// Clear session cookies
-export function clearSessionCookies(response: NextResponse): void {
-  response.cookies.set(SESSION_COOKIE_NAME, '', {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',
-    maxAge: 0,
-    path: '/',
-  });
-  response.cookies.set(CSRF_COOKIE_NAME, '', {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',
-    maxAge: 0,
-    path: '/',
-  });
-}
-
-// Verify CSRF token from request
-export function verifyCsrfToken(request: NextRequest, session: SessionData): boolean {
-  // Check header first (for API calls)
-  const headerToken = request.headers.get(CSRF_HEADER_NAME);
-  if (headerToken && headerToken === session.csrfToken) {
-    return true;
-  }
-  
-  // Check cookie (for form submissions)
-  const cookieToken = request.cookies.get(CSRF_COOKIE_NAME)?.value;
-  if (cookieToken && cookieToken === session.csrfToken) {
-    return true;
-  }
-  
-  return false;
-}
-
-// Require authentication middleware
-export function requireAuth(request: NextRequest): { session: SessionData; response?: NextResponse } {
-  const session = getSessionFromRequest(request);
-  
-  if (!session) {
-    const response = NextResponse.json(
-      { error: { code: 'unauthorized', message: 'Authentication required' } },
-      { status: 401 }
-    );
-    return { session: null as any, response };
-  }
-  
-  return { session };
-}
-
-// Require CSRF protection for state-changing methods
-export function requireCsrf(request: NextRequest, session: SessionData): NextResponse | null {
-  const method = request.method.toUpperCase();
-  if (['GET', 'HEAD', 'OPTIONS'].includes(method)) {
-    return null; // No CSRF needed for safe methods
-  }
-  
-  if (!verifyCsrfToken(request, session)) {
-    return NextResponse.json(
-      { error: { code: 'csrf_invalid', message: 'Invalid or missing CSRF token' } },
-      { status: 403 }
-    );
-  }
-  
-  return null;
-}
-
-// Get CSRF token for client-side use
-export async function getCsrfToken(): Promise<string | null> {
-  const cookieStore = await cookies();
-  const sessionCookie = cookieStore.get(SESSION_COOKIE_NAME);
-  
-  if (!sessionCookie?.value) return null;
-  
-  const session = validateSession(sessionCookie.value);
-  return session?.csrfToken || null;
-}
-
-// Clean up expired sessions (call periodically)
-export function cleanupExpiredSessions(): void {
+export function signIn(request: NextRequest) {
   const now = Date.now();
-  const keysToDelete: string[] = [];
-  sessions.forEach((session, sessionId) => {
-    if (now > session.expiresAt) {
-      keysToDelete.push(sessionId);
+  for (const [id, session] of state.sessions) {
+    if (session.expiresAt <= now) state.sessions.delete(id);
+  }
+  revokeSession(request);
+  if (state.sessions.size >= 32) {
+    const oldest = state.sessions.keys().next().value;
+    if (oldest) state.sessions.delete(oldest);
+  }
+  const id = randomBytes(32).toString('hex');
+  const csrfToken = randomBytes(32).toString('hex');
+  state.sessions.set(id, { csrfToken, expiresAt: now + lifetimeSeconds * 1000 });
+  state.loginLimit.failures = 0;
+  const response = sessionResponse({ success: true, csrfToken });
+  setSessionCookie(response, id, lifetimeSeconds);
+  return response;
+}
+
+function revokeSession(request: NextRequest) {
+  const id = request.cookies.get(cookieName)?.value;
+  if (id) state.sessions.delete(id);
+}
+
+export function signOut(request: NextRequest) {
+  revokeSession(request);
+  const response = sessionResponse({ success: true });
+  setSessionCookie(response, '', 0);
+  return response;
+}
+
+export function requireSession(request: NextRequest) {
+  const session = sessionFromRequest(request);
+  if (!session) {
+    return { error: apiError(401, 'unauthorized', 'Authentication required') };
+  }
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    const csrf = request.headers.get('x-csrf-token');
+    if (!csrf || !isSameOrigin(request) || !compareSecret(csrf, session.csrfToken)) {
+      return { error: apiError(403, 'csrf_invalid', 'Invalid request origin or CSRF token') };
     }
-  });
-  keysToDelete.forEach(key => sessions.delete(key));
+  }
+  return { session };
 }

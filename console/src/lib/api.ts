@@ -22,12 +22,22 @@ function getHeaders(): HeadersInit {
   };
 }
 
+async function mutationHeaders(): Promise<HeadersInit> {
+  return { ...getHeaders(), 'X-CSRF-Token': await getCsrfToken() };
+}
+
+export class ApiRequestError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
+}
+
 async function handleResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const error: ApiError = await response.json().catch(() => ({
       error: { code: 'unknown', message: response.statusText },
     }));
-    throw new Error(error.error.message || `HTTP ${response.status}`);
+    throw new ApiRequestError(response.status, error?.error?.message || `HTTP ${response.status}`);
   }
   if (response.status === 204) {
     return undefined as T;
@@ -49,6 +59,7 @@ export async function login(password: string): Promise<{ csrfToken: string }> {
 export async function logout(): Promise<void> {
   const response = await fetch(`${API_BASE}/auth/logout`, {
     method: 'POST',
+    headers: await mutationHeaders(),
     credentials: 'include',
   });
   await handleResponse<void>(response);
@@ -71,7 +82,7 @@ export async function checkAuth(): Promise<{ authenticated: boolean; userId: str
 
 // Health
 export async function checkHealth(): Promise<HealthResponse> {
-  const response = await fetch(`${API_BASE}/healthz`, {
+  const response = await fetch(`${API_BASE}/health`, {
     method: 'GET',
     headers: { 'Content-Type': 'application/json' },
   });
@@ -91,7 +102,7 @@ export async function listWorkspaces(): Promise<Workspace[]> {
 export async function createWorkspace(workspace: WorkspaceCreate): Promise<Workspace> {
   const response = await fetch(`${API_BASE}/workspaces`, {
     method: 'POST',
-    headers: getHeaders(),
+    headers: await mutationHeaders(),
     credentials: 'include',
     body: JSON.stringify(workspace),
   });
@@ -110,7 +121,7 @@ export async function getWorkspace(workspaceId: string): Promise<Workspace> {
 export async function startWorkspace(workspaceId: string): Promise<Workspace> {
   const response = await fetch(`${API_BASE}/workspaces/${workspaceId}/start`, {
     method: 'POST',
-    headers: getHeaders(),
+    headers: await mutationHeaders(),
     credentials: 'include',
   });
   return handleResponse<Workspace>(response);
@@ -119,16 +130,33 @@ export async function startWorkspace(workspaceId: string): Promise<Workspace> {
 export async function stopWorkspace(workspaceId: string): Promise<Workspace> {
   const response = await fetch(`${API_BASE}/workspaces/${workspaceId}/stop`, {
     method: 'POST',
-    headers: getHeaders(),
+    headers: await mutationHeaders(),
     credentials: 'include',
   });
   return handleResponse<Workspace>(response);
 }
 
+export async function restartWorkspace(workspaceId: string): Promise<Workspace> {
+  const response = await fetch(`${API_BASE}/workspaces/${workspaceId}/restart`, {
+    method: 'POST',
+    headers: await mutationHeaders(),
+  });
+  return handleResponse<Workspace>(response);
+}
+
+export async function gitBranch(workspaceId: string, branch: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/workspaces/${workspaceId}/git/branch`, {
+    method: 'POST',
+    headers: await mutationHeaders(),
+    body: JSON.stringify({ branch }),
+  });
+  await handleResponse<void>(response);
+}
+
 export async function deleteWorkspace(workspaceId: string): Promise<void> {
   const response = await fetch(`${API_BASE}/workspaces/${workspaceId}`, {
     method: 'DELETE',
-    headers: getHeaders(),
+    headers: await mutationHeaders(),
     credentials: 'include',
   });
   await handleResponse<void>(response);
@@ -147,7 +175,7 @@ export async function getGitStatus(workspaceId: string): Promise<GitStatus> {
 export async function gitAdd(workspaceId: string, files: string[]): Promise<void> {
   const response = await fetch(`${API_BASE}/workspaces/${workspaceId}/git/add`, {
     method: 'POST',
-    headers: getHeaders(),
+    headers: await mutationHeaders(),
     credentials: 'include',
     body: JSON.stringify({ files }),
   });
@@ -157,7 +185,7 @@ export async function gitAdd(workspaceId: string, files: string[]): Promise<void
 export async function gitCommit(workspaceId: string, message: string): Promise<{ hash: string }> {
   const response = await fetch(`${API_BASE}/workspaces/${workspaceId}/git/commit`, {
     method: 'POST',
-    headers: getHeaders(),
+    headers: await mutationHeaders(),
     credentials: 'include',
     body: JSON.stringify({ message }),
   });
@@ -167,7 +195,7 @@ export async function gitCommit(workspaceId: string, message: string): Promise<{
 export async function gitPush(workspaceId: string, remote?: string, branch?: string): Promise<void> {
   const response = await fetch(`${API_BASE}/workspaces/${workspaceId}/git/push`, {
     method: 'POST',
-    headers: getHeaders(),
+    headers: await mutationHeaders(),
     credentials: 'include',
     body: JSON.stringify({ remote, branch }),
   });
@@ -177,7 +205,7 @@ export async function gitPush(workspaceId: string, remote?: string, branch?: str
 export async function gitPull(workspaceId: string, remote?: string, branch?: string): Promise<void> {
   const response = await fetch(`${API_BASE}/workspaces/${workspaceId}/git/pull`, {
     method: 'POST',
-    headers: getHeaders(),
+    headers: await mutationHeaders(),
     credentials: 'include',
     body: JSON.stringify({ remote, branch }),
   });
@@ -262,12 +290,4 @@ export async function finishJob(jobId: string, exitCode: number, logs?: string):
     body: JSON.stringify({ exit_code: exitCode, logs }),
   });
   return handleResponse<Job>(response);
-}
-
-// Utility to get local IP for display
-export function getLocalIP(): Promise<string> {
-  return fetch('https://api.ipify.org?format=json')
-    .then(r => r.json())
-    .then(d => d.ip)
-    .catch(() => 'unknown');
 }

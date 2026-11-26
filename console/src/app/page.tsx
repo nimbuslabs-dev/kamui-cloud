@@ -1,335 +1,164 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import { Header } from '@/components/layout/Header';
 import { WorkspaceList } from '@/components/workspace/WorkspaceList';
 import { GitPanel } from '@/components/workspace/GitPanel';
 import { Card, CardContent } from '@/components/ui/Card';
-import { Badge } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
-import { Wifi, WifiOff, Loader2, Info, AlertTriangle } from 'lucide-react';
-import { cn, formatRelativeTime } from '@/lib/utils';
-import { listWorkspaces, createWorkspace, startWorkspace, stopWorkspace, deleteWorkspace, checkHealth, checkAuth, logout } from '@/lib/api';
-import type { Workspace, ConnectionState, HealthResponse } from '@/types';
+import { AlertTriangle, Loader2 } from 'lucide-react';
+import {
+  ApiRequestError, listWorkspaces, startWorkspace, stopWorkspace,
+  restartWorkspace, deleteWorkspace, checkHealth, checkAuth, logout,
+} from '@/lib/api';
+import type { Workspace, ConnectionState } from '@/types';
 
 export default function Dashboard() {
   const router = useRouter();
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [isLoading, setIsLoading] = useState(true);
-  const [authLoading, setAuthLoading] = useState(true);
-  const [connectionState, setConnectionState] = useState<ConnectionState>('disconnected');
-  const [hostName, setHostName] = useState('Loading...');
-  const [localIP, setLocalIP] = useState('Detecting...');
-  const [health, setHealth] = useState<HealthResponse | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  const [authenticated, setAuthenticated] = useState(false);
+  const [connectionState, setConnectionState] = useState<ConnectionState>('connecting');
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string | null>(null);
-  const [showGitPanel, setShowGitPanel] = useState(false);
-  const [refreshInterval, setRefreshInterval] = useState<NodeJS.Timeout | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const currentAction = useRef<string | null>(null);
+  const revision = useRef(0);
+  const gitPanel = useRef<HTMLElement>(null);
 
-  // Check authentication on mount
-  useEffect(() => {
-    const verifyAuth = async () => {
-      try {
-        const auth = await checkAuth();
-        if (!auth.authenticated) {
-          router.push('/login');
-        }
-      } catch {
-        router.push('/login');
-      } finally {
-        setAuthLoading(false);
-      }
-    };
-    verifyAuth();
+  const handleError = useCallback((error: unknown, setError: (message: string) => void) => {
+    if (error instanceof ApiRequestError && error.status === 401) {
+      setAuthenticated(false);
+      router.replace('/login');
+      return;
+    }
+    setError(error instanceof Error ? error.message : 'Kamui could not complete the request');
   }, [router]);
 
   const fetchData = useCallback(async () => {
+    const requestRevision = ++revision.current;
     try {
-      setConnectionState('connecting');
-      const [healthData, workspacesData] = await Promise.all([
-        checkHealth(),
-        listWorkspaces(),
-      ]);
-      setHealth(healthData);
-      setWorkspaces(workspacesData);
+      await checkAuth();
+      setAuthenticated(true);
+      const [, active] = await Promise.all([checkHealth(), listWorkspaces()]);
+      if (requestRevision === revision.current) setWorkspaces(active);
       setConnectionState('connected');
-      setError(null);
-    } catch (err) {
+      setConnectionError(null);
+    } catch (error) {
       setConnectionState('error');
-      setError(err instanceof Error ? err.message : 'Failed to connect to API');
+      handleError(error, setConnectionError);
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [handleError]);
 
-  const fetchLocalIP = useCallback(async () => {
-    try {
-      const response = await fetch('https://api.ipify.org?format=json');
-      const data = await response.json();
-      setLocalIP(data.ip);
-    } catch {
-      setLocalIP('Unknown');
-    }
-  }, []);
-
-  const getHostName = useCallback(async () => {
-    try {
-      const response = await fetch('https://api.hostname.com/');
-      setHostName('kamui-server');
-    } catch {
-      setHostName('kamui-server');
-    }
-  }, []);
-
-  // Initial load
   useEffect(() => {
-    fetchData();
-    fetchLocalIP();
-    getHostName();
-    
-    // Set up periodic refresh
-    const interval = setInterval(fetchData, 30000);
-    setRefreshInterval(interval);
-    
+    const initial = setTimeout(fetchData, 0);
+    const interval = setInterval(() => {
+      if (!currentAction.current) void fetchData();
+    }, 30000);
     return () => {
-      if (interval) clearInterval(interval);
+      clearTimeout(initial);
+      clearInterval(interval);
     };
-  }, [fetchData, fetchLocalIP, getHostName]);
+  }, [fetchData]);
 
-  const handleStartWorkspace = async (id: string) => {
+  async function runAction(id: string, action: (id: string) => Promise<Workspace | void>) {
+    if (currentAction.current) return;
+    currentAction.current = id;
+    ++revision.current;
+    setBusyId(id);
+    setActionError(null);
     try {
-      const workspace = await startWorkspace(id);
-      setWorkspaces(workspaces.map(w => w.id === id ? workspace : w));
-    } catch (err) {
-      alert(err instanceof Error ? err.message : 'Failed to start workspace');
+      const updated = await action(id);
+      setWorkspaces(items => updated
+        ? items.map(workspace => workspace.id === id ? updated : workspace)
+        : items.filter(workspace => workspace.id !== id));
+      if (!updated) setSelectedWorkspaceId(selected => selected === id ? null : selected);
+    } catch (error) {
+      handleError(error, setActionError);
+      void fetchData();
+    } finally {
+      currentAction.current = null;
+      setBusyId(null);
     }
-  };
+  }
 
-  const handleStopWorkspace = async (id: string) => {
-    try {
-      const workspace = await stopWorkspace(id);
-      setWorkspaces(workspaces.map(w => w.id === id ? workspace : w));
-      if (selectedWorkspaceId === id) {
-        setSelectedWorkspaceId(null);
-        setShowGitPanel(false);
-      }
-    } catch (err) {
-      alert(err instanceof Error ? err.message : 'Failed to stop workspace');
-    }
-  };
+  function handleCreate(workspace: Workspace) {
+    ++revision.current;
+    setWorkspaces(items => [...items, workspace]);
+  }
 
-  const handleOpenWorkspace = (id: string) => {
-    const workspace = workspaces.find(w => w.id === id);
-    if (workspace?.code_server_url) {
-      window.open(workspace.code_server_url, '_blank');
-    }
-  };
-
-  const handleDeleteWorkspace = async (id: string) => {
-    try {
-      await deleteWorkspace(id);
-      setWorkspaces(workspaces.filter(w => w.id !== id));
-      if (selectedWorkspaceId === id) {
-        setSelectedWorkspaceId(null);
-        setShowGitPanel(false);
-      }
-    } catch (err) {
-      alert(err instanceof Error ? err.message : 'Failed to delete workspace');
-    }
-  };
-
-  const handleWorkspaceSelect = (id: string) => {
-    setSelectedWorkspaceId(id);
-    setShowGitPanel(true);
-  };
-
-  const handleLogout = async () => {
+  async function handleLogout() {
+    setActionError(null);
     try {
       await logout();
-      router.push('/login');
-      router.refresh();
-    } catch {
-      router.push('/login');
+      setAuthenticated(false);
+      router.replace('/login');
+    } catch (error) {
+      handleError(error, setActionError);
     }
-  };
+  }
 
-  const selectedWorkspace = workspaces.find(w => w.id === selectedWorkspaceId);
+  useEffect(() => {
+    if (!selectedWorkspaceId) return;
+    gitPanel.current?.focus();
+  }, [selectedWorkspaceId]);
 
-  // Show loading while checking auth
-  if (authLoading) {
+  const selectedWorkspace = workspaces.find(workspace => workspace.id === selectedWorkspaceId);
+
+  if (!authenticated && !connectionError) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-neutral-50 dark:bg-neutral-950">
-        <Loader2 className="h-8 w-8 animate-spin text-kamui-indigo-600" />
+      <div className="flex min-h-screen items-center justify-center bg-neutral-50 dark:bg-neutral-950">
+        <Loader2 aria-label="Checking session" className="h-8 w-8 animate-spin text-kamui-indigo-600" />
       </div>
     );
   }
 
   return (
     <div className="min-h-screen">
-      {/* Header */}
-      <Header
-        connectionState={connectionState}
-        hostName={hostName}
-        isMobileMenuOpen={isMobileMenuOpen}
-        onMobileMenuToggle={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
-      />
-
-      {/* Main Content */}
-      <main className="pt-14 pb-4 px-4">
+      <Header connectionState={connectionState} onLogout={authenticated ? handleLogout : undefined} />
+      <main className="px-4 pb-4 pt-[4.5rem]">
         <div className="container-narrow space-y-6">
-          {/* Connection Status Banner */}
-          {(connectionState === 'error' || connectionState === 'disconnected') && (
-            <div className="flex items-center gap-3 p-4 rounded-lg bg-yellow-50 dark:bg-yellow-900/30 border border-yellow-200 dark:border-yellow-800">
-              {connectionState === 'error' ? (
-                <AlertTriangle className="h-5 w-5 text-yellow-600 flex-shrink-0" />
-              ) : (
-                <WifiOff className="h-5 w-5 text-yellow-600 flex-shrink-0" />
-              )}
-              <div className="flex-1">
-                <p className="font-medium text-yellow-800 dark:text-yellow-200">
-                  {connectionState === 'error' ? 'Connection Error' : 'Not Connected'}
-                </p>
-                <p className="text-sm text-yellow-700 dark:text-yellow-300">
-                  {error || 'Unable to reach Kamui API. Check if the server is running.'}
-                </p>
-              </div>
-              <Button variant="secondary" size="sm" onClick={fetchData}>
-                Retry
-              </Button>
+          {connectionError && (
+            <div role="alert" className="flex items-center gap-3 rounded-lg border border-yellow-200 bg-yellow-50 p-4 text-yellow-800 dark:border-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-200">
+              <AlertTriangle className="h-5 w-5 shrink-0" />
+              <p className="flex-1 text-sm">{connectionError}</p>
+              <Button variant="secondary" size="sm" onClick={fetchData}>Retry</Button>
             </div>
           )}
-
-          {/* Server Info */}
-          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-            <Card>
-              <CardContent className="p-4">
-                <div className="flex items-center gap-3">
-                  <div className="p-2 rounded-lg bg-kamui-indigo-100 dark:bg-kamui-indigo-900/30">
-                    <Wifi className="h-5 w-5 text-kamui-indigo-600 dark:text-kamui-indigo-400" />
-                  </div>
-                  <div>
-                    <p className="text-sm text-neutral-500 dark:text-neutral-400">API Status</p>
-                    <p className="font-medium text-neutral-900 dark:text-neutral-100 capitalize">
-                      {health?.status || 'unknown'}
-                    </p>
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
-            
-            <Card>
-              <CardContent className="p-4">
-                <div className="flex items-center gap-3">
-                  <div className="p-2 rounded-lg bg-kamui-teal-100 dark:bg-kamui-teal-900/30">
-                    <span className="text-2xl">📱</span>
-                  </div>
-                  <div>
-                    <p className="text-sm text-neutral-500 dark:text-neutral-400">Host</p>
-                    <p className="font-medium text-neutral-900 dark:text-neutral-100 truncate">
-                      {hostName}
-                    </p>
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
-            
-            <Card>
-              <CardContent className="p-4">
-                <div className="flex items-center gap-3">
-                  <div className="p-2 rounded-lg bg-orange-100 dark:bg-orange-900/30">
-                    <span className="text-2xl">🌐</span>
-                  </div>
-                  <div>
-                    <p className="text-sm text-neutral-500 dark:text-neutral-400">Public IP</p>
-                    <p className="font-medium text-neutral-900 dark:text-neutral-100 truncate font-mono text-sm">
-                      {localIP}
-                    </p>
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
-            
-            <Card>
-              <CardContent className="p-4">
-                <div className="flex items-center gap-3">
-                  <div className="p-2 rounded-lg bg-purple-100 dark:bg-purple-900/30">
-                    <span className="text-2xl">📦</span>
-                  </div>
-                  <div>
-                    <p className="text-sm text-neutral-500 dark:text-neutral-400">Workspaces</p>
-                    <p className="font-medium text-neutral-900 dark:text-neutral-100">
-                      {workspaces.length} total
-                    </p>
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
-          </div>
-
-          {/* Workspace List & Git Panel */}
-          <div className="grid gap-6 lg:grid-cols-3">
-            <div className="lg:col-span-2">
-              <WorkspaceList
-                workspaces={workspaces}
-                onStart={handleStartWorkspace}
-                onStop={handleStopWorkspace}
-                onOpen={handleOpenWorkspace}
-                onDelete={handleDeleteWorkspace}
-                isLoading={isLoading}
-              />
+          {actionError && <p role="alert" className="rounded-lg bg-red-50 p-4 text-sm text-red-700 dark:bg-red-900/20 dark:text-red-300">{actionError}</p>}
+          {authenticated && (
+            <div className="grid gap-6 lg:grid-cols-3">
+              <div className="min-w-0 lg:col-span-2">
+                <WorkspaceList
+                  workspaces={workspaces}
+                  onStart={id => runAction(id, startWorkspace)}
+                  onStop={id => runAction(id, stopWorkspace)}
+                  onRestart={id => runAction(id, restartWorkspace)}
+                  onDelete={id => runAction(id, deleteWorkspace)}
+                  onCreate={handleCreate}
+                  onGit={setSelectedWorkspaceId}
+                  busyId={busyId}
+                  isLoading={isLoading}
+                />
+              </div>
+              <section ref={gitPanel} tabIndex={-1} aria-label="Workspace Git" className="min-w-0 scroll-mt-20">
+                {selectedWorkspace ? (
+                  <GitPanel key={selectedWorkspace.id + selectedWorkspace.status}
+                    workspaceId={selectedWorkspace.id} isWorkspaceRunning={selectedWorkspace.status === 'running'} />
+                ) : (
+                  <Card><CardContent className="py-8 text-center text-sm text-neutral-500 dark:text-neutral-400">
+                    Choose Git on a running workspace to view changes.
+                  </CardContent></Card>
+                )}
+              </section>
             </div>
-            
-            <div className="lg:col-span-1">
-              {selectedWorkspace && (
-                <div className="sticky top-20">
-                  <GitPanel
-                    workspaceId={selectedWorkspace.id}
-                    isWorkspaceRunning={selectedWorkspace.status === 'running'}
-                  />
-                </div>
-              )}
-              {!selectedWorkspace && (
-                <Card>
-                  <CardContent className="py-8 text-center">
-                    <div className="text-2xl mb-2">📂</div>
-                    <h3 className="text-lg font-medium text-neutral-900 dark:text-neutral-100 mb-1">
-                      Select a workspace
-                    </h3>
-                    <p className="text-neutral-500 dark:text-neutral-400">
-                      Click on a workspace to view Git status and controls
-                    </p>
-                  </CardContent>
-                </Card>
-              )}
-            </div>
-          </div>
+          )}
         </div>
       </main>
-
-      {/* Mobile Git Panel Modal */}
-      {showGitPanel && selectedWorkspace && (
-        <div className="fixed inset-0 z-50 lg:hidden">
-          <div className="fixed inset-0 bg-black/50" onClick={() => setShowGitPanel(false)} />
-          <div className="fixed bottom-0 left-0 right-0 bg-white dark:bg-neutral-900 rounded-t-2xl shadow-xl max-h-[80vh] overflow-y-auto animate-slide-up">
-            <div className="flex items-center justify-between p-4 border-b border-neutral-200 dark:border-neutral-700 sticky top-0 bg-white dark:bg-neutral-900 rounded-t-2xl">
-              <h3 className="font-semibold text-neutral-900 dark:text-neutral-100">
-                Git: {selectedWorkspace.name}
-              </h3>
-              <Button variant="ghost" size="sm" onClick={() => setShowGitPanel(false)}>
-                ✕
-              </Button>
-            </div>
-            <div className="p-4">
-              <GitPanel
-                workspaceId={selectedWorkspace.id}
-                isWorkspaceRunning={selectedWorkspace.status === 'running'}
-              />
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

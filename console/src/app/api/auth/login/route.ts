@@ -1,43 +1,24 @@
-// Login endpoint - creates session and sets HttpOnly cookies
-
-import { NextRequest, NextResponse } from 'next/server';
-import { createSession, setSessionCookie } from '@/lib/auth/session';
-
-const ADMIN_PASSWORD = process.env.KAMUI_ADMIN_PASSWORD || 'changeme';
-
-// Simple password check (in production, use proper password hashing)
-function verifyPassword(password: string): boolean {
-  return password === ADMIN_PASSWORD;
-}
+import { NextRequest } from 'next/server';
+import {
+  apiError, authConfiguration, compareSecret, isSameOrigin,
+  loginRateLimit, recordLoginFailure, signIn,
+} from '@/lib/auth/session';
 
 export async function POST(request: NextRequest) {
-  try {
-    const body = await request.json();
-    const { password } = body;
-    
-    if (!password || !verifyPassword(password)) {
-      return NextResponse.json(
-        { error: { code: 'invalid_credentials', message: 'Invalid password' } },
-        { status: 401 }
-      );
-    }
-    
-    // Create new session
-    const { sessionId, csrfToken } = createSession();
-    
-    const response = NextResponse.json({
-      success: true,
-      csrfToken, // Return CSRF token for client-side use
-    });
-    
-    // Set HttpOnly cookies
-    setSessionCookie(response, sessionId, csrfToken);
-    
-    return response;
-  } catch (error) {
-    return NextResponse.json(
-      { error: { code: 'internal', message: 'Login failed' } },
-      { status: 500 }
-    );
+  if (!isSameOrigin(request)) return apiError(403, 'origin_invalid', 'Invalid request origin');
+  const config = authConfiguration();
+  if (!config) return apiError(503, 'unavailable', 'Authentication is not configured');
+  const limited = loginRateLimit();
+  if (limited) return limited;
+  const body = await request.json().catch(() => null);
+  if (!body || typeof body.password !== 'string' || body.password.length > 256) {
+    return apiError(400, 'bad_request', 'A password is required');
   }
+  const retryLimit = loginRateLimit();
+  if (retryLimit) return retryLimit;
+  if (!compareSecret(body.password, config.password)) {
+    recordLoginFailure();
+    return apiError(401, 'invalid_credentials', 'Invalid password');
+  }
+  return signIn(request);
 }

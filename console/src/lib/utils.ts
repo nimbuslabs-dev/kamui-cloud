@@ -57,24 +57,24 @@ export function getStatusColor(status: string): string {
   }
 }
 
-export function getStatusBadge(status: string): string {
+export function getStatusBadge(status: string): 'default' | 'success' | 'warning' | 'error' | 'info' {
   switch (status) {
     case 'online':
     case 'running':
     case 'succeeded':
-      return 'badge-success';
+      return 'success';
     case 'offline':
     case 'stopped':
     case 'failed':
-      return 'badge-error';
+      return 'error';
     case 'creating':
     case 'starting':
     case 'queued':
-      return 'badge-warning';
+      return 'warning';
     case 'stopping':
-      return 'badge-warning';
+      return 'warning';
     default:
-      return 'badge-neutral';
+      return 'default';
   }
 }
 

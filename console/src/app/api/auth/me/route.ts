@@ -1,28 +1,7 @@
-// Session validation endpoint - returns current user info
+import { NextRequest } from 'next/server';
+import { requireSession, sessionResponse } from '@/lib/auth/session';
 
-import { NextRequest, NextResponse } from 'next/server';
-import { getSessionFromRequest } from '@/lib/auth/session';
-
-export async function GET(request: NextRequest) {
-  try {
-    const session = getSessionFromRequest(request);
-    
-    if (!session) {
-      return NextResponse.json(
-        { error: { code: 'unauthorized', message: 'Not authenticated' } },
-        { status: 401 }
-      );
-    }
-    
-    return NextResponse.json({
-      authenticated: true,
-      userId: session.userId,
-      csrfToken: session.csrfToken,
-    });
-  } catch (error) {
-    return NextResponse.json(
-      { error: { code: 'internal', message: 'Session check failed' } },
-      { status: 500 }
-    );
-  }
+export function GET(request: NextRequest) {
+  const auth = requireSession(request);
+  return auth.error ?? sessionResponse({ authenticated: true, userId: 'kamui-user', csrfToken: auth.session.csrfToken });
 }

@@ -1,24 +1,7 @@
-// CSRF token endpoint - returns current CSRF token for client-side use
+import { NextRequest } from 'next/server';
+import { requireSession, sessionResponse } from '@/lib/auth/session';
 
-import { NextRequest, NextResponse } from 'next/server';
-import { getSessionFromRequest } from '@/lib/auth/session';
-
-export async function GET(request: NextRequest) {
-  try {
-    const session = getSessionFromRequest(request);
-    
-    if (!session) {
-      return NextResponse.json(
-        { error: { code: 'unauthorized', message: 'Authentication required' } },
-        { status: 401 }
-      );
-    }
-    
-    return NextResponse.json({ csrfToken: session.csrfToken });
-  } catch (error) {
-    return NextResponse.json(
-      { error: { code: 'internal', message: 'Failed to get CSRF token' } },
-      { status: 500 }
-    );
-  }
+export function GET(request: NextRequest) {
+  const auth = requireSession(request);
+  return auth.error ?? sessionResponse({ csrfToken: auth.session.csrfToken });
 }

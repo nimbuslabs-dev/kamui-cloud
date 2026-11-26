@@ -2,11 +2,11 @@
 
 import { useState, FormEvent } from 'react';
 import { useRouter } from 'next/navigation';
-import { Lock, Loader2, AlertCircle, Eye, EyeOff } from 'lucide-react';
+import { Lock, AlertCircle } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/Card';
-import { login, checkAuth } from '@/lib/api';
+import { login } from '@/lib/api';
 
 export default function LoginPage() {
   const router = useRouter();
@@ -15,19 +15,13 @@ export default function LoginPage() {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 
-  // Check if already authenticated on mount
-  // This runs on client side, so we can't use server-side auth
-  // The page.tsx will handle redirect if already authenticated
-
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setError('');
     setLoading(true);
 
     try {
-      const result = await login(password);
-      // Store CSRF token for subsequent requests
-      // The login API sets HttpOnly cookies automatically
+      await login(password);
       router.push('/');
       router.refresh();
     } catch (err) {
@@ -67,7 +61,6 @@ export default function LoginPage() {
               placeholder="Enter admin password"
               autoComplete="current-password"
               autoFocus
-              onKeyDown={(e) => e.key === 'Enter' && !loading && handleSubmit(e as unknown as FormEvent)}
               disabled={loading}
             />
             
@@ -90,14 +83,6 @@ export default function LoginPage() {
             </Button>
           </form>
 
-          <div className="mt-6 p-3 rounded-md bg-neutral-50 dark:bg-neutral-800/50 text-center">
-            <p className="text-xs text-neutral-500 dark:text-neutral-400">
-              Default password: <code className="font-mono text-neutral-700 dark:text-neutral-300">changeme</code>
-            </p>
-            <p className="text-xs text-neutral-500 dark:text-neutral-400 mt-1">
-              Set <code className="font-mono">KAMUI_ADMIN_PASSWORD</code> in <code className="font-mono">ops/.env</code>
-            </p>
-          </div>
         </CardContent>
       </Card>
     </div>

@@ -50,7 +50,7 @@ export interface Workspace {
   name: string;
   repository_url: string;
   branch: string;
-  status: 'creating' | 'running' | 'stopped' | 'error';
+  status: 'creating' | 'running' | 'stopped' | 'error' | 'unavailable';
   created_at: string;
   updated_at: string;
   last_active_at?: string;
@@ -90,8 +90,8 @@ export interface ApiError {
 
 export interface HealthResponse {
   status: 'ok';
-  service: string;
-  version: string;
+  service?: string;
+  version?: string;
 }
 
 // Connection states

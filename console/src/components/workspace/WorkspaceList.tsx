@@ -6,15 +6,17 @@ import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/Card';
 import { WorkspaceCard } from './WorkspaceCard';
-import { cn, formatRelativeTime } from '@/lib/utils';
 import type { Workspace, WorkspaceCreate } from '@/types';
-import { listWorkspaces, createWorkspace, startWorkspace } from '@/lib/api';
+import { createWorkspace } from '@/lib/api';
 
 interface WorkspaceListProps {
   workspaces: Workspace[];
   onStart: (id: string) => void;
   onStop: (id: string) => void;
-  onOpen: (id: string) => void;
+  onRestart: (id: string) => void;
+  onGit: (id: string) => void;
+  onCreate: (workspace: Workspace) => void;
+  busyId: string | null;
   onDelete: (id: string) => void;
   isLoading?: boolean;
 }
@@ -23,7 +25,10 @@ export function WorkspaceList({
   workspaces,
   onStart,
   onStop,
-  onOpen,
+  onRestart,
+  onGit,
+  onCreate,
+  busyId,
   onDelete,
   isLoading,
 }: WorkspaceListProps) {
@@ -31,9 +36,10 @@ export function WorkspaceList({
   const [newWorkspace, setNewWorkspace] = useState<WorkspaceCreate>({
     name: '',
     repository_url: '',
-    branch: 'main',
+    branch: '',
   });
   const [errors, setErrors] = useState<Partial<WorkspaceCreate>>({});
+  const [createError, setCreateError] = useState<string | null>(null);
   const [isCreating, setIsCreating] = useState(false);
 
   const validateForm = (): boolean => {
@@ -43,8 +49,8 @@ export function WorkspaceList({
     }
     if (!newWorkspace.repository_url.trim()) {
       newErrors.repository_url = 'Repository URL is required';
-    } else if (!/^https?:\/\/.+/.test(newWorkspace.repository_url)) {
-      newErrors.repository_url = 'Must be a valid HTTP/HTTPS URL';
+    } else if (!/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/?$/i.test(newWorkspace.repository_url.trim())) {
+      newErrors.repository_url = 'Enter a GitHub HTTPS repository URL';
     }
     setErrors(newErrors);
     return Object.keys(newErrors).length === 0;
@@ -54,14 +60,19 @@ export function WorkspaceList({
     e.preventDefault();
     if (!validateForm()) return;
     
+    setCreateError(null);
     setIsCreating(true);
     try {
-      const workspace = await createWorkspace(newWorkspace);
-      onStart(workspace.id);
+      const workspace = await createWorkspace({
+        name: newWorkspace.name.trim(),
+        repository_url: newWorkspace.repository_url.trim(),
+        branch: newWorkspace.branch?.trim() || undefined,
+      });
+      onCreate(workspace);
       setShowCreateForm(false);
-      setNewWorkspace({ name: '', repository_url: '', branch: 'main' });
+      setNewWorkspace({ name: '', repository_url: '', branch: '' });
     } catch (error) {
-      setErrors({ repository_url: error instanceof Error ? error.message : 'Failed to create workspace' });
+      setCreateError(error instanceof Error ? error.message : 'Failed to create workspace');
     } finally {
       setIsCreating(false);
     }
@@ -69,8 +80,9 @@ export function WorkspaceList({
 
   const handleCancel = () => {
     setShowCreateForm(false);
-    setNewWorkspace({ name: '', repository_url: '', branch: 'main' });
+    setNewWorkspace({ name: '', repository_url: '', branch: '' });
     setErrors({});
+    setCreateError(null);
   };
 
   if (isLoading) {
@@ -89,7 +101,7 @@ export function WorkspaceList({
       {/* Create Workspace Form */}
       <Card>
         <CardHeader className="pb-2">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <CardTitle className="flex items-center gap-2">
               <FolderGit2 className="h-5 w-5" />
               Workspaces
@@ -109,6 +121,7 @@ export function WorkspaceList({
 
         {showCreateForm && (
           <form onSubmit={handleCreate} className="px-6 pb-6 space-y-4">
+            {createError && <p role="alert" className="text-sm text-red-600">{createError}</p>}
             <Input
               label="Workspace Name"
               value={newWorkspace.name}
@@ -123,13 +136,13 @@ export function WorkspaceList({
               onChange={(e) => setNewWorkspace({ ...newWorkspace, repository_url: e.target.value })}
               placeholder="https://github.com/user/repo.git"
               error={errors.repository_url}
-              helperText="HTTPS URL for public or private repos (with token)"
+              helperText="Public GitHub repository URL"
             />
             <Input
               label="Branch"
               value={newWorkspace.branch}
               onChange={(e) => setNewWorkspace({ ...newWorkspace, branch: e.target.value })}
-              placeholder="main"
+              placeholder="Repository default"
             />
             <div className="flex justify-end gap-2 pt-2">
               <Button type="button" variant="secondary" onClick={handleCancel}>
@@ -161,14 +174,16 @@ export function WorkspaceList({
 
       {/* Workspace Grid */}
       {workspaces.length > 0 && (
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        <div className="grid gap-4 md:grid-cols-2">
           {workspaces.map((workspace) => (
             <WorkspaceCard
               key={workspace.id}
               workspace={workspace}
               onStart={onStart}
               onStop={onStop}
-              onOpen={onOpen}
+              onRestart={onRestart}
+              onGit={onGit}
+              busy={busyId === workspace.id}
               onDelete={onDelete}
             />
           ))}
