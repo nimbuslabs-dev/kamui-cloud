@@ -140,7 +140,7 @@ A single-owner coding workspace with code-server, GitHub integration and Docker-
 .\start-kamui.ps1
 ```
 
-This starts the API, Console, nginx and Workspace Manager. Startup verifies local HTTPS. A private LAN bind and trust of the local CA require one-time device setup.
+This starts the API, Console, nginx, IDE tunnel and Workspace Manager. Startup verifies local HTTPS. A private LAN bind and trust of the local CA require one-time device setup.
 
 See [docs/MOBILE_WORKSPACE_MVP.md](docs/MOBILE_WORKSPACE_MVP.md) for full documentation, setup, testing, and troubleshooting.
 

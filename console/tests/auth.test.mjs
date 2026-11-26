@@ -41,8 +41,7 @@ test('production Console enforces sessions, CSRF, IDE origins and login limits',
   const reserved = createServer();
   const port = await listen(reserved);
   await new Promise(resolve => reserved.close(resolve));
-  // Advance the isolated server's clock without waiting eight hours or adding
-  // a production-only configuration knob for session expiry tests.
+  // Verify the timestamp check independently of the automatic expiry timer.
   const clock = `const now = Date.now; process.on('message', offset => {
     Date.now = () => now() + offset;
     process.send('clock advanced');
@@ -55,6 +54,7 @@ test('production Console enforces sessions, CSRF, IDE origins and login limits',
       KAMUI_ADMIN_PASSWORD: password,
       KAMUI_TOKEN: token,
       KAMUI_API_URL: `http://127.0.0.1:${apiPort}`,
+      KAMUI_SESSION_TTL_SECONDS: '5',
       NEXT_TELEMETRY_DISABLED: '1',
     },
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
@@ -66,7 +66,7 @@ test('production Console enforces sessions, CSRF, IDE origins and login limits',
 
   const address = `127.0.0.1:${port}`;
   const origin = `https://${address}`;
-  const request = (path, { method = 'GET', body, ...headers } = {}) =>
+  const request = (path, { method = 'GET', body, timeout = 1500, ...headers } = {}) =>
     fetch(`http://${address}${path}`, {
       method,
       headers: {
@@ -75,7 +75,7 @@ test('production Console enforces sessions, CSRF, IDE origins and login limits',
         ...headers,
       },
       body: body === undefined ? undefined : JSON.stringify(body),
-      signal: AbortSignal.timeout(1500),
+      signal: AbortSignal.timeout(timeout),
     });
 
   let healthy = false;
@@ -117,6 +117,17 @@ test('production Console enforces sessions, CSRF, IDE origins and login limits',
   assert.equal((await request('/api/auth/ide', { Cookie, 'X-Kamui-Upgrade': 'websocket' })).status, 403);
   assert.equal((await request('/api/auth/ide', { Cookie, Origin: 'https://other.invalid', 'X-Kamui-Upgrade': 'websocket' })).status, 403);
   assert.equal((await request('/api/auth/ide', { Cookie, Origin: origin, 'X-Kamui-Upgrade': 'websocket' })).status, 204);
+  assert.equal((await request('/api/auth/ide?watch=1', { Cookie, Origin: origin })).status, 403);
+  const watch = async Cookie => {
+    const lease = await request('/api/auth/ide?watch=1', {
+      Cookie, Origin: origin, 'X-Kamui-Upgrade': 'websocket', timeout: 8000,
+    });
+    assert.equal(lease.status, 200);
+    const reader = lease.body.getReader();
+    const first = await reader.read();
+    assert.equal(new TextDecoder().decode(first.value), '1');
+    return reader;
+  };
   assert.equal((await request('/api/workspaces', { ...validMutation, 'X-CSRF-Token': 'bad', body: {} })).status, 403);
   assert.equal((await request('/api/workspaces', { Cookie: Cookie + '; kamui_csrf=' + csrfToken, method: 'POST', Origin: origin, body: {} })).status, 403);
   assert.equal((await request('/api/workspaces', { ...validMutation, Origin: 'https://other.invalid', body: {} })).status, 403);
@@ -131,18 +142,25 @@ test('production Console enforces sessions, CSRF, IDE origins and login limits',
   assert.equal((await error.json()).error.message, 'Fixture conflict');
 
   assert.equal((await request('/api/auth/logout', { Cookie, Origin: origin, method: 'POST' })).status, 403);
+  const [firstLease, secondLease] = await Promise.all([watch(Cookie), watch(Cookie)]);
   assert.equal((await request('/api/auth/logout', validMutation)).status, 200);
+  assert.equal((await firstLease.read()).done, true);
+  assert.equal((await secondLease.read()).done, true);
   assert.equal((await request('/api/auth/me', { Cookie })).status, 401);
   assert.equal((await request('/api/auth/ide', { Cookie })).status, 401);
   const expiring = await login(password);
   assert.equal(expiring.status, 200);
   const expiringCookie = expiring.headers.get('set-cookie').split(';', 1)[0];
   assert.equal((await request('/api/auth/me', { Cookie: expiringCookie })).status, 200);
+  const expiringLease = await watch(expiringCookie);
+  assert.equal((await expiringLease.read()).done, true);
+  const clockSession = await login(password);
+  const clockCookie = clockSession.headers.get('set-cookie').split(';', 1)[0];
   const advanced = once(child, 'message');
   child.send(9 * 60 * 60 * 1000);
   assert.equal((await advanced)[0], 'clock advanced');
-  assert.equal((await request('/api/auth/me', { Cookie: expiringCookie })).status, 401);
-  assert.equal((await request('/api/auth/ide', { Cookie: expiringCookie })).status, 401);
+  assert.equal((await request('/api/auth/me', { Cookie: clockCookie })).status, 401);
+  assert.equal((await request('/api/auth/ide', { Cookie: clockCookie })).status, 401);
 
   for (let attempt = 0; attempt < 8; attempt++) {
     assert.equal((await login('invalid')).status, 401);

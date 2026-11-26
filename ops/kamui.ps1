@@ -1,8 +1,9 @@
 # Shared by the entry points. Compatible with Windows PowerShell 5.1.
 $ErrorActionPreference = 'Stop'
 $script:EnvPath = Join-Path $PSScriptRoot '.env'
-$script:KamuiServices = @('api', 'console', 'workspace-manager', 'workspace-proxy')
+$script:KamuiServices = @('api', 'console', 'workspace-manager', 'ide-tunnel', 'workspace-proxy')
 $script:Compose = @('compose', '--env-file', $script:EnvPath, '-f', (Join-Path $PSScriptRoot 'docker-compose.yml'))
+$script:KamuiCurl = $null
 
 function Invoke-KamuiDocker {
     & docker @args
@@ -160,18 +161,42 @@ function Assert-KamuiPort {
     finally { $listener.Stop() }
 }
 
+function Get-KamuiCurl {
+    if ($script:KamuiCurl) { return $script:KamuiCurl }
+    $curl = Get-Command curl.exe -CommandType Application -ErrorAction SilentlyContinue
+    if (-not $curl -and $env:OS -ne 'Windows_NT') {
+        $curl = Get-Command curl -CommandType Application -ErrorAction SilentlyContinue
+    }
+    if (-not $curl) { throw 'curl.exe is needed to verify HTTPS with the local CA.' }
+    $binary = $curl[0].Source
+    $version = @(& $binary --disable --version)
+    if ($LASTEXITCODE -ne 0 -or $version.Count -eq 0) { throw 'curl could not report its version.' }
+
+    $tls = @()
+    if ($version[0] -match '\bSchannel\b') {
+        if ($version[0] -notmatch '^curl (\d+\.\d+\.\d+)' -or [version]$Matches[1] -lt [version]'7.70.0') {
+            throw 'Use curl.exe 7.70.0 or newer with Schannel to verify Kamui HTTPS.'
+        }
+        # The private CA has no online revocation endpoint. Keep local chain
+        # and host verification, tolerating unavailable revocation data.
+        $tls += '--ssl-revoke-best-effort'
+    }
+    $script:KamuiCurl = @{ Binary = $binary; Tls = $tls }
+    return $script:KamuiCurl
+}
+
 function Invoke-KamuiProbe {
     param($Config, [string]$Path, [string]$Expected, [string[]]$Headers = @())
 
-    $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
-    if (-not $curl -and $env:OS -ne 'Windows_NT') { $curl = Get-Command curl -ErrorAction SilentlyContinue }
-    if (-not $curl) { throw 'curl.exe is needed to verify HTTPS with the local CA.' }
+    $curl = Get-KamuiCurl
     if (-not (Test-Path -LiteralPath $Config.CA)) { throw "TLS CA missing at $($Config.CA)." }
 
-    $curlArgs = @('--silent', '--show-error', '--max-time', '10', '--http1.1', '--cacert', $Config.CA,
+    # Use the supplied CA on a direct connection regardless of workstation curl settings.
+    $curlArgs = @('--disable', '--noproxy', $Config.BindIP, '--silent', '--show-error', '--max-time', '10', '--http1.1', '--cacert', $Config.CA,
         '--output', $(if ($env:OS -eq 'Windows_NT') { 'NUL' } else { '/dev/null' }), '--write-out', '%{http_code}')
+    $curlArgs += $curl.Tls
     foreach ($header in $Headers) { $curlArgs += @('--header', $header) }
-    $actual = & $curl.Source @curlArgs "$($Config.Url)$Path"
+    $actual = & $curl.Binary @curlArgs "$($Config.Url)$Path"
     if ($LASTEXITCODE -ne 0 -or $actual -ne $Expected) {
         throw "HTTPS probe for $Path expected $Expected and received $actual at $($Config.Url)."
     }

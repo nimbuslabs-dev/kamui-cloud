@@ -1,0 +1,12 @@
+FROM golang:1.26.11-alpine AS builder
+ENV GOTOOLCHAIN=local
+WORKDIR /src
+COPY go.mod go.sum ./
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -o /out/ide-tunnel ./cmd/ide-tunnel
+
+FROM alpine:3.24
+COPY --from=builder /out/ide-tunnel /usr/local/bin/kamui-ide-tunnel
+USER 65532:65532
+EXPOSE 8083
+ENTRYPOINT ["kamui-ide-tunnel"]

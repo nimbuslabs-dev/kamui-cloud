@@ -9,13 +9,14 @@ param(
 try {
     if ($CleanBuild -and $SkipBuild) { throw 'Choose either CleanBuild or SkipBuild.' }
     Assert-KamuiDocker
+    Get-KamuiCurl | Out-Null
     Initialize-KamuiEnvironment
     $config = Get-KamuiConfig
     Assert-KamuiPort $config
     if (-not $SkipBuild) {
         $build = @('build')
         if ($CleanBuild) { $build += @('--no-cache', '--pull') }
-        Invoke-KamuiCompose @build workspace-image api workspace-manager console workspace-proxy
+        Invoke-KamuiCompose @build workspace-image @script:KamuiServices
     }
     Invoke-KamuiCompose run --rm --no-deps tls-init
     Invoke-KamuiCompose up -d --no-build --wait --wait-timeout $HealthTimeoutSeconds

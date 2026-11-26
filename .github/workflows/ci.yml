@@ -123,6 +123,49 @@ jobs:
           npm run type-check
           npm run test:auth
 
+  windows-powershell:
+    name: Windows PowerShell 5.1 bootstrap
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse scripts and test credential onboarding
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($PSVersionTable.PSEdition -ne 'Desktop' -or $PSVersionTable.PSVersion.ToString() -notmatch '^5\.1') {
+            throw 'Windows PowerShell 5.1 is required for this check.'
+          }
+          $paths = @('start-kamui.ps1', 'status-kamui.ps1', 'stop-kamui.ps1', 'test-kamui.ps1', 'ops/kamui.ps1')
+          foreach ($path in $paths) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $path).Path, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors) { throw "PowerShell could not parse $path" }
+          }
+          . ./ops/kamui.ps1
+          $script:EnvPath = Join-Path $env:RUNNER_TEMP 'kamui bootstrap .env'
+          try {
+            Initialize-KamuiEnvironment
+            $first = [IO.File]::ReadAllText($script:EnvPath)
+            Initialize-KamuiEnvironment
+            if ($first -cne [IO.File]::ReadAllText($script:EnvPath)) { throw 'Saved credentials changed' }
+            [IO.File]::WriteAllText($script:EnvPath, "KAMUI_PORT=12345`nKAMUI_TOKEN=`n")
+            Initialize-KamuiEnvironment
+            $updated = [IO.File]::ReadAllText($script:EnvPath)
+            if ($updated -notmatch 'KAMUI_PORT=12345' -or $updated -notmatch 'KAMUI_TOKEN=[a-f0-9]{64}' -or
+                $updated -notmatch 'KAMUI_ADMIN_PASSWORD=[a-f0-9]{64}') { throw 'Could not preserve config and add credentials' }
+          } finally {
+            [IO.File]::Delete($script:EnvPath)
+          }
+      - name: Verify shell script line endings in a Windows-style checkout
+        shell: powershell
+        run: |
+          $checkout = Join-Path $env:RUNNER_TEMP 'Kamui CRLF checkout'
+          git -c core.autocrlf=true clone --no-local . $checkout
+          if ($LASTEXITCODE -ne 0) { throw 'Could not clone the workspace for the portability check' }
+          $script = Join-Path $checkout 'ops/nginx/generate-cert.sh'
+          if ([IO.File]::ReadAllText($script).Contains("`r")) { throw 'Linux certificate script contains CRLF' }
+
   mobile-workspace:
     name: Docker and Mobile Workspace
     runs-on: ubuntu-latest
@@ -132,6 +175,8 @@ jobs:
       KAMUI_QA_PROJECT: kamui-ci-qa
     steps:
       - uses: actions/checkout@v4
+      - name: Verify Linux AMD64 runner
+        run: test "$(docker info --format '{{.OSType}}/{{.Architecture}}')" = "linux/x86_64"
       - name: Validate Dockerfiles and build toolchain
         shell: bash
         run: |
@@ -140,7 +185,7 @@ jobs:
           test -f ops/Dockerfile.workspace
           test -f ops/nginx/Dockerfile
           version="$(awk '$1 == "go" {print $2}' api/go.mod)"
-          for file in api/Dockerfile api/Dockerfile.workspace-manager; do
+          for file in api/Dockerfile api/Dockerfile.workspace-manager api/Dockerfile.ide-tunnel; do
             grep -Fx "FROM golang:$version-alpine AS builder" "$file"
             grep -Fx "ENV GOTOOLCHAIN=local" "$file"
           done
@@ -152,7 +197,7 @@ jobs:
           echo "KAMUI_ADMIN_PASSWORD=$(openssl rand -hex 32)" >> ops/.env
           docker compose --env-file ops/.env -f ops/docker-compose.yml --profile tools config --quiet
       - name: Build with a clean cache
-        run: docker compose --env-file ops/.env -f ops/docker-compose.yml build --pull --no-cache api console workspace-manager workspace-proxy workspace-image
+        run: docker compose --env-file ops/.env -f ops/docker-compose.yml build --pull --no-cache api console workspace-manager ide-tunnel workspace-proxy workspace-image
       - name: Start and validate nginx
         run: |
           docker compose --env-file ops/.env -f ops/docker-compose.yml run --rm --no-deps tls-init

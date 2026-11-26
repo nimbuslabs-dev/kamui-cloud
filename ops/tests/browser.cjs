@@ -38,6 +38,8 @@ async function openIDE(context, dashboard) {
   await devtools.send('Network.enable');
   const sockets = new Set();
   const upgrades = [];
+  const closed = new Set();
+  devtools.on('Network.webSocketClosed', event => closed.add(event.requestId));
   devtools.on('Network.webSocketCreated', event => {
     if (new URL(event.url).pathname.startsWith(path)) sockets.add(event.requestId);
   });
@@ -50,7 +52,7 @@ async function openIDE(context, dashboard) {
   await waitUntil(() => upgrades.length > 0, 'No code-server WebSocket handshake returned 101');
   const trust = page.getByRole('button', { name: /Yes, I trust the authors/ });
   if (await trust.isVisible()) await trust.click();
-  return { page, upgrades };
+  return { page, path, upgrades, closed };
 }
 
 async function waitUntil(check, failure, waitMs = 15_000) {
@@ -60,6 +62,14 @@ async function waitUntil(check, failure, waitMs = 15_000) {
     await new Promise(resolve => setTimeout(resolve, 100));
   }
   throw new Error(failure);
+}
+
+async function assertRevoked(context, base, connection, live, reason, waitMs) {
+  assert.ok(live.length > 0, 'Expected at least one live authenticated WebSocket');
+  await waitUntil(() => live.every(id => connection.closed.has(id)),
+    'Established code-server WebSocket survived ' + reason, waitMs);
+  const after = await context.request.get(new URL(connection.path, base).href);
+  assert.equal(after.status(), 401, 'The revoked session could still access the IDE');
 }
 
 async function terminal(page, cmd) {
@@ -115,6 +125,14 @@ async function main() {
   try {
     const desktop = await browser.newContext({ viewport: { width: 1366, height: 768 }, ignoreHTTPSErrors: true });
     const { dashboard, elapsedMs: desktopLoginMs } = await login(desktop, base);
+    if (process.env.KAMUI_TEST_EXPIRY_ONLY === '1') {
+      assert.ok(process.env.KAMUI_TEST_WORKSPACE_NAME, 'Start one disposable workspace before testing expiry');
+      const connection = await openIDE(desktop, dashboard);
+      const live = connection.upgrades.filter(id => !connection.closed.has(id));
+      await assertRevoked(desktop, base, connection, live, 'session expiration', 45_000);
+      console.log(JSON.stringify({ sessionExpiryRevoked: live.length }));
+      return;
+    }
     if (!process.env.KAMUI_TEST_WORKSPACE_NAME) {
       await dashboard.getByRole('button', { name: /Create Workspace|New Workspace/ }).first().click();
       await dashboard.getByLabel('Workspace Name').fill(workspaceName);
@@ -181,12 +199,16 @@ async function main() {
     });
     const { dashboard: phone, elapsedMs: mobileLoginMs } = await login(mobile, base);
     assert.equal(await phone.evaluate(() => document.documentElement.scrollWidth > window.innerWidth), false);
-    const { page: reopened, upgrades: mobileUpgrades } = await openIDE(mobile, phone);
+    const mobileConnection = await openIDE(mobile, phone);
+    const { page: reopened, upgrades: mobileUpgrades } = mobileConnection;
     activePage = reopened;
     reopened.on('pageerror', error => pageErrors.push(error.message));
     reopened.setDefaultTimeout(timeout);
     await openFile(reopened, filename);
     await reopened.locator('.view-lines').getByText(value, { exact: true }).first().waitFor();
+    const live = mobileUpgrades.filter(id => !mobileConnection.closed.has(id));
+    await phone.getByRole('button', { name: 'Sign out' }).click();
+    await assertRevoked(mobile, base, mobileConnection, live, 'logout', 5000);
     if (!process.env.KAMUI_TEST_WORKSPACE_NAME || process.env.KAMUI_TEST_REMOVE_WORKSPACE === '1') {
       dashboard.once('dialog', dialog => dialog.accept());
       await card.getByRole('button', { name: 'Remove workspace' }).click();
@@ -196,7 +218,7 @@ async function main() {
     console.log(JSON.stringify({
       desktopLoginMs, mobileLoginMs, workspaceReadyMs, desktopWebSocket101: desktopUpgrades,
       mobileWebSocket101: mobileUpgrades.length, fileExplorer: 'PASS', editorSave: 'PASS',
-      terminalOutput: 'PASS', persistedAfterRestart: 'PASS', workspaceName,
+      terminalOutput: 'PASS', persistedAfterRestart: 'PASS', logoutRevoked: live.length, workspaceName,
     }));
   } catch (error) {
     if (activePage && !activePage.isClosed() && process.env.KAMUI_TEST_SCREENSHOT_DIR) {

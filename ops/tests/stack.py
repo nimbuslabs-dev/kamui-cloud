@@ -86,6 +86,7 @@ def main():
     public = BrowserSession()
     public.request("/healthz", {200})
     public.request("/api/workspaces", {401})
+    public.request("/api/auth/ide?watch=1", {404})
     public.request("/api/auth/login", {401}, "POST", {"password": "wrong-password"})
     test_path = "/workspace/ws-00000000/"
     public.request(test_path, {401})
@@ -126,7 +127,7 @@ def main():
                    for env in inspected["Config"]["Env"])
     assert set(inspected["NetworkSettings"]["Networks"]) == {project + "-ide"}
     assert len(inspected["Mounts"]) == 1 and inspected["Mounts"][0]["Type"] == "volume"
-    for service in ("api", "workspace-manager", "console"):
+    for service in ("api", "workspace-manager", "console", "ide-tunnel"):
         assert not json.loads(command("docker", "inspect", compose("ps", "-q", service)))[0]["HostConfig"]["PortBindings"]
     public.request(ide, {200, 302})
     BrowserSession().request(ide, {401})
@@ -191,7 +192,7 @@ def main():
     assert run("git", "rev-parse", "HEAD") == sha
     public.request(path + "/restart", {200}, "POST")
     assert run("git", "rev-parse", "HEAD") == sha
-    compose("restart", "api", "workspace-manager", "console", "workspace-proxy")
+    compose("restart", "api", "workspace-manager", "console", "ide-tunnel", "workspace-proxy")
     compose("up", "-d", "--no-build", "--wait", "--wait-timeout", "90")
     public.request(path, {401})
     public.login()

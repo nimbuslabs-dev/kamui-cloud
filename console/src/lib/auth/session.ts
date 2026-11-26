@@ -9,6 +9,8 @@ const failureWindowMs = 60_000;
 interface Session {
   csrfToken: string;
   expiresAt: number;
+  revoked: AbortController;
+  timer: ReturnType<typeof setTimeout>;
 }
 
 // Next.js can bundle route handlers separately. Share the revocable sessions
@@ -92,11 +94,11 @@ export function sessionFromRequest(request: NextRequest): Session | null {
   if (request.headers.get('x-forwarded-proto') !== 'https' ||
       !id || !/^[a-f0-9]{64}$/.test(id) || !authConfiguration()) return null;
   const session = state.sessions.get(id);
-  if (!session || session.expiresAt <= Date.now()) {
-    state.sessions.delete(id);
+  if (session && session.expiresAt <= Date.now()) {
+    invalidateSession(id);
     return null;
   }
-  return session;
+  return session ?? null;
 }
 
 function setSessionCookie(response: NextResponse, value: string, maxAge: number) {
@@ -112,25 +114,39 @@ function setSessionCookie(response: NextResponse, value: string, maxAge: number)
 export function signIn(request: NextRequest) {
   const now = Date.now();
   for (const [id, session] of state.sessions) {
-    if (session.expiresAt <= now) state.sessions.delete(id);
+    if (session.expiresAt <= now) invalidateSession(id);
   }
   revokeSession(request);
   if (state.sessions.size >= 32) {
     const oldest = state.sessions.keys().next().value;
-    if (oldest) state.sessions.delete(oldest);
+    if (oldest) invalidateSession(oldest);
   }
   const id = randomBytes(32).toString('hex');
   const csrfToken = randomBytes(32).toString('hex');
-  state.sessions.set(id, { csrfToken, expiresAt: now + lifetimeSeconds * 1000 });
+  const configuredLifetime = Number(process.env.KAMUI_SESSION_TTL_SECONDS);
+  const maxAge = Number.isInteger(configuredLifetime) && configuredLifetime >= 1 && configuredLifetime <= lifetimeSeconds
+    ? configuredLifetime : lifetimeSeconds;
+  state.sessions.set(id, {
+    csrfToken, expiresAt: now + maxAge * 1000, revoked: new AbortController(),
+    timer: setTimeout(() => invalidateSession(id), maxAge * 1000),
+  });
   state.loginLimit.failures = 0;
   const response = sessionResponse({ success: true, csrfToken });
-  setSessionCookie(response, id, lifetimeSeconds);
+  setSessionCookie(response, id, maxAge);
   return response;
 }
 
 function revokeSession(request: NextRequest) {
   const id = request.cookies.get(cookieName)?.value;
-  if (id) state.sessions.delete(id);
+  if (id) invalidateSession(id);
+}
+
+function invalidateSession(id: string) {
+  const session = state.sessions.get(id);
+  if (!session) return;
+  state.sessions.delete(id);
+  clearTimeout(session.timer);
+  session.revoked.abort();
 }
 
 export function signOut(request: NextRequest) {
