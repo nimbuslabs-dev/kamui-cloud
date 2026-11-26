@@ -16,8 +16,13 @@ func TestLoad(t *testing.T) {
 			wantError: true,
 		},
 		{
+			name:      "short token fails",
+			token:     "dev",
+			wantError: true,
+		},
+		{
 			name:      "valid token succeeds",
-			token:     "secret-token",
+			token:     "297715721c3fbdf2b61c4ce69dc055a6",
 			wantError: false,
 		},
 	}

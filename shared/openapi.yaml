@@ -273,33 +273,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
-    patch:
-      tags: [workspaces]
-      operationId: updateWorkspace
-      summary: Update workspace status (used by workspace manager)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/WorkspaceUpdate"
-      responses:
-        "200":
-          description: Workspace updated
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Workspace"
-        "400":
-          $ref: "#/components/responses/BadRequest"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "404":
-          $ref: "#/components/responses/NotFound"
     delete:
       tags: [workspaces]
       operationId: deleteWorkspace
-      summary: Delete a workspace
+      summary: Delete workspace metadata and container, retaining the project volume
       responses:
         "204":
           description: Workspace deleted
@@ -341,6 +318,57 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Workspace"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /v1/workspaces/{id}/restart:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      tags: [workspaces]
+      operationId: restartWorkspace
+      summary: Stop and start the workspace container
+      responses:
+        "200":
+          description: Current workspace state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Workspace"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "502":
+          description: Workspace manager unavailable
+  /v1/workspaces/{id}/git/branch:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      tags: [workspaces]
+      operationId: switchGitBranch
+      summary: Create or switch to a branch in the workspace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [branch]
+              properties:
+                branch:
+                  type: string
+                  maxLength: 200
+      responses:
+        "204":
+          description: Branch selected
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -415,6 +443,8 @@ paths:
                 properties:
                   hash:
                     type: string
+                    description: Full Git commit object ID.
+                    pattern: "^([0-9a-f]{40}|[0-9a-f]{64})$"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -429,7 +459,7 @@ paths:
     post:
       tags: [workspaces]
       operationId: gitPush
-      summary: Push commits to remote
+      summary: Push commits to origin using Git credentials configured inside the workspace
       requestBody:
         required: false
         content:
@@ -453,7 +483,7 @@ paths:
     post:
       tags: [workspaces]
       operationId: gitPull
-      summary: Pull changes from remote
+      summary: Pull changes from origin using a fast-forward update
       requestBody:
         required: false
         content:
@@ -627,6 +657,7 @@ components:
       required: true
       schema:
         type: string
+        pattern: "^ws-[0-9a-f]{8,32}$"
     Bucket:
       name: bucket
       in: path
@@ -852,13 +883,16 @@ components:
         name:
           type: string
           minLength: 1
-          maxLength: 64
+          maxLength: 100
+          description: At most 100 bytes.
         repository_url:
           type: string
           format: uri
+          description: Public GitHub HTTPS repository URL without embedded credentials.
         branch:
           type: string
-          default: main
+          maxLength: 200
+          description: Leave empty to clone the repository's default branch.
       example:
         name: my-project
         repository_url: https://github.com/user/repo.git
@@ -875,9 +909,11 @@ components:
           type: string
         branch:
           type: string
+          description: Initial checkout branch. Empty selects the repository default; Git status shows the current branch.
         status:
           type: string
-          enum: [creating, running, stopped, error]
+          enum: [creating, starting, running, stopping, stopped, error, unavailable]
+          description: State observed from the workspace manager; unavailable indicates status could not be verified.
         created_at:
           type: string
           format: date-time
@@ -889,10 +925,9 @@ components:
           format: date-time
         container_id:
           type: string
-        code_server_port:
-          type: integer
         code_server_url:
           type: string
+          description: Authenticated relative IDE URL, present only while running.
       example:
         id: ws-7f3a9b2c
         name: my-project
@@ -903,8 +938,7 @@ components:
         updated_at: "2026-01-15T10:05:00Z"
         last_active_at: "2026-01-15T10:05:00Z"
         container_id: abc123def456
-        code_server_port: 8081
-        code_server_url: /workspace/ws-7f3a9b2c
+        code_server_url: /workspace/ws-7f3a9b2c/
     GitStatus:
       type: object
       required: [branch, ahead, behind, staged, unstaged, untracked]
@@ -953,6 +987,8 @@ components:
         message:
           type: string
           minLength: 1
+          maxLength: 4096
+          description: At most 4096 bytes.
       example:
         message: "Add new feature"
     GitPushPullRequest:
@@ -960,30 +996,10 @@ components:
       properties:
         remote:
           type: string
+          enum: ["", origin]
           default: origin
         branch:
           type: string
       example:
         remote: origin
         branch: main
-    WorkspaceUpdate:
-      type: object
-      properties:
-        status:
-          type: string
-          enum: [creating, running, stopped, error]
-        code_server_port:
-          type: integer
-        code_server_url:
-          type: string
-        container_id:
-          type: string
-        last_active_at:
-          type: string
-          format: date-time
-      example:
-        status: running
-        code_server_port: 8081
-        code_server_url: /workspace/ws-7f3a9b2c
-        container_id: abc123def456
-        last_active_at: "2026-01-15T10:05:00Z"

@@ -1,26 +1,12 @@
-# Workspace Manager - manages code-server containers
-FROM golang:1.22-alpine AS builder
-
-# Note: Go version matches api/go.mod (go 1.22)
-# Update both together if upgrading Go version
-
-WORKDIR /app
-RUN apk add --no-cache git
-
+FROM golang:1.26.11-alpine AS builder
+ENV GOTOOLCHAIN=local
+WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
-
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o workspace-manager ./cmd/workspace-manager
+RUN CGO_ENABLED=0 go build -trimpath -o /out/workspace-manager ./cmd/workspace-manager
 
-FROM alpine:3.20
-RUN apk add --no-cache docker-cli git
-
-WORKDIR /app
-COPY --from=builder /app/workspace-manager .
-
-# Create non-root user
-RUN adduser -D -u 1000 coder
-USER coder
-
-ENTRYPOINT ["./workspace-manager"]
+FROM alpine:3.24
+COPY --from=builder /out/workspace-manager /usr/local/bin/kamui-workspace-manager
+EXPOSE 8082
+ENTRYPOINT ["kamui-workspace-manager"]

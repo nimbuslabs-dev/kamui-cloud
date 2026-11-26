@@ -10,7 +10,7 @@ import (
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/scheduler"
 )
 
-func NewRouter(cfg *config.Config, reg *registry.Registry, queue *scheduler.Queue) http.Handler {
+func NewRouter(cfg *config.Config, reg *registry.Registry, queue *scheduler.Queue) (http.Handler, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", HandleHealthz)
 
@@ -27,13 +27,17 @@ func NewRouter(cfg *config.Config, reg *registry.Registry, queue *scheduler.Queu
 	mux.HandleFunc("GET /v1/jobs/{id}", jobHandler.Get)
 	mux.HandleFunc("POST /v1/jobs/{id}/finish", jobHandler.Finish)
 
-	workspaceHandler := NewWorkspaceHandler(reg, cfg.WorkspaceManagerURL, cfg.Token)
+	workspaceHandler, err := newWorkspaceHandler(cfg.WorkspaceDataFile, cfg.WorkspaceManagerURL, cfg.Token)
+	if err != nil {
+		return nil, err
+	}
 	mux.HandleFunc("POST /v1/workspaces", workspaceHandler.Create)
 	mux.HandleFunc("GET /v1/workspaces", workspaceHandler.List)
 	mux.HandleFunc("GET /v1/workspaces/{id}", workspaceHandler.Get)
-	mux.HandleFunc("PATCH /v1/workspaces/{id}", workspaceHandler.Update)
 	mux.HandleFunc("POST /v1/workspaces/{id}/start", workspaceHandler.Start)
 	mux.HandleFunc("POST /v1/workspaces/{id}/stop", workspaceHandler.Stop)
+	mux.HandleFunc("POST /v1/workspaces/{id}/restart", workspaceHandler.Restart)
+	mux.HandleFunc("POST /v1/workspaces/{id}/git/branch", workspaceHandler.GitBranch)
 	mux.HandleFunc("DELETE /v1/workspaces/{id}", workspaceHandler.Delete)
 	mux.HandleFunc("GET /v1/workspaces/{id}/git/status", workspaceHandler.GitStatus)
 	mux.HandleFunc("POST /v1/workspaces/{id}/git/add", workspaceHandler.GitAdd)
@@ -53,5 +57,5 @@ func NewRouter(cfg *config.Config, reg *registry.Registry, queue *scheduler.Queu
 			return
 		}
 		authenticated.ServeHTTP(w, r)
-	})
+	}), nil
 }

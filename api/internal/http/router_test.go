@@ -22,7 +22,10 @@ func TestRouterBaseEndpoints(t *testing.T) {
 	}
 	reg := registry.NewRegistry()
 	queue := scheduler.NewQueue(nil)
-	router := NewRouter(cfg, reg, queue)
+	router, err := NewRouter(cfg, reg, queue)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	tests := []struct {
 		name         string
@@ -149,7 +152,10 @@ func TestNodeEndpointsUnauthorized(t *testing.T) {
 	cfg := &config.Config{Token: "test-token", Port: "8080"}
 	reg := registry.NewRegistry()
 	queue := scheduler.NewQueue(nil)
-	router := NewRouter(cfg, reg, queue)
+	router, err := NewRouter(cfg, reg, queue)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	endpoints := []struct {
 		name   string
@@ -188,7 +194,10 @@ func TestJobEndpointsUnauthorized(t *testing.T) {
 	cfg := &config.Config{Token: "test-token", Port: "8080"}
 	reg := registry.NewRegistry()
 	queue := scheduler.NewQueue(nil)
-	router := NewRouter(cfg, reg, queue)
+	router, err := NewRouter(cfg, reg, queue)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	endpoints := []struct {
 		name   string
@@ -231,7 +240,10 @@ func TestNodeLifecycleAndValidation(t *testing.T) {
 	reg.Now = func() time.Time { return currentTime }
 
 	queue := scheduler.NewQueue(nil)
-	router := NewRouter(cfg, reg, queue)
+	router, err := NewRouter(cfg, reg, queue)
+	if err != nil {
+		t.Fatal(err)
+	}
 	authHeader := "Bearer valid-token"
 
 	t.Run("empty list returns []", func(t *testing.T) {
@@ -503,7 +515,10 @@ func TestJobLifecycleAndValidation(t *testing.T) {
 	reg := registry.NewRegistry()
 	currentTime := time.Date(2026, 3, 1, 10, 0, 0, 0, time.UTC)
 	queue := scheduler.NewQueue(func() time.Time { return currentTime })
-	router := NewRouter(cfg, reg, queue)
+	router, err := NewRouter(cfg, reg, queue)
+	if err != nil {
+		t.Fatal(err)
+	}
 	authHeader := "Bearer valid-token"
 
 	nodeID := reg.Register(registry.NodeInfo{

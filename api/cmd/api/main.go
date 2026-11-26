@@ -26,14 +26,18 @@ func main() {
 
 	reg := registry.NewRegistry()
 	queue := scheduler.NewQueue(time.Now)
-	router := httpapi.NewRouter(cfg, reg, queue)
+	router, err := httpapi.NewRouter(cfg, reg, queue)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "initialize API: %v\n", err)
+		os.Exit(1)
+	}
 
 	srv := &http.Server{
 		Addr:              net.JoinHostPort("", cfg.Port),
 		Handler:           router,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Second,
+		WriteTimeout:      160 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 
