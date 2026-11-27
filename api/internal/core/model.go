@@ -221,18 +221,55 @@ type Policy struct {
 	MaxRetries     int `json:"max_retries"`
 }
 
+// VolumeRequest declares a persistent named volume owned by the project.
+// Stateful workloads pin to the worker that already holds the volume.
+type VolumeRequest struct {
+	Name      string `json:"name"`
+	SizeBytes int64  `json:"size_bytes,omitempty"`
+}
+
+// ArtifactMount attaches a project artifact read-only at an in-container path.
+type ArtifactMount struct {
+	ArtifactID string `json:"artifact_id"`
+	Path       string `json:"path"`
+}
+
+// HealthCheck configures the worker-side readiness probe for services.
+type HealthCheck struct {
+	Kind            string `json:"kind"` // "http" or "tcp"
+	Port            int    `json:"port"`
+	Path            string `json:"path,omitempty"`
+	IntervalSeconds int    `json:"interval_seconds,omitempty"`
+}
+
+// Submission is the unified workload contract shared by every service layer.
 type Submission struct {
-	Service          string    `json:"service"`
-	Kind             string    `json:"kind"`
-	Image            string    `json:"image"`
-	Args             []string  `json:"args,omitempty"`
-	Resources        Resources `json:"resources"`
-	Policy           Policy    `json:"policy"`
-	WorkerID         string    `json:"worker_id,omitempty"`
-	Placement        string    `json:"placement,omitempty"`
-	PreferredWorkers []string  `json:"preferred_workers,omitempty"`
-	Fallback         *bool     `json:"fallback,omitempty"`
-	Priority         int       `json:"priority,omitempty"`
+	Service          string            `json:"service"`
+	Kind             string            `json:"kind"`
+	Image            string            `json:"image"`
+	ImageDigest      string            `json:"image_digest,omitempty"`
+	Args             []string          `json:"args,omitempty"`
+	Env              map[string]string `json:"env,omitempty"`
+	Resources        Resources         `json:"resources"`
+	Policy           Policy            `json:"policy"`
+	WorkerID         string            `json:"worker_id,omitempty"`
+	Placement        string            `json:"placement,omitempty"`
+	PreferredWorkers []string          `json:"preferred_workers,omitempty"`
+	Fallback         *bool             `json:"fallback,omitempty"`
+	Priority         int               `json:"priority,omitempty"`
+
+	// Network selects the execution profile: "" or "none" keeps the default
+	// fully isolated batch profile; "private" joins the project-scoped network.
+	Network string `json:"network,omitempty"`
+
+	// Volumes are persistent project-owned volumes; artifacts are read-only
+	// inputs; Outputs lists in-container paths collected after completion.
+	Volumes   []VolumeRequest `json:"volumes,omitempty"`
+	Artifacts []ArtifactMount `json:"artifacts,omitempty"`
+	Outputs   []string        `json:"outputs,omitempty"`
+
+	// HealthCheck enables worker-side readiness probing for services.
+	HealthCheck *HealthCheck `json:"health_check,omitempty"`
 
 	// Scheduling scope is set by the coordinator, never by clients, and is
 	// excluded from idempotency fingerprints because it is part of the request
@@ -271,7 +308,7 @@ const (
 	Stopped   State = "STOPPED"
 )
 
-func (s State) terminal() bool {
+func (s State) Terminal() bool {
 	return s == Succeeded || s == Failed || s == Cancelled || s == Stopped
 }
 
@@ -411,6 +448,9 @@ func (s *Submission) Normalize() error {
 	if s.Priority < 1 || s.Priority > 100 {
 		return errors.New("priority must be between 1 and 100")
 	}
+	if err := s.normalizeRuntime(); err != nil {
+		return err
+	}
 	if s.Image == "" || len(s.Image) > 255 || strings.TrimSpace(s.Image) != s.Image ||
 		strings.ContainsAny(s.Image, " \r\n\t\x00") {
 		return errors.New("a valid local Docker image reference is required")
@@ -458,4 +498,146 @@ func (s *Submission) Normalize() error {
 		return fmt.Errorf("timeout must be 1–86400 seconds and retries 0–3")
 	}
 	return nil
+}
+
+var (
+	volumeNameRe = regexp.MustCompile(`^[a-z][a-z0-9-]{1,62}$`)
+	digestRe     = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	envKeyRe     = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.]{0,127}$`)
+	imageHostRe  = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9.-]*(:[0-9]+)?$`)
+)
+
+// Stateful reports whether the workload owns persistent volumes. Stateful
+// workloads pin to the worker that already holds their volumes.
+func (s *Submission) Stateful() bool { return len(s.Volumes) > 0 }
+
+// NetworkIsolated reports whether the workload uses the default isolated
+// profile. Batch workloads always stay isolated.
+func (s *Submission) NetworkIsolated() bool { return s.Network == "" || s.Network == "none" }
+
+// SecretRefs lists environment entries that reference project secrets.
+func (s *Submission) SecretRefs() []string {
+	var refs []string
+	for _, value := range s.Env {
+		if name, ok := strings.CutPrefix(value, "secret:"); ok && name != "" {
+			refs = append(refs, name)
+		}
+	}
+	return refs
+}
+
+// normalizeRuntime validates the shared runtime contract additions: image
+// digest pinning, environment references, network profile, persistent volumes,
+// artifact mounts, output collection and health checks.
+func (s *Submission) normalizeRuntime() error {
+	if s.ImageDigest != "" && !digestRe.MatchString(s.ImageDigest) {
+		return errors.New("image_digest must be a sha256 digest")
+	}
+	if len(s.Env) > 32 {
+		return errors.New("at most 32 environment entries are allowed")
+	}
+	for key, value := range s.Env {
+		if !envKeyRe.MatchString(key) {
+			return errors.New("environment keys must match [A-Za-z_][A-Za-z0-9_.]*")
+		}
+		if len(value) > 4096 {
+			return errors.New("environment values must be at most 4096 bytes")
+		}
+		if name, ok := strings.CutPrefix(value, "secret:"); ok {
+			if !volumeNameRe.MatchString(name) {
+				return errors.New("secret references must name a project secret")
+			}
+		}
+	}
+	switch s.Network {
+	case "", "none", "private":
+	default:
+		return errors.New("network must be none or private")
+	}
+	if s.Network == "private" && s.Kind != "service" {
+		return errors.New("the private network profile is available to services")
+	}
+	if len(s.Volumes) > 4 {
+		return errors.New("at most 4 persistent volumes are allowed")
+	}
+	seen := map[string]bool{}
+	for _, volume := range s.Volumes {
+		if !volumeNameRe.MatchString(volume.Name) {
+			return errors.New("volume names must be lowercase letters, digits and dashes")
+		}
+		if seen[volume.Name] {
+			return errors.New("volume names must be unique")
+		}
+		seen[volume.Name] = true
+		if volume.SizeBytes < 0 || volume.SizeBytes > 1<<40 {
+			return errors.New("volume size must be between 0 and 1 TiB")
+		}
+	}
+	if len(s.Artifacts) > 8 {
+		return errors.New("at most 8 artifact mounts are allowed")
+	}
+	for _, mount := range s.Artifacts {
+		if !strings.HasPrefix(mount.ArtifactID, "art-") || len(mount.ArtifactID) > 64 {
+			return errors.New("artifact mounts must reference project artifact IDs")
+		}
+		if !validArtifactPath(mount.Path) {
+			return errors.New("artifact mount paths must be absolute, normalized paths under /kamui/")
+		}
+	}
+	if len(s.Outputs) > 8 {
+		return errors.New("at most 8 output paths are allowed")
+	}
+	for _, out := range s.Outputs {
+		if !strings.HasPrefix(out, "/out/") || !validArtifactPath(out) {
+			return errors.New("output paths must be absolute, normalized paths under /out/")
+		}
+	}
+	if s.HealthCheck != nil {
+		hc := s.HealthCheck
+		if hc.Kind != "http" && hc.Kind != "tcp" {
+			return errors.New("health check kind must be http or tcp")
+		}
+		if hc.Port < 1 || hc.Port > 65535 {
+			return errors.New("health check port must be between 1 and 65535")
+		}
+		if hc.Kind == "http" && !strings.HasPrefix(hc.Path, "/") {
+			return errors.New("http health checks require an absolute path")
+		}
+		if hc.IntervalSeconds < 0 || hc.IntervalSeconds > 300 {
+			return errors.New("health check interval must be between 0 and 300 seconds")
+		}
+	}
+	return nil
+}
+
+func validArtifactPath(path string) bool {
+	if len(path) == 0 || len(path) > 256 || !strings.HasPrefix(path, "/") {
+		return false
+	}
+	clean := path
+	for strings.Contains(clean, "//") {
+		clean = strings.ReplaceAll(clean, "//", "/")
+	}
+	if clean != path || strings.HasSuffix(path, "/") {
+		return false
+	}
+	for _, segment := range strings.Split(strings.TrimPrefix(path, "/"), "/") {
+		if segment == "" || segment == "." || segment == ".." || strings.ContainsRune(segment, 0) {
+			return false
+		}
+	}
+	return true
+}
+
+// RegistryHost extracts the registry host from an image reference for policy
+// checks. A reference without an explicit host implies docker.io.
+func RegistryHost(image string) string {
+	first := image
+	if idx := strings.Index(first, "/"); idx > 0 {
+		first = first[:idx]
+		if strings.ContainsAny(first, ".:") && imageHostRe.MatchString(first) {
+			return strings.ToLower(first)
+		}
+	}
+	return "docker.io"
 }

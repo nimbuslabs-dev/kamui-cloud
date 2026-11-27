@@ -13,6 +13,7 @@ import (
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/auth"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/core"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/identity"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/runtime"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/worker"
 )
 
@@ -21,13 +22,14 @@ import (
 // strictly separated: worker tokens never touch management, and sessions never
 // speak for a worker.
 type workerHandler struct {
-	store  *worker.Store
-	engine *core.Engine
-	ids    *identity.Store
+	store   *worker.Store
+	engine  *core.Engine
+	ids     *identity.Store
+	runtime *runtime.Store
 }
 
-func newWorkerHandler(store *worker.Store, engine *core.Engine, ids *identity.Store) *workerHandler {
-	return &workerHandler{store: store, engine: engine, ids: ids}
+func newWorkerHandler(store *worker.Store, engine *core.Engine, ids *identity.Store, rt *runtime.Store) *workerHandler {
+	return &workerHandler{store: store, engine: engine, ids: ids, runtime: rt}
 }
 
 type heartbeatInput struct {
@@ -38,21 +40,24 @@ type heartbeatInput struct {
 
 type reportInput struct {
 	Fence     string     `json:"fence"`
-	Phase     string     `json:"phase,omitempty"` // ack|running|exit|renew
+	Phase     string     `json:"phase,omitempty"` // ack|running|exit|renew|route
 	ExitCode  *int       `json:"exit_code,omitempty"`
 	Started   bool       `json:"started,omitempty"`
 	StartedAt *time.Time `json:"started_at,omitempty"`
 	LogTail   string     `json:"log_tail,omitempty"`
+	Port      int        `json:"port,omitempty"`
+	RouteKind string     `json:"route_kind,omitempty"`
 }
 
 type pollAssignment struct {
-	WorkloadID string         `json:"workload_id"`
-	Attempt    int            `json:"attempt"`
-	Fence      string         `json:"fence"`
-	Image      string         `json:"image"`
-	Args       []string       `json:"args,omitempty"`
-	Resources  core.Resources `json:"resources"`
-	Deadline   time.Time      `json:"deadline"`
+	WorkloadID string                      `json:"workload_id"`
+	Attempt    int                         `json:"attempt"`
+	Fence      string                      `json:"fence"`
+	Image      string                      `json:"image"`
+	Args       []string                    `json:"args,omitempty"`
+	Resources  core.Resources              `json:"resources"`
+	Deadline   time.Time                   `json:"deadline"`
+	Envelope   *runtime.AssignmentEnvelope `json:"envelope,omitempty"`
 }
 
 type pollStop struct {
@@ -214,11 +219,28 @@ func (h *workerHandler) poll(w http.ResponseWriter, r *http.Request) {
 		}
 		switch item.State {
 		case core.Assigned:
-			response.Assignments = append(response.Assignments, pollAssignment{
+			assignment := pollAssignment{
 				WorkloadID: item.ID, Attempt: item.Attempt, Fence: item.Assignment.Fence,
 				Image: item.Submission.Image, Args: item.Submission.Args,
 				Resources: item.Submission.Resources, Deadline: item.Assignment.LeaseUntil,
-			})
+			}
+			if h.runtime != nil {
+				// Resolve secrets, artifacts, network and scoped registry
+				// credentials for exactly this assignment. Problems are
+				// reported to the worker via a failed-start envelope.
+				envelope, problems, err := h.runtime.BuildEnvelope(r.Context(), item.ProjectID, item.Submission)
+				if err != nil {
+					slog.Warn("build assignment envelope", "workload_id", item.ID, "error", err)
+				}
+				if envelope.Env == nil {
+					envelope.Env = map[string]string{}
+				}
+				if len(problems) > 0 {
+					envelope.Problems = problems
+				}
+				assignment.Envelope = &envelope
+			}
+			response.Assignments = append(response.Assignments, assignment)
 		case core.Starting, core.Running, core.Unhealthy:
 			response.Active = append(response.Active, pollActive{
 				WorkloadID: item.ID, Attempt: item.Attempt, Fence: item.Assignment.Fence,
@@ -264,14 +286,49 @@ func (h *workerHandler) report(w http.ResponseWriter, r *http.Request) {
 		apierr.WriteError(w, http.StatusBadRequest, "invalid_request", "invalid report payload")
 		return
 	}
-	kind, known := reportPhases[strings.ToLower(strings.TrimSpace(input.Phase))]
-	if !known {
-		apierr.WriteError(w, http.StatusBadRequest, "invalid_request", "phase must be ack, running, exit or renew")
+	phase := strings.ToLower(strings.TrimSpace(input.Phase))
+	kind, known := reportPhases[phase]
+	if !known && phase != "route" {
+		apierr.WriteError(w, http.StatusBadRequest, "invalid_request", "phase must be ack, running, exit, renew or route")
 		return
 	}
 	workloadID := r.PathValue("workload")
 	if workloadID == "" || input.Fence == "" {
 		apierr.WriteError(w, http.StatusBadRequest, "invalid_request", "an assignment workload ID and fence token are required")
+		return
+	}
+	if phase == "route" {
+		// Routes are assignment-bound metadata: verify worker identity and
+		// fencing inline, then record. A stale assignment can never register.
+		if h.runtime == nil {
+			apierr.WriteError(w, http.StatusServiceUnavailable, "routes_unavailable", "service routes are not enabled")
+			return
+		}
+		workloadID := r.PathValue("workload")
+		if workloadID == "" || input.Fence == "" || input.Port == 0 {
+			apierr.WriteError(w, http.StatusBadRequest, "invalid_request", "route registration requires the fence and port")
+			return
+		}
+		item, err := h.engine.Repo.Get(r.Context(), workloadID)
+		if err != nil {
+			coreError(w, err)
+			return
+		}
+		if item.Assignment == nil || item.Assignment.WorkerID != workerID ||
+			item.Assignment.Fence == "" || item.Assignment.Fence != input.Fence ||
+			item.State.Terminal() || item.State == core.Stopping {
+			apierr.WriteError(w, http.StatusConflict, "stale_assignment", "this assignment is no longer current")
+			return
+		}
+		kind := "http"
+		if strings.TrimSpace(input.RouteKind) != "" {
+			kind = strings.TrimSpace(input.RouteKind)
+		}
+		if err := h.runtime.RegisterRoute(r.Context(), workloadID, item.ProjectID, workerID, item.Attempt, input.Fence, input.Port, kind); err != nil {
+			runtimeError(w, err)
+			return
+		}
+		apierr.WriteJSON(w, http.StatusCreated, map[string]any{"ok": true})
 		return
 	}
 	payload, err := json.Marshal(struct {

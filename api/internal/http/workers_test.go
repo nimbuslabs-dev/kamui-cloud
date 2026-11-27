@@ -14,6 +14,7 @@ import (
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/core"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/identity"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/registry"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/runtime"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/scheduler"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/worker"
 )
@@ -65,7 +66,8 @@ func newWorkerTestEnv(t *testing.T) *workerTestEnv {
 	engineDone := make(chan struct{})
 	go func() { defer close(engineDone); engine.Run(engineCtx) }()
 	t.Cleanup(func() { cancelEngine(); <-engineDone })
-	router, err := NewRouterWithServices(cfg, registry.NewRegistry(), scheduler.NewQueue(nil), engine, idStore, nil, workerStore)
+		runtimeStore := runtime.NewStore(coreStore.DB(), cfg.Token, t.TempDir())
+	router, err := NewRouterWithServices(cfg, registry.NewRegistry(), scheduler.NewQueue(nil), engine, idStore, nil, workerStore, runtimeStore)
 	if err != nil {
 		t.Fatal(err)
 	}

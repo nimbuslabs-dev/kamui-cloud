@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 )
@@ -40,6 +41,17 @@ type Engine struct {
 	Probe     Probe
 	Logger    *slog.Logger
 	Cluster   Cluster
+	// Volumes optionally provides persistent volume ownership for stateful
+	// placement constraints. nil keeps stateless scheduling behavior.
+	Volumes VolumeDirectory
+}
+
+// VolumeDirectory is the persistent storage locality surface consulted by the
+// scheduler. A stateful workload may only run where its volumes already live;
+// the coordinator never recreates an empty volume on another worker.
+type VolumeDirectory interface {
+	VolumeOwner(ctx context.Context, projectID, name string) (string, error)
+	RecordVolumePlacement(ctx context.Context, projectID, name, workerID string, sizeBytes int64) error
 }
 
 func newID() string {
@@ -212,7 +224,44 @@ func (e *Engine) reconcileCluster(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		choice, reason, decision := SelectPlacement(w.Submission, w.ProjectID, w.SubmitterID, workers, reserved, pressure, now)
+		var choice, reason string
+		var decision PlacementDecision
+		submission := w.Submission
+		if submission.Stateful() && e.Volumes != nil {
+			owner := ""
+			conflict := false
+			for _, volume := range submission.Volumes {
+				holder, err := e.Volumes.VolumeOwner(ctx, w.ProjectID, volume.Name)
+				if err != nil {
+					e.Logger.Warn("read volume placement", "workload_id", w.ID, "error", err)
+					break
+				}
+				if holder != "" && owner != "" && holder != owner {
+					conflict = true
+					break
+				}
+				if holder != "" {
+					owner = holder
+				}
+			}
+			switch {
+			case conflict:
+				choice, reason, decision = "", "persistent volumes are pinned to different workers; manual recovery required", PlacementDecision{Mode: submission.Placement, At: now, Candidates: []DecisionCandidate{}}
+			case owner != "":
+				// Stateful workloads run only where their volumes live.
+				if submission.Placement == PlacementManual && submission.WorkerID != owner {
+					choice, reason, decision = "", fmt.Sprintf("volume %s is pinned to worker %s; refusing to run stateful data elsewhere", submission.Volumes[0].Name, owner), PlacementDecision{Mode: submission.Placement, At: now, Candidates: []DecisionCandidate{}}
+				} else {
+					submission.Placement = PlacementManual
+					submission.WorkerID = owner
+					choice, reason, decision = SelectPlacement(submission, w.ProjectID, w.SubmitterID, workers, reserved, pressure, now)
+				}
+			default:
+				choice, reason, decision = SelectPlacement(submission, w.ProjectID, w.SubmitterID, workers, reserved, pressure, now)
+			}
+		} else {
+			choice, reason, decision = SelectPlacement(w.Submission, w.ProjectID, w.SubmitterID, workers, reserved, pressure, now)
+		}
 		decision.Attempt = w.Attempt
 		if choice == "" {
 			if reason == w.QueueReason {
@@ -269,7 +318,7 @@ func (e *Engine) reconcileCluster(ctx context.Context) {
 		}
 		if w.Assignment == nil {
 			// Cancelled while queued, or still waiting on placement.
-			if w.CancelRequested && !w.State.terminal() {
+			if w.CancelRequested && !w.State.Terminal() {
 				state := Cancelled
 				if w.Submission.Kind == "service" {
 					state = Stopped
@@ -352,7 +401,7 @@ func (e *Engine) applyReport(ctx context.Context, report WorkerReport) bool {
 		return false
 	}
 	if w.Assignment == nil || w.Assignment.WorkerID != report.WorkerID ||
-		w.Assignment.Fence == "" || w.Assignment.Fence != report.Fence || w.State.terminal() {
+		w.Assignment.Fence == "" || w.Assignment.Fence != report.Fence || w.State.Terminal() {
 		return true // fenced out: a stale worker must never mutate a newer attempt
 	}
 	now := time.Now().UTC()
@@ -722,7 +771,7 @@ func (e *Engine) finish(ctx context.Context, w Workload, state State, reason str
 func (e *Engine) Cancel(ctx context.Context, id string) (Workload, error) {
 	for {
 		w, err := e.Repo.Get(ctx, id)
-		if err != nil || w.State.terminal() || w.CancelRequested {
+		if err != nil || w.State.Terminal() || w.CancelRequested {
 			return w, err
 		}
 		w.CancelRequested = true

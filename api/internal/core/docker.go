@@ -14,6 +14,7 @@ import (
 
 	"github.com/distribution/reference"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/errdefs"
 )
@@ -293,4 +294,35 @@ func readDockerLogs(logs io.Reader) (string, error) {
 		}
 	}
 	return output.String() + "\n[log output truncated]\n", nil
+}
+
+// ContainerServiceAddress resolves the IP a workload's container holds on its
+// project network, for same-daemon service routing. It inspects by ownership
+// labels so a replaced assignment always wins over stale addresses.
+func (d *DockerExecutor) ContainerServiceAddress(ctx context.Context, workloadID string, attempt int) (string, error) {
+	if workloadID == "" || len(workloadID) > 128 || strings.ContainsRune(workloadID, 0) || attempt < 1 {
+		return "", errors.New("invalid service lookup")
+	}
+	containers, err := d.client.ContainerList(ctx, container.ListOptions{
+		All: true,
+		Filters: filters.NewArgs(
+			filters.Arg("label", scopeLabel+"="+d.scope),
+			filters.Arg("label", workloadLabel+"="+workloadID),
+			filters.Arg("label", attemptLabel+"="+strconv.Itoa(attempt)),
+		),
+	})
+	if err != nil {
+		return "", fmt.Errorf("list workload containers: %w", err)
+	}
+	for _, summary := range containers {
+		for _, network := range summary.NetworkSettings.Networks {
+			if network.IPAddress != "" {
+				return network.IPAddress, nil
+			}
+		}
+	}
+	if len(containers) == 0 {
+		return "", errors.New("service container is not running")
+	}
+	return "", errors.New("service container has no address on a reachable network")
 }
