@@ -1,6 +1,7 @@
 package core
 
 import (
+	"archive/tar"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -38,6 +39,7 @@ type ContainerSpec struct {
 	Args        []string `json:"args"`
 	CPUMillis   int64    `json:"cpu_millis"`
 	MemoryBytes int64    `json:"memory_bytes"`
+	Outputs     []string `json:"outputs,omitempty"`
 }
 
 type ExecutionStatus struct {
@@ -174,12 +176,19 @@ func (d *DockerExecutor) containerConfig(ref ExecutionRef, spec ContainerSpec, i
 			scopeLabel: d.scope, workloadLabel: ref.WorkloadID, attemptLabel: strconv.Itoa(ref.Attempt),
 		},
 	}
+	outputBinds := []string{}
+	if len(spec.Outputs) > 0 {
+		// An assignment-scoped scratch volume collects declared outputs; the
+		// workload itself never sees a host path.
+		outputBinds = append(outputBinds, fmt.Sprintf("kamui-out-%s-%d:/out", ref.WorkloadID, ref.Attempt))
+	}
 	host := &container.HostConfig{
 		Init:           &init,
 		NetworkMode:    "none",
 		ReadonlyRootfs: true,
 		CapDrop:        []string{"ALL"},
 		SecurityOpt:    []string{"no-new-privileges:true"},
+		Binds:          outputBinds,
 		Tmpfs:          map[string]string{"/tmp": "rw,nosuid,nodev,noexec,size=32m,mode=1777"},
 		Resources: container.Resources{
 			NanoCPUs: spec.CPUMillis * 1_000_000, Memory: spec.MemoryBytes, MemorySwap: spec.MemoryBytes,
@@ -294,6 +303,45 @@ func readDockerLogs(logs io.Reader) (string, error) {
 		}
 	}
 	return output.String() + "\n[log output truncated]\n", nil
+}
+
+// CollectOutput reads one declared output file from an exited attempt's
+// output volume through the container's /out mount.
+func (d *DockerExecutor) CollectOutput(ctx context.Context, workloadID string, attempt int, containerPath string) ([]byte, error) {
+	if workloadID == "" || len(workloadID) > 128 || strings.ContainsRune(workloadID, 0) || attempt < 1 {
+		return nil, errors.New("invalid output lookup")
+	}
+	if !strings.HasPrefix(containerPath, "/out/") && containerPath != "/out" {
+		return nil, errors.New("outputs must live under /out/")
+	}
+	ref := ExecutionRef{WorkloadID: workloadID, Attempt: attempt}
+	inspected, err := d.find(ctx, ref)
+	if err != nil || inspected.ContainerJSONBase == nil {
+		return nil, errors.New("the attempt container is no longer present")
+	}
+	reader, _, err := d.client.CopyFromContainer(ctx, inspected.ID, containerPath)
+	if err != nil {
+		return nil, fmt.Errorf("collect output %s: %w", containerPath, err)
+	}
+	defer reader.Close()
+	// CopyFromContainer yields a tar stream; extract the first regular file.
+	tarReader := tar.NewReader(reader)
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			return nil, errors.New("output is empty")
+		}
+		if err != nil {
+			return nil, err
+		}
+		if header.Typeflag == tar.TypeReg {
+			data, err := io.ReadAll(io.LimitReader(tarReader, maxLogBytes))
+			if err != nil {
+				return nil, err
+			}
+			return data, nil
+		}
+	}
 }
 
 // ContainerServiceAddress resolves the IP a workload's container holds on its

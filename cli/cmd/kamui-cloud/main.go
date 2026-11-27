@@ -109,6 +109,7 @@ func (a *app) command() *cobra.Command {
 	cloud := cloudCommand(&a.cloud)
 	cloud.AddCommand(a.healthCommand())
 	cmd.AddCommand(cloud, dockerCommand(&a.cloud), a.configCommand(), a.deviceCommand(), a.workloadCommand("job"), a.workloadCommand("service"), a.workspaceCommand(), a.identityCommand(), a.connectCommand(), a.nodeCommand(), a.agentCommand(), a.schedulerCommand())
+	a.registerServices(cmd)
 	return cmd
 }
 

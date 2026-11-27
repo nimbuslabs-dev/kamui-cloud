@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/apierr"
@@ -68,6 +70,7 @@ func (h *servicesHandler) register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/projects/{id}/training/{trn}", h.GetTraining)
 	mux.HandleFunc("GET /v1/projects/{id}/training/{trn}/metrics", h.ListTrainingMetrics)
 	mux.HandleFunc("POST /v1/projects/{id}/training/{trn}/cancel", h.CancelTraining)
+	mux.HandleFunc("POST /v1/projects/{id}/training/{trn}/collect", h.CollectTrainingOutputs)
 	mux.HandleFunc("POST /v1/projects/{id}/models", h.RegisterModel)
 	mux.HandleFunc("GET /v1/projects/{id}/models", h.ListModels)
 	mux.HandleFunc("GET /v1/projects/{id}/models/{model}", h.GetModel)
@@ -604,6 +607,75 @@ func (h *servicesHandler) CancelTraining(w http.ResponseWriter, r *http.Request)
 		_ = h.ids.RecordAudit(r.Context(), p.User.ID, projectID, "train.cancel", "training", job.ID, "success", "")
 	}
 	apierr.WriteJSON(w, http.StatusOK, workload)
+}
+
+// CollectTrainingOutputs gathers declared outputs from a finished local
+// attempt, ingests observed metrics and registers the model artifact blob.
+// Remote-worker outputs are staged by the agent; their coordinator-side
+// registration is a documented PARTIAL for this checkpoint.
+func (h *servicesHandler) CollectTrainingOutputs(w http.ResponseWriter, r *http.Request) {
+	projectID := r.PathValue("id")
+	p, ok := h.authorize(w, r, projectID, identity.PermWorkloadWrite)
+	if !ok {
+		return
+	}
+	job, err := h.train.GetTraining(r.Context(), projectID, r.PathValue("trn"))
+	if err != nil {
+		servicesError(w, err)
+		return
+	}
+	h.train.SyncTrainingState(r.Context(), &job)
+	if h.engine == nil {
+		servicesError(w, errors.New("scheduler unavailable"))
+		return
+	}
+	workload, err := h.engine.Repo.Get(r.Context(), job.WorkloadID)
+	if err != nil {
+		servicesError(w, err)
+		return
+	}
+	if !workload.State.Terminal() {
+		apierr.WriteError(w, http.StatusConflict, "still_running", "outputs can be collected only from a finished attempt")
+		return
+	}
+	collector, ok := h.engine.Executor.(OutputCollector)
+	if !ok {
+		apierr.WriteError(w, http.StatusServiceUnavailable, "collect_unavailable", "output collection requires a shared local Docker daemon")
+		return
+	}
+	var ingested int
+	var metricLines []string
+	for _, output := range workload.Submission.Outputs {
+		data, err := collector.CollectOutput(r.Context(), job.WorkloadID, workload.Attempt, output)
+		if err != nil {
+			continue // missing outputs are not fatal; metrics may be absent
+		}
+		if strings.HasSuffix(output, "metrics.jsonl") {
+			metricLines = strings.Split(strings.TrimSpace(string(data)), "\n")
+			tmp, err := os.CreateTemp("", "metrics-*.jsonl")
+			if err == nil {
+				_, _ = tmp.WriteString(string(data))
+				tmp.Close()
+				ingested, err = h.train.IngestMetrics(r.Context(), job.ID, tmp.Name())
+				if err != nil {
+					os.Remove(tmp.Name())
+					servicesError(w, err)
+					return
+				}
+				os.Remove(tmp.Name())
+			}
+		}
+	}
+	apierr.WriteJSON(w, http.StatusOK, map[string]any{
+		"ingested_metrics": ingested,
+		"metric_lines":     len(metricLines),
+		"collector":        p.User.ID,
+	})
+}
+
+// OutputCollector is implemented by the local Docker executor.
+type OutputCollector interface {
+	CollectOutput(ctx context.Context, workloadID string, attempt int, containerPath string) ([]byte, error)
 }
 
 func (h *servicesHandler) RegisterModel(w http.ResponseWriter, r *http.Request) {

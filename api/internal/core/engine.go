@@ -698,6 +698,7 @@ func (e *Engine) advance(ctx context.Context, w Workload, worker Worker, reserve
 			r := w.Submission.Resources
 			err := e.Executor.Create(ctx, ref, ContainerSpec{
 				Image: w.Submission.Image, Args: w.Submission.Args, CPUMillis: r.CPUMillis, MemoryBytes: r.MemoryBytes,
+				Outputs: w.Submission.Outputs,
 			})
 			if errors.Is(err, ErrInvalidContainer) {
 				return e.finish(ctx, w, Failed, err.Error(), nil, "", false, false)

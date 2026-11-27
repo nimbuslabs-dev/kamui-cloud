@@ -1,0 +1,639 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/url"
+	"os"
+	"strings"
+
+	"github.com/spf13/cobra"
+)
+
+// registerServices attaches every service command tree to the root command.
+func (a *app) registerServices(root *cobra.Command) {
+	root.AddCommand(a.deployCommand(), a.storeCommand(), a.backupCommand(),
+		a.trainCommand(), a.inferCommand(), a.databaseCommand(), a.monitorCommand(), a.dropCommand())
+}
+
+// sendQuiet performs a request returning parsed JSON or an error.
+func (a *app) sendQuiet(cmd *cobra.Command, method, path string, body any) (json.RawMessage, error) {
+	client, err := a.client()
+	if err != nil {
+		return nil, err
+	}
+	return client.request(cmd.Context(), method, path, body, "")
+}
+
+// --- Deploy ---------------------------------------------------------------
+
+func (a *app) deployCommand() *cobra.Command {
+	group := &cobra.Command{Use: "deploy", Short: "Build and host web applications"}
+	project := group.PersistentFlags()
+	project.StringVar(&svcProjectFlag, "project", "", "Project ID")
+	group.AddCommand(&cobra.Command{
+		Use:   "create NAME --source git|dockerfile|image [--source-ref URL|IMAGE] [--placement auto|manual|preferred] [--node ID] [--cpu-millis N] [--memory-bytes N] [--env K=V]...",
+		Short: "Declare a deployment", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			source, _ := cmd.Flags().GetString("source")
+			sourceRef, _ := cmd.Flags().GetString("source-ref")
+			placement, _ := cmd.Flags().GetString("placement")
+			node, _ := cmd.Flags().GetString("node")
+			cpu, _ := cmd.Flags().GetInt64("cpu-millis")
+			memory, _ := cmd.Flags().GetInt64("memory-bytes")
+			envList, _ := cmd.Flags().GetStringArray("env")
+			env := map[string]string{}
+			for _, entry := range envList {
+				key, value, found := strings.Cut(entry, "=")
+				if !found {
+					return failure(2, "usage", "--env entries must be KEY=VALUE")
+				}
+				env[key] = value
+			}
+			body := map[string]any{
+				"name": args[0], "source": source, "source_ref": sourceRef,
+				"placement": placement, "worker_id": node, "env": env,
+				"resources": map[string]any{"cpu_millis": cpu, "memory_bytes": memory},
+			}
+			return a.serviceSend(cmd, "POST", svcProjectPath("/deployments"), body)
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "list", Short: "List deployments", Args: usageArgs(cobra.NoArgs),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return a.serviceSend(cmd, "GET", svcProjectPath("/deployments"), nil)
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "inspect DEPLOYMENT", Short: "Show revisions, builds and runtime state", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "GET", svcProjectPath("/deployments/"+args[0]), nil)
+		},
+	})
+	for _, op := range []struct{ name, method, path string }{
+		{"start", "POST", "/start"}, {"stop", "POST", "/stop"}, {"restart", "POST", "/start"},
+	} {
+		op := op
+		group.AddCommand(&cobra.Command{
+			Use: op.name + " DEPLOYMENT", Short: strings.Title(op.name) + " a deployment runtime", Args: usageArgs(cobra.ExactArgs(1)),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				return a.serviceSend(cmd, op.method, svcProjectPath("/deployments/"+args[0]+op.path), map[string]any{})
+			},
+		})
+	}
+	group.AddCommand(&cobra.Command{
+		Use: "rollback DEPLOYMENT", Short: "Roll back to the previous healthy revision", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "POST", svcProjectPath("/deployments/"+args[0]+"/rollback"), map[string]any{})
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "logs DEPLOYMENT", Short: "Read the runtime log tail", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "POST", svcProjectPath("/deployments/"+args[0]+"/logs"), map[string]any{})
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "delete DEPLOYMENT", Short: "Stop and delete a deployment", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "DELETE", svcProjectPath("/deployments/"+args[0]), nil)
+		},
+	})
+	return group
+}
+
+// --- Store -----------------------------------------------------------------
+
+func (a *app) storeCommand() *cobra.Command {
+	group := &cobra.Command{Use: "store", Short: "Project object storage"}
+	bucket := &cobra.Command{Use: "bucket", Short: "Manage buckets"}
+	bucket.AddCommand(&cobra.Command{
+		Use: "create NAME", Short: "Create a bucket", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "POST", svcProjectPath("/buckets"), map[string]any{"name": args[0]})
+		},
+	})
+	bucket.AddCommand(&cobra.Command{
+		Use: "list", Short: "List buckets", Args: usageArgs(cobra.NoArgs),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return a.serviceSend(cmd, "GET", svcProjectPath("/buckets"), nil)
+		},
+	})
+	group.AddCommand(bucket)
+	object := &cobra.Command{Use: "object", Short: "Manage objects"}
+	object.AddCommand(&cobra.Command{
+		Use: "upload BUCKET KEY FILE", Short: "Upload a file", Args: usageArgs(cobra.ExactArgs(3)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			file, err := os.Open(args[2])
+			if err != nil {
+				return failure(2, "invalid_file", "cannot open the file to upload")
+			}
+			defer file.Close()
+			client, err := a.client()
+			if err != nil {
+				return err
+			}
+			data, err := io.ReadAll(file)
+			if err != nil {
+				return failure(1, "upload_failed", "cannot read the file")
+			}
+			result, err := client.request(cmd.Context(), "PUT",
+				svcProjectPath("/buckets/"+args[0]+"/objects/"+args[1]), data, "")
+			if err != nil {
+				return err
+			}
+			return printJSON(cmd.OutOrStdout(), result, a.cloud.JSON)
+		},
+	})
+	object.AddCommand(&cobra.Command{
+		Use: "download BUCKET KEY [FILE]", Short: "Download an object", Args: usageArgs(cobra.RangeArgs(2, 3)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := a.client()
+			if err != nil {
+				return err
+			}
+			raw, err := client.request(cmd.Context(), "GET",
+				svcProjectPath("/buckets/"+args[0]+"/objects/"+args[1]+"?metadata=true"), nil, "")
+			if err != nil {
+				return err
+			}
+			var meta struct {
+				Checksum string `json:"checksum"`
+				Size     int64  `json:"size_bytes"`
+			}
+			_ = json.Unmarshal(raw, &meta)
+			_ = meta
+			data, err := client.request(cmd.Context(), "GET",
+				svcProjectPath("/buckets/"+args[0]+"/objects/"+args[1]), nil, "")
+			if err != nil {
+				return err
+			}
+			if len(args) == 3 {
+				return os.WriteFile(args[2], data, 0600)
+			}
+			_, err = cmd.OutOrStdout().Write(data)
+			return err
+		},
+	})
+	object.AddCommand(&cobra.Command{
+		Use: "list BUCKET", Short: "List objects", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "GET", svcProjectPath("/buckets/"+args[0]+"/objects"), nil)
+		},
+	})
+	object.AddCommand(&cobra.Command{
+		Use: "delete BUCKET KEY", Short: "Delete an object", Args: usageArgs(cobra.ExactArgs(2)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "DELETE", svcProjectPath("/buckets/"+args[0]+"/objects/"+args[1]), nil)
+		},
+	})
+	group.AddCommand(object)
+	return group
+}
+
+// --- Backup ------------------------------------------------------------------
+
+func (a *app) backupCommand() *cobra.Command {
+	group := &cobra.Command{Use: "backup", Short: "Back up and restore Kamui state"}
+	group.AddCommand(&cobra.Command{
+		Use: "create metadata", Short: "Snapshot coordinator metadata (admin)", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "POST", "/backups/metadata", map[string]any{})
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "create objects", Short: "Bundle this project's stored objects", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "POST", svcProjectPath("/backups/objects"), map[string]any{})
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "create volume --volume NAME", Short: "Export a Docker volume backup",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			volume, _ := cmd.Flags().GetString("volume")
+			if volume == "" {
+				return failure(2, "usage", "--volume is required")
+			}
+			return a.serviceSend(cmd, "POST", svcProjectPath("/backups/volume"), map[string]any{"volume": volume})
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "list", Short: "List backups", Args: usageArgs(cobra.NoArgs),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return a.serviceSend(cmd, "GET", "/backups"+svcProjectSuffix(), nil)
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "inspect BACKUP", Short: "Show backup metadata", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "GET", "/backups/"+args[0], nil)
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "restore BACKUP --destination DIR", Short: "Restore into an isolated destination",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			destination, _ := cmd.Flags().GetString("destination")
+			if destination == "" {
+				return failure(2, "usage", "--destination is required and must be an isolated directory")
+			}
+			return a.serviceSend(cmd, "POST", "/backups/"+args[0]+"/restore", map[string]any{"destination": destination})
+		},
+	})
+	return group
+}
+
+// --- Train --------------------------------------------------------------------
+
+func (a *app) trainCommand() *cobra.Command {
+	group := &cobra.Command{Use: "train", Short: "Run training workloads"}
+	group.AddCommand(&cobra.Command{
+		Use:   "submit NAME IMAGE -- [args...] [--dataset ARTIFACT_ID] [--cpu-millis N] [--memory-bytes N] [--gpus N]",
+		Short: "Submit a training job", Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) < 2 {
+				return failure(2, "usage", "provide a name and an image")
+			}
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			dataset, _ := cmd.Flags().GetString("dataset")
+			cpu, _ := cmd.Flags().GetInt64("cpu-millis")
+			memory, _ := cmd.Flags().GetInt64("memory-bytes")
+			gpus, _ := cmd.Flags().GetInt("gpus")
+			placement, _ := cmd.Flags().GetString("placement")
+			timeout, _ := cmd.Flags().GetInt("timeout")
+			imageArgs := []string{}
+			if len(args) > 2 {
+				imageArgs = args[2:]
+			}
+			body := map[string]any{
+				"name": args[0], "image": args[1], "args": imageArgs,
+				"dataset_artifact": dataset, "placement": placement, "timeout_seconds": timeout,
+				"resources": map[string]any{"cpu_millis": cpu, "memory_bytes": memory, "gpu_count": gpus},
+			}
+			return a.serviceSend(cmd, "POST", svcProjectPath("/training"), body)
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "list", Short: "List training jobs", Args: usageArgs(cobra.NoArgs),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return a.serviceSend(cmd, "GET", svcProjectPath("/training"), nil)
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "inspect JOB", Short: "Show a training job and its logs", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "GET", svcProjectPath("/training/"+args[0]), nil)
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "logs JOB", Short: "Read the training log tail", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "GET", svcProjectPath("/training/"+args[0]), nil)
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "cancel JOB", Short: "Cancel a training job", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "POST", svcProjectPath("/training/"+args[0]+"/cancel"), map[string]any{})
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "checkpoint list JOB", Short: "List observed metrics for a job", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "GET", svcProjectPath("/training/"+args[0]+"/metrics"), nil)
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "resume JOB", Short: "Resume is not implemented yet; training jobs are re-submitted instead",
+		Args: usageArgs(cobra.NoArgs),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return failure(4, "not_implemented", "checkpoint resume requires explicit framework support; submit a new job with the checkpoint artifact instead")
+		},
+	})
+	model := &cobra.Command{Use: "model", Short: "Registered model artifacts"}
+	model.AddCommand(&cobra.Command{
+		Use: "list", Short: "List models", Args: usageArgs(cobra.NoArgs),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return a.serviceSend(cmd, "GET", svcProjectPath("/models"), nil)
+		},
+	})
+	model.AddCommand(&cobra.Command{
+		Use: "inspect MODEL", Short: "Show a model", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "GET", svcProjectPath("/models/"+args[0]), nil)
+		},
+	})
+	group.AddCommand(model)
+	return group
+}
+
+// --- Infer ---------------------------------------------------------------------
+
+func (a *app) inferCommand() *cobra.Command {
+	group := &cobra.Command{Use: "infer", Short: "Serve models through runtime adapters"}
+	group.AddCommand(&cobra.Command{
+		Use:   "deploy NAME --runtime RUNTIME --image IMAGE [--model MODEL_ID] [--upstream URL]",
+		Short: "Deploy an inference service",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			name, _ := cmd.Flags().GetString("name")
+			runtimeKind, _ := cmd.Flags().GetString("runtime")
+			image, _ := cmd.Flags().GetString("image")
+			model, _ := cmd.Flags().GetString("model")
+			upstream, _ := cmd.Flags().GetString("upstream")
+			if name == "" || runtimeKind == "" || image == "" {
+				return failure(2, "usage", "--name, --runtime and --image are required")
+			}
+			body := map[string]any{"name": name, "runtime": runtimeKind, "image": image, "model_id": model, "upstream_url": upstream}
+			return a.serviceSend(cmd, "POST", svcProjectPath("/inference"), body)
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "list", Short: "List inference services", Args: usageArgs(cobra.NoArgs),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return a.serviceSend(cmd, "GET", svcProjectPath("/inference"), nil)
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "inspect SERVICE", Short: "Show an inference service", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "GET", svcProjectPath("/inference/"+args[0]), nil)
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "endpoint SERVICE", Short: "Show the authenticated local endpoint", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "GET", svcProjectPath("/inference/"+args[0]+"/proxy"), nil)
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use:   "request SERVICE --method GET --path /v1/models [--data JSON]",
+		Short: "Send an authenticated request through the service proxy",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc := args[0]
+			method, _ := cmd.Flags().GetString("method")
+			path, _ := cmd.Flags().GetString("path")
+			data, _ := cmd.Flags().GetString("data")
+			if !strings.HasPrefix(path, "/") {
+				return failure(2, "usage", "--path must start with /")
+			}
+			client, err := a.client()
+			if err != nil {
+				return err
+			}
+			var body any
+			if data != "" {
+				body = json.RawMessage(data)
+			}
+			result, err := client.request(cmd.Context(), method, svcProjectPath("/inference/"+svc+"/proxy"+path), body, "")
+			if err != nil {
+				return err
+			}
+			return printJSON(cmd.OutOrStdout(), result, a.cloud.JSON)
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "stop SERVICE", Short: "Stop an inference service", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "POST", svcProjectPath("/inference/"+args[0]+"/stop"), map[string]any{})
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "restart SERVICE", Short: "Restart re-releases the same workload; use stop then deploy",
+		Args: usageArgs(cobra.NoArgs),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return failure(4, "not_implemented", "inference restart reuses stop and a fresh deploy")
+		},
+	})
+	return group
+}
+
+// --- Databases -------------------------------------------------------------------
+
+func (a *app) databaseCommand() *cobra.Command {
+	group := &cobra.Command{Use: "database", Short: "Managed databases (PostgreSQL)"}
+	group.AddCommand(&cobra.Command{
+		Use: "create NAME --engine postgres", Short: "Create a managed database",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			name, _ := cmd.Flags().GetString("name")
+			engine, _ := cmd.Flags().GetString("engine")
+			if name == "" || engine == "" {
+				return failure(2, "usage", "--name and --engine are required")
+			}
+			body := map[string]any{"name": name, "engine": engine}
+			return a.serviceSend(cmd, "POST", svcProjectPath("/databases"), body)
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "list", Short: "List databases", Args: usageArgs(cobra.NoArgs),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return a.serviceSend(cmd, "GET", svcProjectPath("/databases"), nil)
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "inspect DB", Short: "Show a database and its logs", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "GET", svcProjectPath("/databases/"+args[0]), nil)
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "logs DB", Short: "Read the database log tail", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "GET", svcProjectPath("/databases/"+args[0]), nil)
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "stop DB", Short: "Stop a database", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "POST", svcProjectPath("/databases/"+args[0]+"/stop"), map[string]any{})
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "restart DB", Short: "Restart is stop + start; restart is not yet implemented",
+		Args: usageArgs(cobra.NoArgs),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return failure(4, "not_implemented", "database restart reuses stop and start; not yet wired")
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "backup DB", Short: "Database backups run through the documented engine dump path",
+		Args: usageArgs(cobra.NoArgs),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return failure(4, "not_implemented", "engine-level database backup is not implemented yet; use volume backups")
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "restore DB", Short: "Database restore is not implemented yet", Args: usageArgs(cobra.NoArgs),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return failure(4, "not_implemented", "engine-level database restore is not implemented yet")
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "delete DB", Short: "Stop and remove a database record", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "DELETE", svcProjectPath("/databases/"+args[0]), nil)
+		},
+	})
+	return group
+}
+
+// --- Monitor / alerts ---------------------------------------------------------------
+
+func (a *app) monitorCommand() *cobra.Command {
+	group := &cobra.Command{Use: "monitor", Short: "Operational monitoring and alerts"}
+	group.AddCommand(&cobra.Command{
+		Use: "status", Short: "Queue, workers and recent placement decisions", Args: usageArgs(cobra.NoArgs),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return a.serviceSend(cmd, "GET", "/v1/scheduler/status", nil)
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "events", Short: "Recent workload events", Args: usageArgs(cobra.NoArgs),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return a.serviceSend(cmd, "GET", "/v1/workload-events", nil)
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "metrics", Short: "Prometheus metrics are exposed at /metrics by the coordinator",
+		Args: usageArgs(cobra.NoArgs),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			client, err := a.client()
+			if err != nil {
+				return err
+			}
+			raw, err := client.request(cmd.Context(), "GET", "/v1/scheduler/status", nil, "")
+			if err != nil {
+				return err
+			}
+			return printJSON(cmd.OutOrStdout(), raw, a.cloud.JSON)
+		},
+	})
+	alert := &cobra.Command{Use: "alert", Short: "Durable alert rules"}
+	alert.AddCommand(&cobra.Command{
+		Use: "list", Short: "List alert rules", Args: usageArgs(cobra.NoArgs),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return a.serviceSend(cmd, "GET", svcProjectPath("/alerts"), nil)
+		},
+	})
+	alert.AddCommand(&cobra.Command{
+		Use: "create --kind KIND [--target ID] [--threshold N] [--webhook URL]", Short: "Create an alert rule",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			kind, _ := cmd.Flags().GetString("kind")
+			target, _ := cmd.Flags().GetString("target")
+			threshold, _ := cmd.Flags().GetInt("threshold")
+			webhook, _ := cmd.Flags().GetString("webhook")
+			body := map[string]any{"kind": kind, "target": target, "threshold": threshold, "webhook_url": webhook}
+			return a.serviceSend(cmd, "POST", svcProjectPath("/alerts"), body)
+		},
+	})
+	group.AddCommand(alert)
+	return group
+}
+
+// --- Drop -------------------------------------------------------------------------
+
+func (a *app) dropCommand() *cobra.Command {
+	group := &cobra.Command{Use: "drop", Short: "Secure file transfers"}
+	group.AddCommand(&cobra.Command{
+		Use: "send FILE --recipient USER_ID", Short: "Send a file to a principal",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) != 1 {
+				return failure(2, "usage", "provide exactly one file")
+			}
+			recipient, _ := cmd.Flags().GetString("recipient")
+			if recipient == "" {
+				return failure(2, "usage", "--recipient is required")
+			}
+			file, err := os.Open(args[0])
+			if err != nil {
+				return failure(2, "invalid_file", "cannot open the file to send")
+			}
+			defer file.Close()
+			data, err := io.ReadAll(file)
+			if err != nil {
+				return failure(1, "send_failed", "cannot read the file")
+			}
+			client, err := a.client()
+			if err != nil {
+				return err
+			}
+			path := fmt.Sprintf("/v1/drop/transfers?recipient=%s&filename=%s", recipient, urlQueryEscape(args[0]))
+			result, err := client.request(cmd.Context(), "POST", path, data, "")
+			if err != nil {
+				return err
+			}
+			return printJSON(cmd.OutOrStdout(), result, a.cloud.JSON)
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "receive TRANSFER --output FILE", Short: "Download an approved transfer",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			output, _ := cmd.Flags().GetString("output")
+			if output == "" {
+				return failure(2, "usage", "--output is required")
+			}
+			client, err := a.client()
+			if err != nil {
+				return err
+			}
+			result, err := client.request(cmd.Context(), "GET", "/v1/drop/transfers/"+args[0]+"/content", nil, "")
+			if err != nil {
+				return err
+			}
+			return os.WriteFile(output, result, 0600)
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "list", Short: "List your transfers", Args: usageArgs(cobra.NoArgs),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return a.serviceSend(cmd, "GET", "/v1/drop/transfers", nil)
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "inspect TRANSFER", Short: "Show a transfer", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "GET", "/v1/drop/transfers/"+args[0], nil)
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "cancel TRANSFER", Short: "Cancel a transfer you sent", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "POST", "/v1/drop/transfers/"+args[0]+"/cancel", map[string]any{})
+		},
+	})
+	return group
+}
+
+// --- shared helpers -----------------------------------------------------------------
+
+func urlQueryEscape(raw string) string {
+	return url.QueryEscape(raw)
+}
+
+func (a *app) serviceSend(cmd *cobra.Command, method, path string, body any) error {
+	result, err := a.sendQuiet(cmd, method, path, body)
+	if err != nil {
+		return err
+	}
+	return printJSON(cmd.OutOrStdout(), result, a.cloud.JSON)
+}
+
+var svcProjectFlag string
+
+func svcProject() string { return svcProjectFlag }
+
+func svcProjectSuffix() string {
+	if svcProject() == "" {
+		return ""
+	}
+	return "&project_id=" + svcProject()
+}
+
+func svcProjectPath(suffix string) string {
+	if svcProject() == "" {
+		// Without a project the request cannot be routed; the coordinator
+		// answers with a clear authorization error.
+		return "/v1/projects/UNSET" + suffix
+	}
+	return "/v1/projects/" + svcProject() + suffix
+}
