@@ -111,8 +111,8 @@ func (s *Store) CreateTransfer(ctx context.Context, senderID, recipientID, filen
 	if ttl <= 0 || ttl > 7*24*time.Hour {
 		ttl = 24 * time.Hour
 	}
-	if recipientID == "" || recipientID == senderID {
-		return Transfer{}, fmt.Errorf("%w: a distinct recipient is required", ErrBadInput)
+	if recipientID == "" {
+		return Transfer{}, fmt.Errorf("%w: a recipient is required", ErrBadInput)
 	}
 	idBytes := make([]byte, 12)
 	if _, err := rand.Read(idBytes); err != nil {

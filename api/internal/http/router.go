@@ -179,6 +179,14 @@ func NewRouterWithServices(
 		}
 	}
 
+	if deployStore != nil {
+		newDeployHandler(deployStore, idStore, engine).register(mux, publicMux)
+	}
+	if serviceStores != nil {
+		newServicesHandler(serviceStores.Objects, serviceStores.Backups, serviceStores.Train,
+			serviceStores.Infer, serviceStores.Ops, serviceStores.Drop, idStore, engine).register(mux)
+	}
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		apierr.WriteError(w, http.StatusNotFound, "not_found", "not found")
 	})

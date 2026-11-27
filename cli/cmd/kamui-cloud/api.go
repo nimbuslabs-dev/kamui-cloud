@@ -147,6 +147,38 @@ func (c *apiClient) request(ctx context.Context, method, path string, body any, 
 	return result, nil
 }
 
+// rawRequest performs a request carrying the body verbatim and returns the
+// uninterpreted response bytes, for binary uploads and downloads where JSON
+// framing would corrupt the content.
+func (c *apiClient) rawRequest(ctx context.Context, method, path string, body []byte) ([]byte, error) {
+	var payload io.Reader
+	if body != nil {
+		payload = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.url+path, payload)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, failure(6, "connection", "could not reach the coordinator")
+	}
+	defer resp.Body.Close()
+	const limit = 1 << 30
+	result, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil || len(result) > limit {
+		return nil, failure(6, "response", "cannot read the coordinator response")
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, c.responseError(resp.StatusCode, result)
+	}
+	return result, nil
+}
+
 func (c *apiClient) responseError(status int, data []byte) error {
 	detail := &cliError{Status: status, Code: "http_error", Message: http.StatusText(status), exit: 1}
 	var reply struct {

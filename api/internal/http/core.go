@@ -85,6 +85,9 @@ func registerCoreWithIdentity(mux *http.ServeMux, e *core.Engine, idStore *ident
 				}
 			}
 		}
+		// Clients can never self-declare managed infrastructure.
+		input.ManagedInfra = false
+		input.ExtraTmpfs = nil
 		if err := input.Normalize(); err != nil {
 			apierr.WriteError(w, http.StatusBadRequest, "invalid_workload", err.Error())
 			return

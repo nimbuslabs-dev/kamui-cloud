@@ -368,11 +368,14 @@ func (s *Store) runBuild(input buildInput) {
 	_, _ = s.db.ExecContext(ctx, "UPDATE builds SET status='building' WHERE id=?", input.Build.ID)
 
 	var result buildResult
+	// The target tag is computed up front so the recorded revision image is
+	// the tag actually applied to the built image.
+	targetTag := fmt.Sprintf("kamui-deploy/%s:%d", input.Deployment.Name, input.Build.Revision)
 	switch input.Deployment.SourceKind {
 	case "git":
-		result = s.builder.BuildFromGit(ctx, input.Deployment.SourceRef, input.Commit, input.GitToken, input.Deployment.BuildImage)
+		result = s.builder.BuildFromGit(ctx, input.Deployment.SourceRef, input.Commit, input.GitToken, targetTag)
 	case "dockerfile":
-		result = s.builder.BuildFromDockerfile(ctx, input.Dockerfile, input.Deployment.BuildImage)
+		result = s.builder.BuildFromDockerfile(ctx, input.Dockerfile, targetTag)
 	case "image":
 		result = s.builder.ResolveImage(ctx, input.Deployment.SourceRef)
 	default:
@@ -391,7 +394,7 @@ func (s *Store) runBuild(input buildInput) {
 	revID := strings.ReplaceAll(newID("rev"), "-", "")
 	_, err := s.db.ExecContext(ctx,
 		"INSERT INTO deployment_revisions(id,deployment_id,revision,image,image_digest,source_commit,workload_id,state,note,created_by,created_at) VALUES(?,?,?,?,?,?,?,'built',?,?,?)",
-		revID, input.Deployment.ID, next, imageTag, result.Digest, input.Build.CommitSHA, "", input.Build.CreatedBy, s.now().UnixNano())
+		revID, input.Deployment.ID, next, imageTag, result.Digest, input.Build.CommitSHA, "", input.Build.CreatedBy, s.now().UnixNano(), s.now().UnixNano())
 	if err != nil {
 		slog.Error("record deployment revision", "error", err)
 		return

@@ -1,13 +1,15 @@
 package core
 
 import (
-	"archive/tar"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +18,7 @@ import (
 	"github.com/distribution/reference"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/errdefs"
 )
@@ -34,12 +37,32 @@ type ExecutionRef struct {
 	Attempt    int    `json:"attempt"`
 }
 
+// VolumeBinding mounts a managed named volume at an in-container path.
+type VolumeBinding struct {
+	Name   string `json:"name"`
+	Target string `json:"target"`
+}
+
 type ContainerSpec struct {
-	Image       string   `json:"image"`
-	Args        []string `json:"args"`
-	CPUMillis   int64    `json:"cpu_millis"`
-	MemoryBytes int64    `json:"memory_bytes"`
-	Outputs     []string `json:"outputs,omitempty"`
+	Image       string            `json:"image"`
+	Args        []string          `json:"args"`
+	CPUMillis   int64             `json:"cpu_millis"`
+	MemoryBytes int64             `json:"memory_bytes"`
+	Env         map[string]string `json:"env,omitempty"`
+	Outputs     []string          `json:"outputs,omitempty"`
+	Volumes     []VolumeBinding   `json:"volumes,omitempty"`
+	// RunAsUser overrides the forced nonroot UID for managed infrastructure
+	// images whose entrypoints initialize state directories (e.g. PostgreSQL).
+	// Empty means the image default. Batch and user workloads are always
+	// forced to 65534:65534 regardless of this field.
+	RunAsUser  string   `json:"run_as_user,omitempty"`
+	ExtraTmpfs []string `json:"extra_tmpfs,omitempty"`
+	// CapAdd grants narrowly scoped capabilities to managed infrastructure
+	// images (e.g. CHOWN/FOWNER for state directory initialization).
+	CapAdd []string `json:"cap_add,omitempty"`
+	// Network joins the container to an existing docker network (the private
+	// project profile). Empty keeps the isolated "none" profile.
+	Network string `json:"network,omitempty"`
 }
 
 type ExecutionStatus struct {
@@ -63,6 +86,8 @@ type DockerCapacity struct {
 type DockerExecutor struct {
 	client *client.Client
 	scope  string
+	// outputRoot stages declared workload outputs; nil disables output mounts.
+	outputRoot string
 	// Serialize inspect-and-mutate operations so a second Start cannot restart a completed attempt.
 	mutations sync.Mutex
 }
@@ -73,6 +98,11 @@ func NewDockerExecutor(cli *client.Client, scope string) (*DockerExecutor, error
 	}
 	return &DockerExecutor{client: cli, scope: scope}, nil
 }
+
+// SetOutputRoot configures the coordinator-managed output staging root. Paths
+// are created per attempt with world-writable mode so nonroot workloads can
+// write; only the coordinator reads them back.
+func (d *DockerExecutor) SetOutputRoot(root string) { d.outputRoot = root }
 
 func (d *DockerExecutor) Capacity(ctx context.Context) (DockerCapacity, error) {
 	info, err := d.client.Info(ctx)
@@ -98,6 +128,70 @@ func (d *DockerExecutor) Capacity(ctx context.Context) (DockerCapacity, error) {
 	return DockerCapacity{
 		ID: info.ID, OS: info.OSType, Arch: arch, LogicalCPUs: info.NCPU, MemoryTotalBytes: info.MemTotal,
 	}, nil
+}
+
+// outputDir prepares the per-attempt output staging directory.
+func (d *DockerExecutor) outputDir(ref ExecutionRef) string {
+	if d.outputRoot == "" || strings.ContainsRune(ref.WorkloadID, '/') {
+		return ""
+	}
+	dir := filepath.Join(d.outputRoot, "outputs", fmt.Sprintf("%s-%d", ref.WorkloadID, ref.Attempt))
+	if err := os.MkdirAll(dir, 0777); err != nil {
+		return ""
+	}
+	return dir
+}
+
+// CollectOutput reads one declared output file from an exited attempt's
+// output staging directory.
+func (d *DockerExecutor) CollectOutput(ctx context.Context, workloadID string, attempt int, containerPath string) ([]byte, error) {
+	if workloadID == "" || len(workloadID) > 128 || strings.ContainsRune(workloadID, 0) || attempt < 1 {
+		return nil, errors.New("invalid output lookup")
+	}
+	if !strings.HasPrefix(containerPath, "/out/") && containerPath != "/out" {
+		return nil, errors.New("outputs must live under /out/")
+	}
+	base := d.outputDir(ExecutionRef{WorkloadID: workloadID, Attempt: attempt})
+	if base == "" {
+		return nil, errors.New("output staging is not configured")
+	}
+	rel := strings.TrimPrefix(containerPath, "/out/")
+	target := filepath.Join(base, rel)
+	if !strings.HasPrefix(filepath.Clean(target), filepath.Clean(base)+string(os.PathSeparator)) {
+		return nil, errors.New("output path escapes the staging directory")
+	}
+	data, err := os.ReadFile(target)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("output %s was not produced", containerPath)
+	}
+	return data, err
+}
+
+// ensureNetwork idempotently creates a labeled private network.
+func (d *DockerExecutor) ensureNetwork(ctx context.Context, name string) error {
+	if _, err := d.client.NetworkInspect(ctx, name, network.InspectOptions{}); err == nil {
+		return nil
+	} else if !errdefs.IsNotFound(err) {
+		return err
+	}
+	_, err := d.client.NetworkCreate(ctx, name, network.CreateOptions{
+		Labels: map[string]string{scopeLabel: d.scope, "dev.nimbuslabs.kamui.managed": "1"},
+	})
+	return err
+}
+
+// sortedEnv produces a deterministic environment for reproducible containers.
+func sortedEnv(env map[string]string) []string {
+	keys := make([]string, 0, len(env))
+	for key := range env {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, key+"="+env[key])
+	}
+	return out
 }
 
 func (d *DockerExecutor) name(ref ExecutionRef) string {
@@ -148,10 +242,40 @@ func (d *DockerExecutor) Create(ctx context.Context, ref ExecutionRef, spec Cont
 	if err != nil {
 		return fmt.Errorf("inspect workload image: %w", err)
 	}
-	if image.Os != "linux" || image.Config == nil || len(image.Config.Volumes) != 0 || image.ID == "" {
-		return fmt.Errorf("%w: workload requires a Linux image without declared volumes", ErrInvalidContainer)
+	if image.Os != "linux" || image.Config == nil || image.ID == "" {
+		return fmt.Errorf("%w: workload requires a Linux image", ErrInvalidContainer)
+	}
+	if len(image.Config.Volumes) != 0 {
+		// Images with declared volumes are stateful services; every declared
+		// path must be covered by a managed volume binding, otherwise the
+		// container would write unmanaged state.
+		covered := map[string]bool{}
+		for _, volume := range spec.Volumes {
+			covered[volume.Target] = true
+		}
+		for declaredPath := range image.Config.Volumes {
+			if !covered[declaredPath] {
+				return fmt.Errorf("%w: image declares volume %s which the workload does not cover with a managed volume", ErrInvalidContainer, declaredPath)
+			}
+		}
 	}
 	cfg, host := d.containerConfig(ref, spec, image.ID)
+	// The engine computes the user: forced nonroot for user workloads, the
+	// image default for declared managed infrastructure.
+	cfg.User = spec.RunAsUser
+	host.CapAdd = spec.CapAdd
+	for _, tmpfs := range spec.ExtraTmpfs {
+		parts := strings.SplitN(tmpfs, ":", 2)
+		if len(parts) == 2 {
+			host.Tmpfs[parts[0]] = parts[1]
+		}
+	}
+	if spec.Network != "" {
+		if err := d.ensureNetwork(ctx, spec.Network); err != nil {
+			return fmt.Errorf("prepare project network: %w", err)
+		}
+		host.NetworkMode = container.NetworkMode(spec.Network)
+	}
 	_, err = d.client.ContainerCreate(ctx, cfg, host, nil, nil, d.name(ref))
 	if errdefs.IsConflict(err) {
 		existing, findErr := d.find(ctx, ref)
@@ -171,16 +295,24 @@ func (d *DockerExecutor) containerConfig(ref ExecutionRef, spec ContainerSpec, i
 	cfg := &container.Config{
 		Image: imageID,
 		Cmd:   spec.Args,
+		Env:   sortedEnv(spec.Env),
 		User:  "65534:65534",
 		Labels: map[string]string{
 			scopeLabel: d.scope, workloadLabel: ref.WorkloadID, attemptLabel: strconv.Itoa(ref.Attempt),
 		},
 	}
+	volumeBinds := []string{}
+	for _, volume := range spec.Volumes {
+		volumeBinds = append(volumeBinds, fmt.Sprintf("%s:%s", volume.Name, volume.Target))
+	}
 	outputBinds := []string{}
-	if len(spec.Outputs) > 0 {
-		// An assignment-scoped scratch volume collects declared outputs; the
-		// workload itself never sees a host path.
-		outputBinds = append(outputBinds, fmt.Sprintf("kamui-out-%s-%d:/out", ref.WorkloadID, ref.Attempt))
+	if len(spec.Outputs) > 0 && d.outputRoot != "" {
+		// An assignment-scoped, coordinator-managed staging directory collects
+		// declared outputs; the workload never chooses the host path.
+		dir := d.outputDir(ref)
+		if dir != "" {
+			outputBinds = append(outputBinds, fmt.Sprintf("%s:/out", dir))
+		}
 	}
 	host := &container.HostConfig{
 		Init:           &init,
@@ -188,7 +320,7 @@ func (d *DockerExecutor) containerConfig(ref ExecutionRef, spec ContainerSpec, i
 		ReadonlyRootfs: true,
 		CapDrop:        []string{"ALL"},
 		SecurityOpt:    []string{"no-new-privileges:true"},
-		Binds:          outputBinds,
+		Binds:          append(volumeBinds, outputBinds...),
 		Tmpfs:          map[string]string{"/tmp": "rw,nosuid,nodev,noexec,size=32m,mode=1777"},
 		Resources: container.Resources{
 			NanoCPUs: spec.CPUMillis * 1_000_000, Memory: spec.MemoryBytes, MemorySwap: spec.MemoryBytes,
@@ -303,45 +435,6 @@ func readDockerLogs(logs io.Reader) (string, error) {
 		}
 	}
 	return output.String() + "\n[log output truncated]\n", nil
-}
-
-// CollectOutput reads one declared output file from an exited attempt's
-// output volume through the container's /out mount.
-func (d *DockerExecutor) CollectOutput(ctx context.Context, workloadID string, attempt int, containerPath string) ([]byte, error) {
-	if workloadID == "" || len(workloadID) > 128 || strings.ContainsRune(workloadID, 0) || attempt < 1 {
-		return nil, errors.New("invalid output lookup")
-	}
-	if !strings.HasPrefix(containerPath, "/out/") && containerPath != "/out" {
-		return nil, errors.New("outputs must live under /out/")
-	}
-	ref := ExecutionRef{WorkloadID: workloadID, Attempt: attempt}
-	inspected, err := d.find(ctx, ref)
-	if err != nil || inspected.ContainerJSONBase == nil {
-		return nil, errors.New("the attempt container is no longer present")
-	}
-	reader, _, err := d.client.CopyFromContainer(ctx, inspected.ID, containerPath)
-	if err != nil {
-		return nil, fmt.Errorf("collect output %s: %w", containerPath, err)
-	}
-	defer reader.Close()
-	// CopyFromContainer yields a tar stream; extract the first regular file.
-	tarReader := tar.NewReader(reader)
-	for {
-		header, err := tarReader.Next()
-		if err == io.EOF {
-			return nil, errors.New("output is empty")
-		}
-		if err != nil {
-			return nil, err
-		}
-		if header.Typeflag == tar.TypeReg {
-			data, err := io.ReadAll(io.LimitReader(tarReader, maxLogBytes))
-			if err != nil {
-				return nil, err
-			}
-			return data, nil
-		}
-	}
 }
 
 // ContainerServiceAddress resolves the IP a workload's container holds on its

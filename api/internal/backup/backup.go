@@ -81,7 +81,11 @@ func (s *Store) backupPath(id string) (string, error) {
 	if len(id) < 8 || strings.ContainsAny(id, "/\\.") {
 		return "", ErrBadInput
 	}
-	return filepath.Join(s.root, "backups", id+".bin"), nil
+	path := filepath.Join(s.root, "backups", id+".bin")
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 // CreateMetadataBackup produces a consistent SQLite snapshot via VACUUM INTO,

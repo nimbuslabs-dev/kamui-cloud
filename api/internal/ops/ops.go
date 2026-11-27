@@ -367,6 +367,16 @@ var engineImages = map[string]string{
 	"postgres": "postgres:17-alpine",
 }
 
+// EngineDataPath is the engine's declared data volume path.
+func EngineDataPath(engine string) string {
+	switch engine {
+	case "postgres":
+		return "/var/lib/postgresql/data"
+	default:
+		return "/var/lib/data"
+	}
+}
+
 // EngineProbe derives the readiness check for a database engine.
 func EngineProbe(engine string) core.HealthCheck {
 	switch engine {
@@ -396,7 +406,7 @@ func (s *Store) CreateDatabase(ctx context.Context, projectID, name, engine, ver
 			"POSTGRES_INITDB_ARGS": "--data-checksums",
 		},
 		Network:     "private",
-		Volumes:     []core.VolumeRequest{{Name: volume}},
+		Volumes:     []core.VolumeRequest{{Name: volume, Target: EngineDataPath(engine)}},
 		HealthCheck: ptr(EngineProbe(engine)),
 	}
 	submission.Resources = resources
@@ -407,6 +417,10 @@ func (s *Store) CreateDatabase(ctx context.Context, projectID, name, engine, ver
 		submission.Resources.MemoryBytes = 512 << 20
 	}
 	submission.SetScope(projectID, actor)
+	if engine == "postgres" {
+		submission.MarkManagedInfra([]string{"/run/postgresql:rw,nosuid,nodev,size=16m,mode=0770,uid=70,gid=70"})
+		submission.ManagedCaps = []string{"CHOWN", "FOWNER", "DAC_OVERRIDE", "SETUID", "SETGID"}
+	}
 	if err := submission.Normalize(); err != nil {
 		return Database{}, fmt.Errorf("%w: %v", ErrBadInput, err)
 	}

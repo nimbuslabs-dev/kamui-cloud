@@ -677,11 +677,10 @@ func (s *Store) BuildEnvelope(ctx context.Context, projectID string, submission 
 	return envelope, problems, nil
 }
 
-// ProjectNetworkName derives the per-project Docker network name used by the
-// private service profile.
+// ProjectNetworkName delegates to the core derivation so every executor and
+// the scheduler agree on the private network name.
 func ProjectNetworkName(projectID string) string {
-	sum := sha256.Sum256([]byte("kamui-project:" + projectID))
-	return "kamui-net-" + hex.EncodeToString(sum[:8])
+	return core.ProjectNetworkName(projectID)
 }
 
 // MarshalEnvelope serializes the envelope for the durable report queue path.

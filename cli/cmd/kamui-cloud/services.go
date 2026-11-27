@@ -32,8 +32,8 @@ func (a *app) deployCommand() *cobra.Command {
 	group := &cobra.Command{Use: "deploy", Short: "Build and host web applications"}
 	project := group.PersistentFlags()
 	project.StringVar(&svcProjectFlag, "project", "", "Project ID")
-	group.AddCommand(&cobra.Command{
-		Use:   "create NAME --source git|dockerfile|image [--source-ref URL|IMAGE] [--placement auto|manual|preferred] [--node ID] [--cpu-millis N] [--memory-bytes N] [--env K=V]...",
+	create := &cobra.Command{
+		Use:   "create NAME",
 		Short: "Declare a deployment", Args: usageArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			source, _ := cmd.Flags().GetString("source")
@@ -58,7 +58,15 @@ func (a *app) deployCommand() *cobra.Command {
 			}
 			return a.serviceSend(cmd, "POST", svcProjectPath("/deployments"), body)
 		},
-	})
+	}
+	create.Flags().String("source", "", "Deployment source: git, dockerfile or image")
+	create.Flags().String("source-ref", "", "Git URL for git source; image reference for image source")
+	create.Flags().String("placement", "auto", "auto, manual or preferred")
+	create.Flags().String("node", "", "Worker ID for manual placement")
+	create.Flags().Int64("cpu-millis", 0, "CPU request in millicores")
+	create.Flags().Int64("memory-bytes", 0, "Memory request in bytes")
+	create.Flags().StringArray("env", nil, "Environment entry KEY=VALUE (values may reference secret:NAME)")
+	group.AddCommand(create)
 	group.AddCommand(&cobra.Command{
 		Use: "list", Short: "List deployments", Args: usageArgs(cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -83,6 +91,27 @@ func (a *app) deployCommand() *cobra.Command {
 		})
 	}
 	group.AddCommand(&cobra.Command{
+		Use: "build DEPLOYMENT [--commit SHA] [--dockerfile CONTENT]", Short: "Trigger a build",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			commit, _ := cmd.Flags().GetString("commit")
+			dockerfile, _ := cmd.Flags().GetString("dockerfile")
+			body := map[string]any{}
+			if commit != "" {
+				body["commit"] = commit
+			}
+			if dockerfile != "" {
+				body["dockerfile"] = dockerfile
+			}
+			return a.serviceSend(cmd, "POST", svcProjectPath("/deployments/"+args[0]+"/builds"), body)
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "release DEPLOYMENT REVISION", Short: "Release a built revision", Args: usageArgs(cobra.ExactArgs(2)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "POST", svcProjectPath("/deployments/"+args[0]+"/revisions/"+args[1]+"/release"), map[string]any{})
+		},
+	})
+	group.AddCommand(&cobra.Command{
 		Use: "rollback DEPLOYMENT", Short: "Roll back to the previous healthy revision", Args: usageArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return a.serviceSend(cmd, "POST", svcProjectPath("/deployments/"+args[0]+"/rollback"), map[string]any{})
@@ -106,7 +135,7 @@ func (a *app) deployCommand() *cobra.Command {
 // --- Store -----------------------------------------------------------------
 
 func (a *app) storeCommand() *cobra.Command {
-	group := &cobra.Command{Use: "store", Short: "Project object storage"}
+	group := addProjectFlag(&cobra.Command{Use: "store", Short: "Project object storage"})
 	bucket := &cobra.Command{Use: "bucket", Short: "Manage buckets"}
 	bucket.AddCommand(&cobra.Command{
 		Use: "create NAME", Short: "Create a bucket", Args: usageArgs(cobra.ExactArgs(1)),
@@ -138,8 +167,8 @@ func (a *app) storeCommand() *cobra.Command {
 			if err != nil {
 				return failure(1, "upload_failed", "cannot read the file")
 			}
-			result, err := client.request(cmd.Context(), "PUT",
-				svcProjectPath("/buckets/"+args[0]+"/objects/"+args[1]), data, "")
+			result, err := client.rawRequest(cmd.Context(), "PUT",
+				svcProjectPath("/buckets/"+args[0]+"/objects/"+args[1]), data)
 			if err != nil {
 				return err
 			}
@@ -153,19 +182,8 @@ func (a *app) storeCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			raw, err := client.request(cmd.Context(), "GET",
-				svcProjectPath("/buckets/"+args[0]+"/objects/"+args[1]+"?metadata=true"), nil, "")
-			if err != nil {
-				return err
-			}
-			var meta struct {
-				Checksum string `json:"checksum"`
-				Size     int64  `json:"size_bytes"`
-			}
-			_ = json.Unmarshal(raw, &meta)
-			_ = meta
-			data, err := client.request(cmd.Context(), "GET",
-				svcProjectPath("/buckets/"+args[0]+"/objects/"+args[1]), nil, "")
+			data, err := client.rawRequest(cmd.Context(), "GET",
+				svcProjectPath("/buckets/"+args[0]+"/objects/"+args[1]), nil)
 			if err != nil {
 				return err
 			}
@@ -195,11 +213,11 @@ func (a *app) storeCommand() *cobra.Command {
 // --- Backup ------------------------------------------------------------------
 
 func (a *app) backupCommand() *cobra.Command {
-	group := &cobra.Command{Use: "backup", Short: "Back up and restore Kamui state"}
+	group := addProjectFlag(&cobra.Command{Use: "backup", Short: "Back up and restore Kamui state"})
 	group.AddCommand(&cobra.Command{
 		Use: "create metadata", Short: "Snapshot coordinator metadata (admin)", Args: usageArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return a.serviceSend(cmd, "POST", "/backups/metadata", map[string]any{})
+			return a.serviceSend(cmd, "POST", "/v1/backups/metadata", map[string]any{})
 		},
 	})
 	group.AddCommand(&cobra.Command{
@@ -221,13 +239,13 @@ func (a *app) backupCommand() *cobra.Command {
 	group.AddCommand(&cobra.Command{
 		Use: "list", Short: "List backups", Args: usageArgs(cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return a.serviceSend(cmd, "GET", "/backups"+svcProjectSuffix(), nil)
+			return a.serviceSend(cmd, "GET", "/v1/backups"+svcProjectSuffix(), nil)
 		},
 	})
 	group.AddCommand(&cobra.Command{
 		Use: "inspect BACKUP", Short: "Show backup metadata", Args: usageArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return a.serviceSend(cmd, "GET", "/backups/"+args[0], nil)
+			return a.serviceSend(cmd, "GET", "/v1/backups/"+args[0], nil)
 		},
 	})
 	group.AddCommand(&cobra.Command{
@@ -237,7 +255,7 @@ func (a *app) backupCommand() *cobra.Command {
 			if destination == "" {
 				return failure(2, "usage", "--destination is required and must be an isolated directory")
 			}
-			return a.serviceSend(cmd, "POST", "/backups/"+args[0]+"/restore", map[string]any{"destination": destination})
+			return a.serviceSend(cmd, "POST", "/v1/backups/"+args[0]+"/restore", map[string]any{"destination": destination})
 		},
 	})
 	return group
@@ -246,10 +264,11 @@ func (a *app) backupCommand() *cobra.Command {
 // --- Train --------------------------------------------------------------------
 
 func (a *app) trainCommand() *cobra.Command {
-	group := &cobra.Command{Use: "train", Short: "Run training workloads"}
-	group.AddCommand(&cobra.Command{
-		Use:   "submit NAME IMAGE -- [args...] [--dataset ARTIFACT_ID] [--cpu-millis N] [--memory-bytes N] [--gpus N]",
-		Short: "Submit a training job", Args: func(cmd *cobra.Command, args []string) error {
+	group := addProjectFlag(&cobra.Command{Use: "train", Short: "Run training workloads"})
+	trainSubmit := &cobra.Command{
+		Use:   "submit NAME IMAGE [-- args...]",
+		Short: "Submit a training job",
+		Args: func(cmd *cobra.Command, args []string) error {
 			if len(args) < 2 {
 				return failure(2, "usage", "provide a name and an image")
 			}
@@ -273,7 +292,14 @@ func (a *app) trainCommand() *cobra.Command {
 			}
 			return a.serviceSend(cmd, "POST", svcProjectPath("/training"), body)
 		},
-	})
+	}
+	trainSubmit.Flags().String("dataset", "", "Dataset artifact ID mounted at /kamui/dataset")
+	trainSubmit.Flags().Int64("cpu-millis", 0, "CPU request in millicores")
+	trainSubmit.Flags().Int64("memory-bytes", 0, "Memory request in bytes")
+	trainSubmit.Flags().Int("gpus", 0, "GPU count requested")
+	trainSubmit.Flags().String("placement", "auto", "auto, manual or preferred")
+	trainSubmit.Flags().Int("timeout", 0, "Training timeout in seconds")
+	group.AddCommand(trainSubmit)
 	group.AddCommand(&cobra.Command{
 		Use: "list", Short: "List training jobs", Args: usageArgs(cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -331,23 +357,29 @@ func (a *app) trainCommand() *cobra.Command {
 // --- Infer ---------------------------------------------------------------------
 
 func (a *app) inferCommand() *cobra.Command {
-	group := &cobra.Command{Use: "infer", Short: "Serve models through runtime adapters"}
-	group.AddCommand(&cobra.Command{
-		Use:   "deploy NAME --runtime RUNTIME --image IMAGE [--model MODEL_ID] [--upstream URL]",
+	group := addProjectFlag(&cobra.Command{Use: "infer", Short: "Serve models through runtime adapters"})
+	inferDeploy := &cobra.Command{
+		Use:   "deploy NAME",
 		Short: "Deploy an inference service",
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			name, _ := cmd.Flags().GetString("name")
+		Args:  usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := args[0]
 			runtimeKind, _ := cmd.Flags().GetString("runtime")
 			image, _ := cmd.Flags().GetString("image")
 			model, _ := cmd.Flags().GetString("model")
 			upstream, _ := cmd.Flags().GetString("upstream")
-			if name == "" || runtimeKind == "" || image == "" {
-				return failure(2, "usage", "--name, --runtime and --image are required")
+			if runtimeKind == "" || image == "" {
+				return failure(2, "usage", "--runtime and --image are required")
 			}
 			body := map[string]any{"name": name, "runtime": runtimeKind, "image": image, "model_id": model, "upstream_url": upstream}
 			return a.serviceSend(cmd, "POST", svcProjectPath("/inference"), body)
 		},
-	})
+	}
+	inferDeploy.Flags().String("runtime", "", "ollama, llamacpp, vllm, openai-compatible or proxy")
+	inferDeploy.Flags().String("image", "", "Runtime server image")
+	inferDeploy.Flags().String("model", "", "Registered model ID")
+	inferDeploy.Flags().String("upstream", "", "Upstream endpoint for the proxy runtime")
+	group.AddCommand(inferDeploy)
 	group.AddCommand(&cobra.Command{
 		Use: "list", Short: "List inference services", Args: usageArgs(cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -411,19 +443,22 @@ func (a *app) inferCommand() *cobra.Command {
 // --- Databases -------------------------------------------------------------------
 
 func (a *app) databaseCommand() *cobra.Command {
-	group := &cobra.Command{Use: "database", Short: "Managed databases (PostgreSQL)"}
-	group.AddCommand(&cobra.Command{
-		Use: "create NAME --engine postgres", Short: "Create a managed database",
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			name, _ := cmd.Flags().GetString("name")
+	group := addProjectFlag(&cobra.Command{Use: "database", Short: "Managed databases (PostgreSQL)"})
+	dbCreate := &cobra.Command{
+		Use:   "create NAME",
+		Short: "Create a managed database",
+		Args:  usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
 			engine, _ := cmd.Flags().GetString("engine")
-			if name == "" || engine == "" {
-				return failure(2, "usage", "--name and --engine are required")
+			if engine == "" {
+				return failure(2, "usage", "--engine is required (postgres)")
 			}
-			body := map[string]any{"name": name, "engine": engine}
+			body := map[string]any{"name": args[0], "engine": engine}
 			return a.serviceSend(cmd, "POST", svcProjectPath("/databases"), body)
 		},
-	})
+	}
+	dbCreate.Flags().String("engine", "postgres", "Database engine")
+	group.AddCommand(dbCreate)
 	group.AddCommand(&cobra.Command{
 		Use: "list", Short: "List databases", Args: usageArgs(cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -480,7 +515,7 @@ func (a *app) databaseCommand() *cobra.Command {
 // --- Monitor / alerts ---------------------------------------------------------------
 
 func (a *app) monitorCommand() *cobra.Command {
-	group := &cobra.Command{Use: "monitor", Short: "Operational monitoring and alerts"}
+	group := addProjectFlag(&cobra.Command{Use: "monitor", Short: "Operational monitoring and alerts"})
 	group.AddCommand(&cobra.Command{
 		Use: "status", Short: "Queue, workers and recent placement decisions", Args: usageArgs(cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -515,8 +550,10 @@ func (a *app) monitorCommand() *cobra.Command {
 			return a.serviceSend(cmd, "GET", svcProjectPath("/alerts"), nil)
 		},
 	})
-	alert.AddCommand(&cobra.Command{
-		Use: "create --kind KIND [--target ID] [--threshold N] [--webhook URL]", Short: "Create an alert rule",
+	alertCreate := &cobra.Command{
+		Use:   "create",
+		Short: "Create an alert rule",
+		Args:  usageArgs(cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			kind, _ := cmd.Flags().GetString("kind")
 			target, _ := cmd.Flags().GetString("target")
@@ -525,7 +562,12 @@ func (a *app) monitorCommand() *cobra.Command {
 			body := map[string]any{"kind": kind, "target": target, "threshold": threshold, "webhook_url": webhook}
 			return a.serviceSend(cmd, "POST", svcProjectPath("/alerts"), body)
 		},
-	})
+	}
+	alertCreate.Flags().String("kind", "", "worker_offline, deployment_failed, workload_failed, storage_threshold, quota_exceeded or job_timeout")
+	alertCreate.Flags().String("target", "", "Optional target identifier")
+	alertCreate.Flags().Int("threshold", 0, "Optional threshold")
+	alertCreate.Flags().String("webhook", "", "Optional https webhook URL")
+	alert.AddCommand(alertCreate)
 	group.AddCommand(alert)
 	return group
 }
@@ -533,7 +575,7 @@ func (a *app) monitorCommand() *cobra.Command {
 // --- Drop -------------------------------------------------------------------------
 
 func (a *app) dropCommand() *cobra.Command {
-	group := &cobra.Command{Use: "drop", Short: "Secure file transfers"}
+	group := addProjectFlag(&cobra.Command{Use: "drop", Short: "Secure file transfers"})
 	group.AddCommand(&cobra.Command{
 		Use: "send FILE --recipient USER_ID", Short: "Send a file to a principal",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -558,7 +600,7 @@ func (a *app) dropCommand() *cobra.Command {
 				return err
 			}
 			path := fmt.Sprintf("/v1/drop/transfers?recipient=%s&filename=%s", recipient, urlQueryEscape(args[0]))
-			result, err := client.request(cmd.Context(), "POST", path, data, "")
+			result, err := client.rawRequest(cmd.Context(), "POST", path, data)
 			if err != nil {
 				return err
 			}
@@ -576,11 +618,11 @@ func (a *app) dropCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			result, err := client.request(cmd.Context(), "GET", "/v1/drop/transfers/"+args[0]+"/content", nil, "")
+			data, err := client.rawRequest(cmd.Context(), "GET", "/v1/drop/transfers/"+args[0]+"/content", nil)
 			if err != nil {
 				return err
 			}
-			return os.WriteFile(output, result, 0600)
+			return os.WriteFile(output, data, 0600)
 		},
 	})
 	group.AddCommand(&cobra.Command{
@@ -605,6 +647,12 @@ func (a *app) dropCommand() *cobra.Command {
 }
 
 // --- shared helpers -----------------------------------------------------------------
+
+// addProjectFlag attaches the shared --project selector to a service tree.
+func addProjectFlag(cmd *cobra.Command) *cobra.Command {
+	cmd.PersistentFlags().StringVar(&svcProjectFlag, "project", "", "Project ID")
+	return cmd
+}
 
 func urlQueryEscape(raw string) string {
 	return url.QueryEscape(raw)

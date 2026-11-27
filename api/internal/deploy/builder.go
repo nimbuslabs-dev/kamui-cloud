@@ -237,7 +237,7 @@ func (b *Builder) materialize(archive []byte) (string, error) {
 	return contextDir, nil
 }
 
-func (b *Builder) buildContext(ctx context.Context, contextDir, baseTag string) buildResult {
+func (b *Builder) buildContext(ctx context.Context, contextDir, tag string) buildResult {
 	tarContext, err := tarDirectory(contextDir)
 	if err != nil {
 		return buildResult{Err: err}
@@ -245,7 +245,6 @@ func (b *Builder) buildContext(ctx context.Context, contextDir, baseTag string) 
 	if int64(len(tarContext)) > MaxBuildContextBytes {
 		return buildResult{Err: fmt.Errorf("%w: build context exceeds %d bytes", ErrBadInput, MaxBuildContextBytes)}
 	}
-	tag := baseTag
 	if tag == "" {
 		tag = "kamui-build:pending"
 	}
@@ -261,12 +260,25 @@ func (b *Builder) buildContext(ctx context.Context, contextDir, baseTag string) 
 	}
 	defer result.Body.Close()
 	logStream, _ := io.ReadAll(io.LimitReader(result.Body, MaxBuildLogBytes))
-	var failure struct {
-		Error string `json:"error"`
-	}
-	_ = json.Unmarshal(logStream, &failure)
-	if failure.Error != "" {
-		return buildResult{Err: fmt.Errorf("image build failed: %s", failure.Error)}
+	// The build stream is a sequence of JSON messages; scan every line for an
+	// error entry instead of decoding the whole stream as one object.
+	for _, line := range strings.Split(string(logStream), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var entry struct {
+			Error       string `json:"error"`
+			ErrorDetail struct {
+				Message string `json:"message"`
+			} `json:"errorDetail"`
+		}
+		if json.Unmarshal([]byte(line), &entry) == nil && entry.Error != "" {
+			return buildResult{Err: fmt.Errorf("image build failed: %s", entry.Error)}
+		}
+		if json.Unmarshal([]byte(line), &entry) == nil && entry.ErrorDetail.Message != "" {
+			return buildResult{Err: fmt.Errorf("image build failed: %s", entry.ErrorDetail.Message)}
+		}
 	}
 	inspect, _, err := b.client.ImageInspectWithRaw(ctx, tag)
 	if err != nil {

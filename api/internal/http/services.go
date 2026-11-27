@@ -197,7 +197,7 @@ func (h *servicesHandler) PutObject(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	bucket, err := h.objects.GetBucket(r.Context(), projectID, bucketID)
+	bucket, err := h.objects.GetBucketByName(r.Context(), projectID, bucketID)
 	if err != nil {
 		servicesError(w, err)
 		return
@@ -225,7 +225,7 @@ func (h *servicesHandler) GetObject(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.authorize(w, r, projectID, identity.PermWorkloadRead); !ok {
 		return
 	}
-	bucket, err := h.objects.GetBucket(r.Context(), projectID, bucketID)
+	bucket, err := h.objects.GetBucketByName(r.Context(), projectID, bucketID)
 	if err != nil {
 		servicesError(w, err)
 		return
@@ -261,7 +261,7 @@ func (h *servicesHandler) DeleteObject(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	bucket, err := h.objects.GetBucket(r.Context(), projectID, bucketID)
+	bucket, err := h.objects.GetBucketByName(r.Context(), projectID, bucketID)
 	if err != nil {
 		servicesError(w, err)
 		return
@@ -283,7 +283,7 @@ func (h *servicesHandler) ListObjects(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.authorize(w, r, projectID, identity.PermWorkloadRead); !ok {
 		return
 	}
-	bucket, err := h.objects.GetBucket(r.Context(), projectID, bucketID)
+	bucket, err := h.objects.GetBucketByName(r.Context(), projectID, bucketID)
 	if err != nil {
 		servicesError(w, err)
 		return

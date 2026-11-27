@@ -52,6 +52,7 @@ func openCore(ctx context.Context, cfg *config.Config) (*core.Engine, *identity.
 			closeExecutor()
 			return nil, nil, nil, nil, nil, nil, nil, nil, err
 		}
+		local.SetOutputRoot(storageRootFor(path))
 		executor = local
 		probe = hostProbe(path)
 	case "manager":
@@ -90,6 +91,10 @@ func openCore(ctx context.Context, cfg *config.Config) (*core.Engine, *identity.
 	}
 	runtimeStore := runtime.NewStore(store.DB(), cfg.Token, storageRoot)
 	engine.Volumes = runtimeStore
+	engine.EnvResolver = func(ctx context.Context, projectID string, env map[string]string) (map[string]string, error) {
+		resolved, _, err := runtimeStore.ResolveEnv(ctx, projectID, env)
+		return resolved, err
+	}
 	if err := engine.Register(ctx); err != nil {
 		cleanup()
 		return nil, nil, nil, nil, nil, nil, nil, nil, err
@@ -131,6 +136,14 @@ func openCore(ctx context.Context, cfg *config.Config) (*core.Engine, *identity.
 		Ops: opsStore, Drop: dropStore,
 	}
 	return engine, idStore, connStore, workers, runtimeStore, deployStore, services, cleanup, nil
+}
+
+// storageRootFor derives the default storage root for a data file path.
+func storageRootFor(path string) string {
+	if root := os.Getenv("KAMUI_STORAGE_ROOT"); root != "" {
+		return root
+	}
+	return filepath.Join(filepath.Dir(path), "kamui-storage")
 }
 
 func samePath(a, b string) bool {

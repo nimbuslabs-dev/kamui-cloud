@@ -187,6 +187,19 @@ func (s *Store) ListBuckets(ctx context.Context, projectID string) ([]Bucket, er
 	return items, rows.Err()
 }
 
+// GetBucketByName resolves a bucket by its project-unique name.
+func (s *Store) GetBucketByName(ctx context.Context, projectID, name string) (Bucket, error) {
+	var bucket Bucket
+	var createdAt int64
+	err := s.db.QueryRowContext(ctx, "SELECT id,project_id,name,created_at FROM buckets WHERE project_id=? AND name=?", projectID, name).
+		Scan(&bucket.ID, &bucket.ProjectID, &bucket.Name, &createdAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Bucket{}, ErrNotFound
+	}
+	bucket.CreatedAt = time.Unix(0, createdAt).UTC()
+	return bucket, err
+}
+
 func (s *Store) GetBucket(ctx context.Context, projectID, bucketID string) (Bucket, error) {
 	var bucket Bucket
 	var createdAt int64

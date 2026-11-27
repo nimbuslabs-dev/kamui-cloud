@@ -44,6 +44,9 @@ type Engine struct {
 	// Volumes optionally provides persistent volume ownership for stateful
 	// placement constraints. nil keeps stateless scheduling behavior.
 	Volumes VolumeDirectory
+	// EnvResolver expands `secret:NAME` environment references at container
+	// create time. nil keeps environment entries as-is.
+	EnvResolver func(ctx context.Context, projectID string, env map[string]string) (map[string]string, error)
 }
 
 // VolumeDirectory is the persistent storage locality surface consulted by the
@@ -696,9 +699,32 @@ func (e *Engine) advance(ctx context.Context, w Workload, worker Worker, reserve
 			return e.Executor.Start(ctx, ref)
 		default:
 			r := w.Submission.Resources
+			bindings := make([]VolumeBinding, 0, len(w.Submission.Volumes))
+			for _, volume := range w.Submission.Volumes {
+				target := volume.Target
+				if target == "" {
+					target = "/kamui/volumes/" + volume.Name
+				}
+				bindings = append(bindings, VolumeBinding{Name: volume.Name, Target: target})
+			}
+			networkName := ""
+			if !w.Submission.NetworkIsolated() && w.Submission.Network == "private" {
+				networkName = ProjectNetworkName(w.ProjectID)
+			}
+			env := w.Submission.Env
+			if len(env) > 0 && e.EnvResolver != nil {
+				resolved, err := e.EnvResolver(ctx, w.ProjectID, env)
+				if err != nil {
+					return e.finish(ctx, w, Failed, "secret resolution failed: "+err.Error(), nil, "", false, false)
+				}
+				env = resolved
+			}
 			err := e.Executor.Create(ctx, ref, ContainerSpec{
 				Image: w.Submission.Image, Args: w.Submission.Args, CPUMillis: r.CPUMillis, MemoryBytes: r.MemoryBytes,
-				Outputs: w.Submission.Outputs,
+				Env: env, Outputs: w.Submission.Outputs, Volumes: bindings,
+				Network:   networkName,
+				RunAsUser: w.Submission.ManagedInfraUser(), ExtraTmpfs: w.Submission.ExtraTmpfs,
+				CapAdd: w.Submission.ManagedCaps,
 			})
 			if errors.Is(err, ErrInvalidContainer) {
 				return e.finish(ctx, w, Failed, err.Error(), nil, "", false, false)

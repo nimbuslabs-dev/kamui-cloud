@@ -2,6 +2,8 @@ package core
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"regexp"
@@ -242,6 +244,10 @@ type Policy struct {
 type VolumeRequest struct {
 	Name      string `json:"name"`
 	SizeBytes int64  `json:"size_bytes,omitempty"`
+	// Target overrides the in-container mount point (default
+	// /kamui/volumes/<name>); required to cover image-declared volume paths
+	// for stateful services such as managed databases.
+	Target string `json:"target,omitempty"`
 }
 
 // ArtifactMount attaches a project artifact read-only at an in-container path.
@@ -287,11 +293,39 @@ type Submission struct {
 	// HealthCheck enables worker-side readiness probing for services.
 	HealthCheck *HealthCheck `json:"health_check,omitempty"`
 
+	// ExtraTmpfs declares additional writable tmpfs mounts (managed infra).
+	ExtraTmpfs []string `json:"extra_tmpfs,omitempty"`
+	// ManagedCaps grants narrow capabilities to managed infrastructure only.
+	ManagedCaps []string `json:"managed_caps,omitempty"`
+
+	// ManagedInfra marks coordinator-declared infrastructure workloads (e.g.
+	// managed databases). The public submit handler always clears it; only
+	// coordinator-internal paths may set it.
+	ManagedInfra bool `json:"managed_infra,omitempty"`
+
 	// Scheduling scope is set by the coordinator, never by clients, and is
 	// excluded from idempotency fingerprints because it is part of the request
 	// envelope rather than the workload definition.
 	projectScopeValue string
 	submitter         string
+}
+
+// ManagedInfraUser returns the image-default user for declared infrastructure
+// workloads; ordinary workloads always run as the hardened nonroot UID.
+func (s *Submission) ManagedInfraUser() string {
+	if s.ManagedInfra {
+		return ""
+	}
+	return "65534:65534"
+}
+
+// MarkManagedInfra flags a workload as coordinator-managed infrastructure.
+func (s *Submission) MarkManagedInfra(extraTmpfs []string) {
+	s.ManagedInfra = true
+	s.ExtraTmpfs = extraTmpfs
+	if s.ManagedCaps == nil {
+		s.ManagedCaps = []string{}
+	}
 }
 
 // FallbackEnabled reports whether preferred placement may fall back to
@@ -588,6 +622,12 @@ func (s *Submission) normalizeRuntime() error {
 		if volume.SizeBytes < 0 || volume.SizeBytes > 1<<40 {
 			return errors.New("volume size must be between 0 and 1 TiB")
 		}
+		if volume.Target != "" && !validArtifactPath(volume.Target) {
+			return errors.New("volume targets must be absolute, normalized container paths")
+		}
+		if volume.Target != "" && (strings.HasPrefix(volume.Target, "/out") || strings.HasPrefix(volume.Target, "/kamui/")) {
+			return errors.New("volume targets must not shadow the /out or /kamui namespaces")
+		}
 	}
 	if len(s.Artifacts) > 8 {
 		return errors.New("at most 8 artifact mounts are allowed")
@@ -624,6 +664,13 @@ func (s *Submission) normalizeRuntime() error {
 		}
 	}
 	return nil
+}
+
+// ProjectNetworkName derives the per-project private network name used by
+// the service networking profile on every executor.
+func ProjectNetworkName(projectID string) string {
+	sum := sha256.Sum256([]byte("kamui-project:" + projectID))
+	return "kamui-net-" + hex.EncodeToString(sum[:8])
 }
 
 func validArtifactPath(path string) bool {
