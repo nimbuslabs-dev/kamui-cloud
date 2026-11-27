@@ -455,8 +455,13 @@ pub fn run_enriched(spec: &RunSpec, envelope: &AssignmentEnvelope, staged: &[(St
     // Persistent volumes mount read-write at /kamui/volumes/<name>; the
     // workload never receives a host path.
     for volume in &envelope.volumes {
+        let target = if volume.target.is_empty() {
+            format!("/kamui/volumes/{}", volume.name)
+        } else {
+            volume.target.clone()
+        };
         args.push("--mount".into());
-        args.push(format!("type=volume,source={},target=/kamui/volumes/{}", volume.name, volume.name));
+        args.push(format!("type=volume,source={},target={}", volume.name, target));
     }
     // Staged artifacts bind read-only from the worker-owned staging area.
     for (container_path, local) in staged {

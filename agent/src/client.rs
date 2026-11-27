@@ -86,6 +86,10 @@ pub struct AssignmentEnvelope {
 #[derive(Deserialize, Clone)]
 pub struct VolumeRequest {
     pub name: String,
+    /// Explicit mount point when the workload must cover an image-declared
+    /// volume path (managed databases).
+    #[serde(default)]
+    pub target: String,
     /// Advisory on the local volume driver; coordinator quotas enforce size.
     #[allow(dead_code)]
     #[serde(default)]
