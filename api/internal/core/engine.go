@@ -12,7 +12,24 @@ import (
 const (
 	heartbeatInterval = 10 * time.Second
 	leaseDuration     = 45 * time.Second
+	// remoteGrace is how long an acknowledged but silent worker assignment
+	// survives before the coordinator gives up waiting for a report.
+	remoteGrace = 45 * time.Second
 )
+
+// Cluster is the optional multi-worker scheduling surface. When nil the engine
+// keeps the single-host behavior unchanged.
+type Cluster interface {
+	// Workers returns the local worker plus every contributed worker with
+	// fresh lifecycle state, capabilities and telemetry.
+	Workers(context.Context) ([]Worker, error)
+	// SaveDecision persists an explainable placement decision.
+	SaveDecision(context.Context, PlacementDecision) error
+	// DrainReports reads durable worker reports in submission order.
+	DrainReports(context.Context, int) ([]WorkerReport, error)
+	// ReportsApplied acknowledges processed reports so they are not replayed.
+	ReportsApplied(context.Context, []int64) error
+}
 
 type Probe func(context.Context) (*Device, error)
 
@@ -22,12 +39,19 @@ type Engine struct {
 	Placement Placement
 	Probe     Probe
 	Logger    *slog.Logger
+	Cluster   Cluster
 }
 
 func newID() string {
 	var bytes [16]byte
 	rand.Read(bytes[:])
 	return "wl-" + hex.EncodeToString(bytes[:])
+}
+
+func newFence() string {
+	var bytes [16]byte
+	rand.Read(bytes[:])
+	return "f-" + hex.EncodeToString(bytes[:])
 }
 
 func NewEngine(repo Repository, executor Executor, probe Probe) *Engine {
@@ -47,6 +71,14 @@ func (e *Engine) Run(ctx context.Context) {
 		case <-ticker.C:
 		}
 	}
+}
+
+func (e *Engine) reconcile(ctx context.Context) {
+	if e.Cluster != nil {
+		e.reconcileCluster(ctx)
+		return
+	}
+	e.reconcileLocal(ctx)
 }
 
 // Register before serving requests, even when Docker or hardware probing is unavailable.
@@ -84,7 +116,7 @@ func (e *Engine) heartbeat(ctx context.Context) {
 	}
 }
 
-func (e *Engine) reconcile(ctx context.Context) {
+func (e *Engine) reconcileLocal(ctx context.Context) {
 	worker, err := e.Repo.Worker(ctx)
 	if err != nil {
 		return
@@ -122,6 +154,380 @@ func (e *Engine) reconcile(ctx context.Context) {
 	if worker.Health == "healthy" {
 		e.cleanup(ctx)
 	}
+}
+
+// reconcileCluster schedules across the local worker and contributed workers.
+// Reports are applied first so worker progress is durable before scheduling.
+func (e *Engine) reconcileCluster(ctx context.Context) {
+	e.applyReports(ctx)
+	workers, err := e.Cluster.Workers(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			e.Logger.Error("read worker directory", "error", err)
+		}
+		return
+	}
+	byID := make(map[string]Worker, len(workers))
+	for _, w := range workers {
+		if w.ID == LocalWorker && time.Since(w.Heartbeat) > leaseDuration {
+			w.Health = "unavailable"
+		}
+		byID[w.ID] = w
+	}
+	items, err := e.Repo.List(ctx, true)
+	if err != nil {
+		e.Logger.Error("list active workloads", "error", err)
+		return
+	}
+	now := time.Now().UTC()
+	reserved := make(map[string]Reservation, len(workers))
+	pressure := make(map[string]int, len(workers))
+	for _, w := range items {
+		if w.Assignment != nil {
+			r := w.Assignment.Reservation
+			res := reserved[w.Assignment.WorkerID]
+			res.CPUMillis += r.CPUMillis
+			res.MemoryBytes += r.MemoryBytes
+			reserved[w.Assignment.WorkerID] = res
+			pressure[w.Assignment.WorkerID]++
+		}
+	}
+
+	for _, w := range items {
+		if w.State != Pending {
+			continue
+		}
+		op, cancel := context.WithTimeout(ctx, 9*time.Second)
+		w.State = Queued
+		err := e.Repo.Save(op, w, false)
+		cancel()
+		if err != nil && !errors.Is(err, ErrConflict) && ctx.Err() == nil {
+			e.Logger.Warn("queue workload", "workload_id", w.ID, "error", err)
+		}
+	}
+
+	// Fair order: priority, then project share, then arrival.
+	queued := OrderQueue(items)
+	for _, w := range queued {
+		if ctx.Err() != nil {
+			return
+		}
+		choice, reason, decision := SelectPlacement(w.Submission, w.ProjectID, w.SubmitterID, workers, reserved, pressure, now)
+		decision.Attempt = w.Attempt
+		if choice == "" {
+			if reason == w.QueueReason {
+				continue
+			}
+			w.QueueReason = reason
+			op, cancel := context.WithTimeout(ctx, 9*time.Second)
+			err := e.Repo.Save(op, w, false)
+			cancel()
+			if err == nil {
+				_ = e.Cluster.SaveDecision(ctx, decision)
+			} else if !errors.Is(err, ErrConflict) && ctx.Err() == nil {
+				e.Logger.Warn("record queue reason", "workload_id", w.ID, "error", err)
+			}
+			continue
+		}
+		worker := byID[choice]
+		r := w.Submission.Resources
+		w.Attempt++
+		w.State, w.QueueReason, w.Result, w.LogTail = Assigned, "", nil, ""
+		w.Assignment = &Assignment{
+			WorkerID:    choice,
+			RuntimeID:   runtimeID(worker),
+			Attempt:     w.Attempt,
+			Fence:       newFence(),
+			LeaseUntil:  now.Add(leaseDuration),
+			Reservation: Reservation{CPUMillis: r.CPUMillis, MemoryBytes: r.MemoryBytes},
+		}
+		decision.WorkloadID = w.ID
+		decision.Attempt = w.Attempt
+		decision.Chosen = choice
+		op, cancel := context.WithTimeout(ctx, 9*time.Second)
+		err = e.Repo.Save(op, w, false)
+		cancel()
+		if err != nil {
+			if !errors.Is(err, ErrConflict) && ctx.Err() == nil {
+				e.Logger.Warn("assign workload", "workload_id", w.ID, "error", err)
+			}
+			continue
+		}
+		if derr := e.Cluster.SaveDecision(ctx, decision); derr != nil {
+			e.Logger.Error("save assignment decision", "error", derr)
+		}
+		res := reserved[choice]
+		res.CPUMillis += r.CPUMillis
+		res.MemoryBytes += r.MemoryBytes
+		reserved[choice] = res
+		pressure[choice]++
+	}
+
+	for _, w := range items {
+		if ctx.Err() != nil {
+			return
+		}
+		if w.Assignment == nil {
+			// Cancelled while queued, or still waiting on placement.
+			if w.CancelRequested && !w.State.terminal() {
+				state := Cancelled
+				if w.Submission.Kind == "service" {
+					state = Stopped
+				}
+				w.State = state
+				w.Result = &Result{Reason: "cancelled"}
+				op, cancel := context.WithTimeout(ctx, 9*time.Second)
+				err := e.Repo.Save(op, w, false)
+				cancel()
+				if err != nil && !errors.Is(err, ErrConflict) && ctx.Err() == nil {
+					e.Logger.Warn("cancel queued workload", "workload_id", w.ID, "error", err)
+				}
+			}
+			continue
+		}
+		if w.Assignment.WorkerID == LocalWorker {
+			worker := byID[LocalWorker]
+			local := reserved[LocalWorker]
+			op, cancel := context.WithTimeout(ctx, 9*time.Second)
+			err := e.advance(op, w, worker, &local)
+			cancel()
+			reserved[LocalWorker] = local
+			if err != nil && !errors.Is(err, ErrConflict) && ctx.Err() == nil {
+				e.Logger.Warn("reconcile local workload", "workload_id", w.ID, "attempt", w.Attempt, "state", w.State, "error", err)
+			}
+			continue
+		}
+		op, cancel := context.WithTimeout(ctx, 9*time.Second)
+		err := e.advanceRemote(op, w, byID[w.Assignment.WorkerID], time.Now().UTC())
+		cancel()
+		if err != nil && !errors.Is(err, ErrConflict) && ctx.Err() == nil {
+			e.Logger.Warn("reconcile remote workload", "workload_id", w.ID, "attempt", w.Attempt, "state", w.State, "error", err)
+		}
+	}
+	if byID[LocalWorker].Health == "healthy" {
+		e.cleanup(ctx)
+	}
+}
+
+func runtimeID(worker Worker) string {
+	if worker.ID == LocalWorker && worker.Runtime != nil {
+		return worker.Runtime.ID
+	}
+	return "worker:" + worker.ID
+}
+
+func (e *Engine) applyReports(ctx context.Context) {
+	reports, err := e.Cluster.DrainReports(ctx, 64)
+	if err != nil {
+		if ctx.Err() == nil {
+			e.Logger.Error("drain worker reports", "error", err)
+		}
+		return
+	}
+	if len(reports) == 0 {
+		return
+	}
+	applied := make([]int64, 0, len(reports))
+	for _, report := range reports {
+		if e.applyReport(ctx, report) {
+			applied = append(applied, report.ID)
+		}
+	}
+	if len(applied) > 0 {
+		if err := e.Cluster.ReportsApplied(ctx, applied); err != nil && ctx.Err() == nil {
+			e.Logger.Error("acknowledge worker reports", "error", err)
+		}
+	}
+}
+
+// applyReport validates fencing before mutating a workload. It reports whether
+// the report was consumed (including fenced-out and obsolete reports, which
+// must not be replayed).
+func (e *Engine) applyReport(ctx context.Context, report WorkerReport) bool {
+	w, err := e.Repo.Get(ctx, report.WorkloadID)
+	if errors.Is(err, ErrNotFound) {
+		return true
+	}
+	if err != nil {
+		return false
+	}
+	if w.Assignment == nil || w.Assignment.WorkerID != report.WorkerID ||
+		w.Assignment.Fence == "" || w.Assignment.Fence != report.Fence || w.State.terminal() {
+		return true // fenced out: a stale worker must never mutate a newer attempt
+	}
+	now := time.Now().UTC()
+	switch report.Kind {
+	case ReportRenew:
+		w.Assignment.LeaseUntil = now.Add(leaseDuration)
+		return e.saveReport(ctx, w)
+	case ReportAck:
+		if !w.Assignment.AckedAt.IsZero() {
+			return true
+		}
+		w.Assignment.AckedAt = now
+		if w.State == Assigned {
+			budget := leaseDuration
+			if w.Submission.Kind == "service" {
+				budget = time.Duration(w.Submission.Policy.TimeoutSeconds) * time.Second
+			}
+			w.Assignment.Deadline = now.Add(budget)
+			w.State = Starting
+		}
+		return e.saveReport(ctx, w)
+	case ReportStart:
+		startedAt := now
+		if report.StartedAt != nil && !report.StartedAt.IsZero() {
+			startedAt = report.StartedAt.UTC()
+		}
+		if w.Assignment.AckedAt.IsZero() {
+			w.Assignment.AckedAt = now
+		}
+		if w.State == Assigned || w.State == Starting {
+			w.State = Running
+			if w.Submission.Kind == "job" {
+				w.Assignment.Deadline = startedAt.Add(time.Duration(w.Submission.Policy.TimeoutSeconds) * time.Second)
+			}
+		}
+		w.Assignment.LeaseUntil = now.Add(leaseDuration)
+		w.LogTail = report.LogTail
+		return e.saveReport(ctx, w)
+	case ReportExit:
+		return e.finishRemote(ctx, w, report, now)
+	default:
+		return true
+	}
+}
+
+func (e *Engine) saveReport(ctx context.Context, w Workload) bool {
+	if err := e.Repo.Save(ctx, w, false); err != nil && !errors.Is(err, ErrConflict) && ctx.Err() == nil {
+		e.Logger.Warn("apply worker report", "workload_id", w.ID, "error", err)
+	}
+	return true
+}
+
+func (e *Engine) finishRemote(ctx context.Context, w Workload, report WorkerReport, now time.Time) bool {
+	code := report.ExitCode
+	var state State
+	var reason string
+	retry := false
+	switch {
+	case w.CancelRequested:
+		state, reason = Cancelled, "cancelled"
+		if w.Submission.Kind == "service" {
+			state = Stopped
+		}
+	case w.StopReason == "timeout":
+		state, reason = Failed, "timeout"
+	case !report.Started:
+		state, reason = Failed, "worker reported that the attempt never started"
+		retry = w.Attempt <= w.Submission.Policy.MaxRetries
+	case code == nil:
+		state, reason = Failed, "worker reported no exit code"
+	case *code == 0:
+		state, reason = Succeeded, ""
+	default:
+		state, reason = Failed, "nonzero exit code"
+		retry = w.Attempt <= w.Submission.Policy.MaxRetries
+	}
+	w.State, w.Assignment, w.StopReason = state, nil, ""
+	w.Result = &Result{ExitCode: code, Reason: reason}
+	w.LogTail = report.LogTail
+	if retry {
+		w.State, w.QueueReason = Queued, "retry after "+reason
+	}
+	if err := e.Repo.Save(ctx, w, false); err != nil && !errors.Is(err, ErrConflict) && ctx.Err() == nil {
+		e.Logger.Warn("finish remote attempt", "workload_id", w.ID, "error", err)
+	} else if err == nil {
+		e.Logger.Info("remote attempt finished", "workload_id", w.ID, "attempt", w.Attempt, "state", w.State, "reason", reason)
+	}
+	return true
+}
+
+// advanceRemote drives the remote half of the assignment lifecycle: cancel
+// intent, lease expiry before acknowledgement, deadlines and lost workers.
+func (e *Engine) advanceRemote(ctx context.Context, w Workload, worker Worker, now time.Time) error {
+	if w.Assignment == nil {
+		return nil
+	}
+	if w.CancelRequested {
+		if w.State == Assigned && w.Assignment.AckedAt.IsZero() {
+			state := Cancelled
+			if w.Submission.Kind == "service" {
+				state = Stopped
+			}
+			w.State, w.Assignment = state, nil
+			w.Result = &Result{Reason: "cancelled"}
+			return e.Repo.Save(ctx, w, false)
+		}
+		if w.State != Stopping {
+			w.State, w.StopReason = Stopping, "cancelled"
+			return e.Repo.Save(ctx, w, false)
+		}
+	}
+	online := workerActive(worker, now)
+	switch w.State {
+	case Assigned:
+		if now.After(w.Assignment.LeaseUntil) {
+			if w.Attempt <= w.Submission.Policy.MaxRetries+3 {
+				w.State, w.Assignment = Queued, nil
+				w.QueueReason = "assignment expired before the worker acknowledged it"
+				return e.Repo.Save(ctx, w, false)
+			}
+			w.State, w.Assignment = Failed, nil
+			w.Result = &Result{Reason: "repeatedly failed to reach an acknowledging worker"}
+			return e.Repo.Save(ctx, w, false)
+		}
+		return nil
+	case Starting, Running, Unhealthy:
+		if w.Submission.Kind == "job" && now.After(w.Assignment.Deadline) ||
+			w.Submission.Kind == "service" && w.State == Starting && now.After(w.Assignment.Deadline) {
+			w.State, w.StopReason = Stopping, "timeout"
+			return e.Repo.Save(ctx, w, false)
+		}
+		if !online && now.After(w.Assignment.LeaseUntil.Add(remoteGrace)) {
+			return e.finishLostWorker(ctx, w)
+		}
+		return nil
+	case Stopping:
+		if !online && now.After(w.Assignment.LeaseUntil.Add(remoteGrace)) {
+			return e.finishLostWorker(ctx, w)
+		}
+		return nil
+	}
+	return nil
+}
+
+func workerActive(worker Worker, now time.Time) bool {
+	if worker.ID == "" {
+		return false
+	}
+	return now.Sub(worker.Heartbeat) <= OfflineAfter &&
+		(worker.State == WorkerStateOnline || worker.State == WorkerStateDraining)
+}
+
+// finishLostWorker ends an assignment without confirmation. Lost contact after
+// an attempt started is never retried automatically: side effects may have
+// happened and duplicating them is worse than reporting the loss.
+func (e *Engine) finishLostWorker(ctx context.Context, w Workload) error {
+	var state State
+	var reason string
+	if w.CancelRequested || w.StopReason == "cancelled" {
+		state, reason = Cancelled, "cancelled"
+		if w.Submission.Kind == "service" {
+			state = Stopped
+		}
+	} else if w.StopReason == "timeout" {
+		state, reason = Failed, "timeout"
+	} else {
+		state, reason = Failed, "worker lost contact during execution; not retried to avoid duplicate side effects"
+	}
+	w.State, w.Assignment, w.StopReason = state, nil, ""
+	w.Result = &Result{Reason: reason}
+	if err := e.Repo.Save(ctx, w, false); err != nil {
+		return err
+	}
+	e.Logger.Warn("worker lost contact", "workload_id", w.ID, "attempt", w.Attempt, "state", state)
+	return nil
 }
 
 func (e *Engine) cleanup(ctx context.Context) {

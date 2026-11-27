@@ -24,7 +24,10 @@ var schema001 string
 //go:embed migrations/002.sql
 var schema002 string
 
-const LatestSchemaVersion = 2
+//go:embed migrations/003.sql
+var schema003 string
+
+const LatestSchemaVersion = 3
 
 type Repository interface {
 	EventReader
@@ -113,6 +116,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	}{
 		{1, schema001},
 		{2, schema002},
+		{3, schema003},
 	}
 	for _, migration := range migrations {
 		if version < migration.version {
@@ -153,6 +157,10 @@ func (s *Store) Submit(ctx context.Context, spec Submission, key string) (Worklo
 }
 
 func (s *Store) SubmitForProject(ctx context.Context, projectID string, spec Submission, key string) (Workload, bool, error) {
+	return s.SubmitForProjectAs(ctx, projectID, "", spec, key)
+}
+
+func (s *Store) SubmitForProjectAs(ctx context.Context, projectID, submitterID string, spec Submission, key string) (Workload, bool, error) {
 	var zero Workload
 	if projectID == "" {
 		projectID = defaultProject
@@ -188,13 +196,14 @@ func (s *Store) SubmitForProject(ctx context.Context, projectID string, spec Sub
 		return zero, false, ErrLimit
 	}
 	now := time.Now().UTC()
-	w := Workload{ID: newID(), ProjectID: projectID, Submission: spec, State: Pending, CreatedAt: now, UpdatedAt: now, Revision: 1}
+	w := Workload{ID: newID(), ProjectID: projectID, SubmitterID: submitterID, Submission: spec, State: Pending, CreatedAt: now, UpdatedAt: now, Revision: 1}
 	snapshot, err := json.Marshal(w)
 	if err != nil {
 		return zero, false, err
 	}
-	_, err = tx.ExecContext(ctx, "INSERT INTO workloads(id,project_id,idempotency_key,fingerprint,state,created_at,revision,snapshot) VALUES(?,?,?,?,?,?,?,?)",
-		w.ID, w.ProjectID, key, fingerprint, w.State, now.UnixNano(), w.Revision, snapshot)
+	_, err = tx.ExecContext(ctx,
+		"INSERT INTO workloads(id,project_id,idempotency_key,fingerprint,state,created_at,revision,snapshot,worker_id,priority,placement) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+		w.ID, w.ProjectID, key, fingerprint, w.State, now.UnixNano(), w.Revision, snapshot, "", w.Submission.Priority, w.Submission.Placement)
 	if err != nil {
 		return zero, false, err
 	}
@@ -275,7 +284,12 @@ func (s *Store) Save(ctx context.Context, w Workload, cleanup bool) error {
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, "UPDATE workloads SET snapshot=?, state=?, log_tail=?, revision=revision+1 WHERE id=?", snapshot, w.State, w.LogTail, w.ID)
+	workerID := ""
+	if w.Assignment != nil {
+		workerID = w.Assignment.WorkerID
+	}
+	_, err = tx.ExecContext(ctx, "UPDATE workloads SET snapshot=?, state=?, log_tail=?, revision=revision+1, worker_id=?, priority=?, placement=? WHERE id=?",
+		snapshot, w.State, w.LogTail, workerID, w.Submission.Priority, w.Submission.Placement, w.ID)
 	if err != nil {
 		return err
 	}
@@ -386,4 +400,79 @@ func (s *Store) Cleanup(ctx context.Context) ([]ExecutionRef, error) {
 func (s *Store) Cleaned(ctx context.Context, ref ExecutionRef) error {
 	_, err := s.db.ExecContext(ctx, "DELETE FROM execution_cleanup WHERE workload_id=? AND attempt=?", ref.WorkloadID, ref.Attempt)
 	return err
+}
+
+func (s *Store) SaveDecision(ctx context.Context, d PlacementDecision) error {
+	candidates, err := json.Marshal(d.Candidates)
+	if err != nil {
+		return err
+	}
+	var chosen any
+	if d.Chosen != "" {
+		chosen = d.Chosen
+	}
+	_, err = s.db.ExecContext(ctx,
+		"INSERT INTO placement_decisions(workload_id,attempt,mode,chosen_worker,explanation,candidates,at) VALUES(?,?,?,?,?,?,?)",
+		d.WorkloadID, d.Attempt, d.Mode, chosen, d.Explanation, candidates, d.At.UnixNano())
+	return err
+}
+
+func (s *Store) Decisions(ctx context.Context, workloadID string) ([]PlacementDecision, error) {
+	rows, err := s.db.QueryContext(ctx,
+		"SELECT attempt,mode,chosen_worker,explanation,candidates,at FROM placement_decisions WHERE workload_id=? ORDER BY id DESC LIMIT 50", workloadID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	decisions := make([]PlacementDecision, 0)
+	for rows.Next() {
+		var d PlacementDecision
+		var chosen *string
+		var at int64
+		var candidates []byte
+		if err := rows.Scan(&d.Attempt, &d.Mode, &chosen, &d.Explanation, &candidates, &at); err != nil {
+			return nil, err
+		}
+		if chosen != nil {
+			d.Chosen = *chosen
+		}
+		if err := json.Unmarshal(candidates, &d.Candidates); err != nil {
+			return nil, err
+		}
+		d.WorkloadID = workloadID
+		d.At = time.Unix(0, at).UTC()
+		decisions = append(decisions, d)
+	}
+	return decisions, rows.Err()
+}
+
+func (s *Store) RecentDecisions(ctx context.Context, limit int) ([]PlacementDecision, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	rows, err := s.db.QueryContext(ctx,
+		"SELECT workload_id,attempt,mode,chosen_worker,explanation,candidates,at FROM placement_decisions ORDER BY id DESC LIMIT ?", limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	decisions := make([]PlacementDecision, 0)
+	for rows.Next() {
+		var d PlacementDecision
+		var chosen *string
+		var at int64
+		var candidates []byte
+		if err := rows.Scan(&d.WorkloadID, &d.Attempt, &d.Mode, &chosen, &d.Explanation, &candidates, &at); err != nil {
+			return nil, err
+		}
+		if chosen != nil {
+			d.Chosen = *chosen
+		}
+		if err := json.Unmarshal(candidates, &d.Candidates); err != nil {
+			return nil, err
+		}
+		d.At = time.Unix(0, at).UTC()
+		decisions = append(decisions, d)
+	}
+	return decisions, rows.Err()
 }

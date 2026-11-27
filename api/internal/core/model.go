@@ -43,22 +43,141 @@ type GPU struct {
 	Capabilities         []string `json:"capabilities,omitempty"`
 }
 
+// Telemetry carries sampled host measurements a worker may be unable to observe.
+// nil fields mean unknown; they are never fabricated.
+type Telemetry struct {
+	CPUPct       *float64 `json:"cpu_pct,omitempty"`
+	OnBattery    *bool    `json:"on_battery,omitempty"`
+	TemperatureC *float64 `json:"temperature_c,omitempty"`
+}
+
+// Placement modes for workload scheduling.
+const (
+	PlacementAuto      = "auto"
+	PlacementManual    = "manual"
+	PlacementPreferred = "preferred"
+)
+
+// Worker lifecycle states for contributed devices. The local worker has no lifecycle state.
+const (
+	WorkerStatePending  = "pending"
+	WorkerStateApproved = "approved"
+	WorkerStateDraining = "draining"
+	WorkerStateDisabled = "disabled"
+	WorkerStateRevoked  = "revoked"
+	WorkerStateOnline   = "online"
+	WorkerStateOffline  = "offline"
+)
+
+// DefaultWorkerPolicy is applied when a device enrolls before an owner narrows it.
+// It shares compute with the owner's default project and never permits GPU passthrough.
+func DefaultWorkerPolicy() WorkerPolicy {
+	return WorkerPolicy{GPUAllowed: false, Projects: []string{"default"}, AllowHeavyOnBattery: true}
+}
+
+// ScheduleWindow restricts sharing to recurring time ranges in the owner's timezone.
+type ScheduleWindow struct {
+	Days  []int  `json:"days,omitempty"` // 0=Sunday..6=Saturday; empty means every day
+	Start string `json:"start"`          // "HH:MM"
+	End   string `json:"end"`            // "HH:MM"
+}
+
+// WorkerPolicy is the resource-sharing contract the device owner controls.
+type WorkerPolicy struct {
+	CPUMillisMax        int64            `json:"cpu_millis_max,omitempty"`
+	MemoryBytesMax      int64            `json:"memory_bytes_max,omitempty"`
+	StorageBytesMax     int64            `json:"storage_bytes_max,omitempty"`
+	GPUAllowed          bool             `json:"gpu_allowed"`
+	WorkloadKinds       []string         `json:"workload_kinds,omitempty"`
+	Projects            []string         `json:"projects,omitempty"`
+	Users               []string         `json:"users,omitempty"`
+	Schedule            []ScheduleWindow `json:"schedule,omitempty"`
+	Timezone            string           `json:"timezone,omitempty"`
+	AllowHeavyOnBattery bool             `json:"allow_heavy_on_battery"`
+	MaxConcurrent       int              `json:"max_concurrent,omitempty"`
+}
+
+// ScoreComponent is one weighted factor of an explainable placement score.
+type ScoreComponent struct {
+	Name   string  `json:"name"`
+	Value  float64 `json:"value"`
+	Weight float64 `json:"weight"`
+	Detail string  `json:"detail,omitempty"`
+}
+
+// DecisionCandidate records how one worker was evaluated for a workload.
+type DecisionCandidate struct {
+	WorkerID   string           `json:"worker_id"`
+	Eligible   bool             `json:"eligible"`
+	Score      *float64         `json:"score,omitempty"`
+	Reasons    []string         `json:"reasons,omitempty"`
+	Components []ScoreComponent `json:"components,omitempty"`
+}
+
+// PlacementDecision is the durable, explainable record of a scheduling evaluation.
+type PlacementDecision struct {
+	WorkloadID  string              `json:"workload_id"`
+	Attempt     int                 `json:"attempt"`
+	Mode        string              `json:"mode"`
+	Chosen      string              `json:"chosen_worker,omitempty"`
+	Explanation string              `json:"explanation"`
+	Candidates  []DecisionCandidate `json:"candidates"`
+	At          time.Time           `json:"at"`
+}
+
+// WorkerReport is a durable message from a worker about one assignment.
+// Reports are applied by the coordinator with assignment fencing.
+const (
+	ReportAck   = "ack"
+	ReportStart = "running"
+	ReportExit  = "exit"
+	ReportRenew = "renew"
+)
+
+type WorkerReport struct {
+	ID         int64      `json:"id"`
+	WorkerID   string     `json:"worker_id"`
+	WorkloadID string     `json:"workload_id"`
+	Fence      string     `json:"fence"`
+	Kind       string     `json:"kind"`
+	ExitCode   *int       `json:"exit_code,omitempty"`
+	Started    bool       `json:"started,omitempty"`
+	StartedAt  *time.Time `json:"started_at,omitempty"`
+	LogTail    string     `json:"log_tail,omitempty"`
+	At         time.Time  `json:"at"`
+}
+
+// WorkerState is a worker snapshot used for placement. State is populated for
+// contributed workers; the local worker relies on Health alone.
 type Worker struct {
-	ID        string          `json:"id"`
-	Device    *Device         `json:"device,omitempty"`
-	Runtime   *DockerCapacity `json:"docker,omitempty"`
-	Health    string          `json:"health"`
-	Heartbeat time.Time       `json:"heartbeat"`
+	ID          string          `json:"id"`
+	Device      *Device         `json:"device,omitempty"`
+	Runtime     *DockerCapacity `json:"docker,omitempty"`
+	Health      string          `json:"health"`
+	Heartbeat   time.Time       `json:"heartbeat"`
+	State       string          `json:"state,omitempty"`
+	Name        string          `json:"name,omitempty"`
+	Telemetry   *Telemetry      `json:"telemetry,omitempty"`
+	Policy      *WorkerPolicy   `json:"policy,omitempty"`
+	LatencyMS   float64         `json:"latency_ms,omitempty"`
+	Reliability float64         `json:"reliability,omitempty"`
+	Active      int             `json:"active_assignments,omitempty"`
 }
 
 const LocalWorker = "local"
 
+// OfflineAfter is how long a contributed worker may stay silent before the
+// coordinator considers it offline. It is roughly three heartbeat intervals.
+const OfflineAfter = 45 * time.Second
+
 type Resources struct {
-	CPUMillis   int64  `json:"cpu_millis"`
-	MemoryBytes int64  `json:"memory_bytes"`
-	OS          string `json:"os,omitempty"`
-	Arch        string `json:"arch,omitempty"`
-	GPUCount    int    `json:"gpu_count,omitempty"`
+	CPUMillis       int64    `json:"cpu_millis"`
+	MemoryBytes     int64    `json:"memory_bytes"`
+	StorageBytes    int64    `json:"storage_bytes,omitempty"`
+	OS              string   `json:"os,omitempty"`
+	Arch            string   `json:"arch,omitempty"`
+	GPUCount        int      `json:"gpu_count,omitempty"`
+	GPUCapabilities []string `json:"gpu_capabilities,omitempty"`
 }
 
 type Reservation struct {
@@ -103,13 +222,37 @@ type Policy struct {
 }
 
 type Submission struct {
-	Service   string    `json:"service"`
-	Kind      string    `json:"kind"`
-	Image     string    `json:"image"`
-	Args      []string  `json:"args,omitempty"`
-	Resources Resources `json:"resources"`
-	Policy    Policy    `json:"policy"`
-	WorkerID  string    `json:"worker_id,omitempty"`
+	Service          string    `json:"service"`
+	Kind             string    `json:"kind"`
+	Image            string    `json:"image"`
+	Args             []string  `json:"args,omitempty"`
+	Resources        Resources `json:"resources"`
+	Policy           Policy    `json:"policy"`
+	WorkerID         string    `json:"worker_id,omitempty"`
+	Placement        string    `json:"placement,omitempty"`
+	PreferredWorkers []string  `json:"preferred_workers,omitempty"`
+	Fallback         *bool     `json:"fallback,omitempty"`
+	Priority         int       `json:"priority,omitempty"`
+
+	// Scheduling scope is set by the coordinator, never by clients, and is
+	// excluded from idempotency fingerprints because it is part of the request
+	// envelope rather than the workload definition.
+	projectScopeValue string
+	submitter         string
+}
+
+// FallbackEnabled reports whether preferred placement may fall back to
+// automatic selection. Absence means enabled.
+func (s *Submission) FallbackEnabled() bool { return s.Fallback == nil || *s.Fallback }
+
+// Scope returns the project and submitter identity the coordinator attached.
+func (s *Submission) Scope() (projectID, submitterID string) {
+	return s.projectScopeValue, s.submitter
+}
+
+// SetScope attaches scheduling identity. It must be called before Submit.
+func (s *Submission) SetScope(projectID, submitterID string) {
+	s.projectScopeValue, s.submitter = projectID, submitterID
 }
 
 type State string
@@ -136,8 +279,10 @@ type Assignment struct {
 	RuntimeID   string      `json:"runtime_id"`
 	WorkerID    string      `json:"worker_id"`
 	Attempt     int         `json:"attempt"`
+	Fence       string      `json:"fence,omitempty"`
 	LeaseUntil  time.Time   `json:"lease_until"`
 	Deadline    time.Time   `json:"deadline"`
+	AckedAt     time.Time   `json:"acked_at,omitempty"`
 	Reservation Reservation `json:"reservation"`
 }
 
@@ -160,6 +305,7 @@ type Logs struct {
 type Workload struct {
 	ID              string      `json:"id"`
 	ProjectID       string      `json:"project_id"`
+	SubmitterID     string      `json:"submitter_id,omitempty"`
 	Submission      Submission  `json:"submission"`
 	State           State       `json:"state"`
 	CreatedAt       time.Time   `json:"created_at"`
@@ -201,9 +347,13 @@ var (
 	ErrConflict = errors.New("workload changed or idempotency key is already in use")
 	ErrLimit    = errors.New("active workload limit reached")
 	keyPattern  = regexp.MustCompile(`^[a-zA-Z0-9_.:-]{1,128}$`)
+	workerIDRe  = regexp.MustCompile(`^wk-[0-9a-f]{32}$`)
+	gpuCaps     = map[string]bool{"cuda": true, "rocm": true, "metal": true, "vulkan": true, "level-zero": true, "oneapi": true}
 )
 
 func ValidKey(key string) bool { return keyPattern.MatchString(key) }
+
+func ValidWorkerID(id string) bool { return id == LocalWorker || workerIDRe.MatchString(id) }
 
 // Normalize sets the defaults before hashing a request for idempotency.
 func (s *Submission) Normalize() error {
@@ -220,8 +370,46 @@ func (s *Submission) Normalize() error {
 	if s.Kind != "job" && s.Kind != "service" {
 		return errors.New("kind must be job or service")
 	}
-	if s.WorkerID != "" && s.WorkerID != LocalWorker {
-		return errors.New("manual worker must be local")
+	switch s.Placement {
+	case "":
+		s.Placement = PlacementAuto
+	case PlacementAuto, PlacementManual, PlacementPreferred:
+	default:
+		return errors.New("placement must be auto, manual or preferred")
+	}
+	if s.WorkerID != "" && !ValidWorkerID(s.WorkerID) {
+		return errors.New("worker_id must be the local worker or a wk- worker identifier")
+	}
+	if s.Placement == PlacementManual && s.WorkerID == "" {
+		return errors.New("manual placement requires worker_id")
+	}
+	if s.Placement != PlacementManual && s.WorkerID != "" {
+		return errors.New("worker_id requires manual placement")
+	}
+	if s.Placement == PlacementPreferred {
+		if len(s.PreferredWorkers) == 0 {
+			return errors.New("preferred placement requires at least one preferred worker")
+		}
+		if len(s.PreferredWorkers) > 8 {
+			return errors.New("at most 8 preferred workers are allowed")
+		}
+		for _, id := range s.PreferredWorkers {
+			if !ValidWorkerID(id) {
+				return errors.New("preferred workers must be the local worker or wk- worker identifiers")
+			}
+		}
+	}
+	if s.Placement != PlacementPreferred && len(s.PreferredWorkers) > 0 {
+		return errors.New("preferred_workers require preferred placement")
+	}
+	if s.Fallback != nil && s.Placement != PlacementPreferred {
+		return errors.New("fallback requires preferred placement")
+	}
+	if s.Priority == 0 {
+		s.Priority = 50
+	}
+	if s.Priority < 1 || s.Priority > 100 {
+		return errors.New("priority must be between 1 and 100")
 	}
 	if s.Image == "" || len(s.Image) > 255 || strings.TrimSpace(s.Image) != s.Image ||
 		strings.ContainsAny(s.Image, " \r\n\t\x00") {
@@ -243,8 +431,18 @@ func (s *Submission) Normalize() error {
 		r.MemoryBytes = 128 << 20
 	}
 	if r.CPUMillis < 10 || r.CPUMillis > 256000 || r.MemoryBytes < 16<<20 || r.MemoryBytes > 1<<40 ||
-		r.GPUCount < 0 || r.GPUCount > 64 {
-		return errors.New("CPU, memory or GPU count is outside the supported range")
+		r.GPUCount < 0 || r.GPUCount > 64 || r.StorageBytes < 0 || r.StorageBytes > 16<<40 {
+		return errors.New("CPU, memory, storage or GPU count is outside the supported range")
+	}
+	if len(r.GPUCapabilities) > 4 {
+		return errors.New("at most 4 GPU capabilities are allowed")
+	}
+	for i, capability := range r.GPUCapabilities {
+		capability = strings.ToLower(strings.TrimSpace(capability))
+		if !gpuCaps[capability] {
+			return errors.New("GPU capabilities must be cuda, rocm, metal, vulkan, level-zero or oneapi")
+		}
+		r.GPUCapabilities[i] = capability
 	}
 	if r.Arch != "" && r.Arch != "amd64" && r.Arch != "arm64" {
 		return errors.New("architecture must be amd64 or arm64")

@@ -11,7 +11,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var dashboardTabs = [...]string{"Device", "Jobs", "Services", "Workspaces", "Identity", "Projects", "Connect"}
+var dashboardTabs = [...]string{"Device", "Jobs", "Services", "Workspaces", "Identity", "Projects", "Connect", "Workers", "Scheduler"}
 
 type dashboardModel struct {
 	app       *app
@@ -68,14 +68,18 @@ func (m dashboardModel) load() tea.Cmd {
 			path = "/v1/projects"
 		case 6: // Connect
 			path = "/v1/connect/info?mdns=1"
+		case 7: // Workers
+			path = "/v1/workers"
+		case 8: // Scheduler
+			path = "/v1/scheduler/status"
 		}
 		data, err := client.request(m.ctx, "GET", path, nil, "")
 		switch {
 		case err != nil:
 			reply.err = err
-		case m.tab == 0 || m.tab == 4 || m.tab == 6:
+		case m.tab == 0 || m.tab == 4 || m.tab == 6 || m.tab == 8:
 			reply.detail = jsonLines(data)
-		case m.tab == 3 || m.tab == 5:
+		case m.tab == 3 || m.tab == 5 || m.tab == 7:
 			reply.err = json.Unmarshal(data, &reply.items)
 		default: // Jobs (1) or Services (2)
 			kind := "job"
@@ -125,7 +129,7 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch key := value.String(); key {
 		case "q", "ctrl+c":
 			return m, tea.Quit
-		case "1", "2", "3", "4", "5", "6", "7", "tab", "shift+tab", "r":
+		case "1", "2", "3", "4", "5", "6", "7", "8", "9", "tab", "shift+tab", "r":
 			switch key {
 			case "tab":
 				m.tab = (m.tab + 1) % len(dashboardTabs)
@@ -212,7 +216,7 @@ func (m dashboardModel) View() string {
 			view.WriteString(truncate(cursor+dashboardRow(m.items[i]), m.width) + "\n")
 		}
 	}
-	view.WriteString("\n1–7 views · ↑/↓ navigate · Enter details · l logs · Esc back · r refresh · q quit")
+	view.WriteString("\n1–9 views · ↑/↓ navigate · Enter details · l logs · Esc back · r refresh · q quit")
 	return view.String()
 }
 
@@ -227,7 +231,10 @@ func jsonLines(raw json.RawMessage) []string {
 func dashboardRow(raw json.RawMessage) string {
 	var item struct {
 		workloadSummary
-		Name, Status string
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		State  string `json:"state"`
+		Status string `json:"status"`
 	}
 	if json.Unmarshal(raw, &item) != nil {
 		return "Invalid coordinator response"
@@ -235,6 +242,10 @@ func dashboardRow(raw json.RawMessage) string {
 	name, state := item.Name, item.Status
 	if item.Submission.Image != "" {
 		name, state = item.Submission.Image, item.State
+	}
+	if item.ID != "" && strings.HasPrefix(item.ID, "wk-") || item.ID == "local" {
+		// Worker rows: state and device name.
+		return terminalText(item.ID + "  " + item.State + "  " + item.Name)
 	}
 	return terminalText(item.ID + "  " + state + "  " + name)
 }

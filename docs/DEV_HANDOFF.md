@@ -1,8 +1,8 @@
 # Kamui Cloud — Development Handoff
 
 **Branch:** `feat/mobile-workspace-mvp`
-**Last Verified Commit:** `d172c1616c45b24be9dd2c9a05e2c6306ca06756` (HEAD)
-**Date:** 2026-11-27
+**Last Verified Commit:** see [Remote Commit SHA](#remote-commit-sha)
+**Date:** 2026-11-28
 
 ---
 
@@ -16,6 +16,8 @@
 | 03: Universal CLI | ✅ Complete | Bubble Tea dashboard, workspace/job/service commands |
 | **04: Identity** | ✅ **Complete** | Full backend + CLI integration |
 | **05: Connectivity** | ✅ **Complete** | Full backend + CLI integration |
+| **06: Distributed Worker Agent** | ✅ **Complete** | Enrollment, worker protocol, real Docker execution |
+| **07: Intelligent Scheduler** | ✅ **Complete** | Placement modes, explainable scoring, durable scheduling |
 
 ---
 
@@ -186,12 +188,179 @@ These are marked **BLOCKED** per requirements — implementation is complete, li
 
 ---
 
-## Next Steps (Phase 06-07 — Not Started)
+## Phase 06: Distributed Worker Agent — Completed
 
-Per instructions, **stop after Phase 05**. Do not independently begin Phase 06-07.
+### Backend (api/internal/worker/, migration 003)
+- **Enrollment**: `POST /v1/workers/enrollments` (admin) issues single-use, hashed, TTL-bounded
+  (1s–24h, default 15m) credentials; `POST /v1/workers/enroll` consumes the token in the same
+  transaction that creates the worker identity, so it can never be used twice.
+- **Worker identity**: `wk-<32hex>` IDs with revocable `kwt-…` API tokens (SHA-256 hashed,
+  `last_used` tracked). Revocation invalidates tokens and blocks assignments.
+- **Lifecycle states**: pending → approved → draining / disabled / revoked; online/offline derived
+  from heartbeat freshness (`core.OfflineAfter` = 45s ≈ 3 heartbeat intervals).
+- **Heartbeats**: `POST /v1/workers/{id}/heartbeat` records capabilities, telemetry (CPU %, battery,
+  temperature — unknown values stay unknown) and an EWMA of worker-measured round-trip latency plus
+  a heartbeat-reliability score.
+- **Resource-sharing policies** (`PUT /v1/workers/{id}/policy`): CPU/RAM/storage allocations per
+  workload, GPU permission, allowed workload kinds, permitted projects and users, availability
+  schedule (weekdays + HH:MM windows + IANA timezone), heavy-on-battery rule, max concurrent
+  workloads. Defaults share with the owner's default project and never permit GPU.
+- **Assignment protocol** (worker-token authenticated): `poll` returns new assignments, stop
+  requests and the active set; `assignments/{workload}/report` accepts `ack|running|exit|renew`
+  into a durable `worker_reports` table. The engine applies reports with **assignment fencing**
+  (per-assignment random fence token) and is the single writer of workload state.
+- **Client pairing never grants worker permissions**: pairing produces `paired_device` sessions;
+  all worker management endpoints are admin-only and enrollment requires a `kwe-` credential.
 
-Phase 06 would cover: Mobile workspace UX, Rust agent integration, file sync, terminal UX.
-Phase 07 would cover: Multi-host execution, artifact store, GPU passthrough, production hardening.
+### Rust agent (agent/src/)
+- `kamui-agent enroll` — exchanges a node-join credential for persistent worker identity stored in
+  `~/.kamui-agent/worker.json` (0600). `kamui-agent worker` — the poll loop. The legacy
+  node-registration heartbeat mode and `capabilities` are unchanged.
+- **Real local Docker execution**: `docker run -d` with the same hardening contract as the
+  coordinator executor (no network, read-only rootfs, cap-drop ALL, nonroot UID, bounded tmpfs,
+  CPU/RAM/PID limits, bounded json-file logs, ownership labels). Images must exist locally and be
+  Linux. GPU passthrough only when the NVIDIA container runtime is present.
+- **Leases and cancellation**: renewals every 10s while running; poll delivers stop requests;
+  worker stops, reports exit code and log tail, removes the container.
+- **Reconnection**: exponential backoff (2s→30s) on poll/heartbeat failure with an in-memory report
+  queue; at-least-once delivery with idempotent report application.
+- **Worker-side reconciliation**: on every poll, containers labeled for this worker that the
+  coordinator no longer tracks are removed, so stale attempts never run unobserved.
+- TLS via rustls with optional `--ca-file`; telemetry via sysinfo, `/sys/class/power_supply`,
+  `/sys/class/thermal`, `pmset`. Apple GPU detection never implies CUDA.
+
+## Phase 07: Intelligent Scheduler — Completed
+
+### Placement (api/internal/core/scheduler.go)
+- **Three modes**: `auto` (score all eligible workers), `manual` (validated at submit with HTTP 422
+  + explanation when structurally ineligible; queues when merely busy), `preferred` (ordered list
+  with opt-out fallback via `fallback:false`).
+- **Eligibility filtering**: state (pending/revoked/disabled/draining/offline), platform/runtime
+  compatibility, GPU presence + capability match (e.g. `cuda`), owner policy caps, storage,
+  workload kinds, project and user authorization, availability schedule, battery rule for heavy
+  workloads, thermal threshold (>90 °C ineligible), existing reservations, concurrency limits.
+- **Deterministic, explainable scoring**: weighted components — CPU and memory utilization after
+  placement, GPU scarcity (GPU nodes are deprioritized for CPU-only work), workload pressure,
+  measured latency, heartbeat reliability, power and thermal state, submitter preference, data
+  locality (weight 0, no signals yet). Every candidate records components and reasons.
+- **Scheduling reliability**: per-worker atomic reservations, priority → project-share → FIFO
+  durable queue ordering, bounded unacknowledged-lease requeues (≤ MaxRetries+3), lost-contact
+  handling that never blindly retries a started attempt, node draining, reservation release on
+  terminal states, restart reconciliation (SQLite state + engine reinspection).
+- **Decision history**: every assignment and queue-reason change persists a `PlacementDecision`;
+  `GET /v1/workloads/{id}/explanation` (project members) and the scheduler status view expose it.
+- **Project scheduling preferences**: `GET/PUT /v1/projects/{id}/scheduling-preferences`
+  (mode, preferred workers, fallback) applied to submissions that omit an explicit placement.
+- Single-host operation is unchanged: with no remote workers the local worker wins scheduling and
+  the legacy local lifecycle is preserved.
+
+### HTTP surface
+Workers: `GET/POST /v1/workers(/{id})`, `/approve|revoke|drain|enable|disable|policy`,
+`/v1/workers/enrollments(/{id})`, `/v1/workers/enroll`, `/heartbeat`, `/poll`, `/assignments/{wl}/report`.
+Scheduling: `/v1/scheduler/status` (admin), `/v1/workloads/{id}/explanation`,
+`/v1/projects/{id}/scheduling-preferences`, `/v1/projects/{id}/workers`.
+
+### CLI (cli/cmd/kamui-cloud/)
+- `node join|list|inspect|approve|revoke|drain|enable|disable|share|map`
+- `agent enroll|start|status|stop` (shares the Rust agent's state file)
+- `job submit --placement auto|manual|preferred --node ID --preferred a,b --allow-fallback --priority --storage-bytes --gpu-capability`
+- `job explain ID`, `scheduler status`
+- Dashboard tabs 8 (Workers) and 9 (Scheduler) show live worker state and scheduling decisions.
+
+## Integration Verification (2026-11-28)
+
+Simulated multi-node on one Docker Desktop (linux/arm64) daemon: a native macOS coordinator
+(`KAMUI_CORE_EXECUTOR=local`) plus a `kamui-demo-agent` linux/arm64 container as the contributed
+worker with the Docker socket mounted. This is a **simulated second node** (one daemon, two agent
+views), not physical cross-device verification.
+
+| Check | Result |
+|-------|--------|
+| Standalone local job (`busybox`, echo + uname) | ✅ SUCCEEDED, logs returned |
+| Enrollment via `node join` → single-use token → `kamui-agent enroll` | ✅ pending worker created; replayed token rejected 401 |
+| Pending worker enforcement | ✅ poll 403 until approved; heartbeat allowed |
+| `node approve` → online with real inventory | ✅ linux arm64, 10 CPUs, storage, CPU telemetry, latency EWMA |
+| Manual placement through worker | ✅ RUNNING → SUCCEEDED, exit 0, log tail round-tripped |
+| Automatic placement | ✅ remote worker chosen (score 0.656 vs local 0.455) with full explanation |
+| Incompatible manual placement (amd64 on arm64) | ✅ HTTP 422 with explanation |
+| CUDA request with no GPU worker | ✅ QUEUED with per-worker reasons — CUDA remains BLOCKED |
+| Concurrent reservations (two 6-CPU jobs, 10-CPU worker) | ✅ second QUEUED ("waiting for available CPU or RAM reservations"), ran after the first finished |
+| Worker disconnection | ✅ offline after ~50s without heartbeat; online again on reconnect |
+| Coordinator restart mid-run | ✅ assignment survived, queue preserved, job completed with logs |
+| Revoked worker | ✅ token invalidated (poll 401); manual placement rejected ("worker is revoked") |
+
+## Verification Results
+
+| Check | Result |
+|-------|--------|
+| Go compilation (api) | ✅ Pass |
+| Go compilation (cli) | ✅ Pass |
+| go vet + gofmt (api, cli) | ✅ Clean |
+| API tests (core, http, worker, identity, connect, … — 11 packages) | ✅ All Pass (new: scheduler, remote-engine, worker-store, HTTP auth-matrix suites) |
+| CLI tests (incl. node/agent/placement flags) | ✅ All Pass |
+| Rust build + tests (10 tests) inside rust:1.88 linux/arm64 container | ✅ All Pass |
+| cargo clippy --all-targets | ✅ Clean |
+| Cross-compile | ✅ api: linux/arm64, linux/amd64; cli: linux/arm64, darwin/arm64 |
+
+## Outstanding Blockers (BLOCKED)
+
+| Item | Reason |
+|------|--------|
+| Physical cross-device verification | Requires a second real machine on the LAN; demo used a simulated container worker |
+| mDNS discovery across devices | Requires physical LAN with multiple devices |
+| GitHub OAuth live verification | No KAMUI_GITHUB_CLIENT_ID/SECRET configured in environment |
+| Tailscale remote connectivity | No Tailscale daemon installed on test host |
+| GPU (CUDA) execution | No compatible GPU worker exists on this host — CUDA stays BLOCKED by design |
+| Extensive security auditing and stress testing | Deferred until after December 21 per instructions |
+
+These are marked **BLOCKED** per requirements — implementation is complete, live verification deferred.
+
+---
+
+## Changed Modules (Phase 06–07)
+
+### API (Go)
+- `api/internal/worker/` — New package (store.go: enrollment, tokens, lifecycle, heartbeat,
+  policies, report queue, decisions, project prefs; policy.go: policy validation; store_test.go)
+- `api/internal/core/scheduler.go` — New: eligibility, scoring, placement modes, fairness ordering,
+  manual validation (+ scheduler_test.go)
+- `api/internal/core/engine.go` — Cluster interface, report application with fencing, remote
+  lifecycle (acks, leases, deadlines, lost workers), per-worker reservations; local path unchanged
+  (+ engine_remote_test.go)
+- `api/internal/core/model.go` — Placement/preferred/fallback/priority submission fields, storage
+  and GPU capability requests, WorkerPolicy, Telemetry, PlacementDecision, WorkerReport,
+  Assignment.Fence/AckedAt
+- `api/internal/core/store.go` + `migrations/003.sql` — remote workers, enrollments, worker tokens,
+  worker reports, placement decisions, project scheduling prefs; indexed workload worker/priority
+  columns; decision and prefs queries
+- `api/internal/http/workers.go` — worker protocol + management handlers (+ workers_test.go)
+- `api/internal/http/core.go` — project preference application, submitter scope, manual validation
+- `api/internal/http/router.go` — worker routes (adminOnly management, public worker protocol)
+- `api/cmd/api/core.go`, `api/cmd/api/main.go` — worker store wiring, cluster mode
+
+### Agent (Rust)
+- `agent/src/{client,state,telemetry,worker,enroll}.rs` — New; `agent/src/docker.rs` — hardened
+  local executor; `agent/src/main.rs` — subcommand dispatch with legacy mode preserved;
+  `Cargo.toml` — reqwest rustls-tls (no OpenSSL dependency)
+
+### CLI (Go)
+- `cli/cmd/kamui-cloud/node.go`, `agent.go` — New command trees (+ node_test.go)
+- `cli/cmd/kamui-cloud/workloads.go` — placement/priority/storage/GPU-capability flags, `job explain`
+- `cli/cmd/kamui-cloud/dashboard.go` — Workers and Scheduler tabs
+- `cli/cmd/kamui-cloud/main.go` — command registration
+
+### Contracts
+- `shared/core-openapi.yaml` — worker, scheduling, preference and explanation endpoints and schemas
+
+---
+
+## Next Steps (Phase 08–10 — Not Started)
+
+Per instructions, **stop after Phase 07**.
+
+Phase 08 would cover: deployment service on the shared scheduling contracts, artifact handoff.
+Phase 09 would cover: object storage integration, GPU passthrough hardening on real NVIDIA hosts.
+Phase 10 would cover: production hardening, security audit (after December 21), stress testing.
 
 ---
 

@@ -101,6 +101,312 @@ paths:
                 type: array
                 items: { $ref: '#/components/schemas/Event' }
         default: { $ref: '#/components/responses/Error' }
+  /v1/workers/enrollments:
+    post:
+      operationId: createWorkerEnrollment
+      description: Issue a single-use, short-lived enrollment credential. Administrators only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                ttl_seconds: { type: integer, minimum: 1, maximum: 86400 }
+                auto_approve: { type: boolean, default: false }
+      responses:
+        '201':
+          description: Enrollment created; the token is returned exactly once
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [token]
+                properties:
+                  enrollment: { $ref: '#/components/schemas/Enrollment' }
+                  token: { type: string }
+        default: { $ref: '#/components/responses/Error' }
+    get:
+      operationId: listWorkerEnrollments
+      responses:
+        '200':
+          description: Recent enrollments without token material
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Enrollment' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workers/enrollments/{id}:
+    delete:
+      operationId: revokeWorkerEnrollment
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: Revoked }
+        '404': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workers/enroll:
+    post:
+      operationId: enrollWorker
+      security: []
+      description: Exchange a valid single-use enrollment token for a worker identity.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string }
+                name: { type: string }
+                hostname: { type: string }
+      responses:
+        '201':
+          description: Worker created; the worker token is returned once
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [worker_id, worker_token, approved]
+                properties:
+                  worker_id: { type: string }
+                  worker_token: { type: string }
+                  approved: { type: boolean }
+        '401': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workers:
+    get:
+      operationId: listWorkers
+      description: Administrators only. Contributed workers with fresh lifecycle state.
+      responses:
+        '200':
+          description: Contributed workers
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/RemoteWorker' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workers/{id}:
+    parameters:
+      - $ref: '#/components/parameters/WorkerID'
+    get:
+      operationId: getWorker
+      responses:
+        '200': { description: Worker detail, content: { application/json: { schema: { $ref: '#/components/schemas/RemoteWorker' } } } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workers/{id}/approve:
+    parameters:
+      - $ref: '#/components/parameters/WorkerID'
+    post:
+      operationId: transitionWorker
+      description: >-
+        Administrators only. Lifecycle transitions for contributed workers.
+        The same request shape applies to /revoke, /drain, /enable and /disable
+        at the same path prefix.
+      responses:
+        '200': { description: Updated worker, content: { application/json: { schema: { $ref: '#/components/schemas/RemoteWorker' } } } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workers/{id}/policy:
+    parameters:
+      - $ref: '#/components/parameters/WorkerID'
+    put:
+      operationId: updateWorkerPolicy
+      description: Administrators only. Stores the owner's resource-sharing rules.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WorkerPolicy' }
+      responses:
+        '200': { description: Stored }
+        '400': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workers/{id}/heartbeat:
+    parameters:
+      - $ref: '#/components/parameters/WorkerID'
+    post:
+      operationId: workerHeartbeat
+      description: Worker-token authenticated. Publishes capabilities, telemetry and measured latency.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                capabilities: { $ref: '#/components/schemas/Capabilities' }
+                telemetry:
+                  type: object
+                  properties:
+                    cpu_pct: { type: number, nullable: true }
+                    on_battery: { type: boolean, nullable: true }
+                    temperature_c: { type: number, nullable: true }
+                rtt_ms: { type: number }
+      responses:
+        '200': { description: Recorded }
+        '401': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workers/{id}/poll:
+    parameters:
+      - $ref: '#/components/parameters/WorkerID'
+    post:
+      operationId: workerPoll
+      description: Worker-token authenticated. Returns new assignments, stop requests and the active set for reconciliation.
+      responses:
+        '200':
+          description: Assignment set
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [assignments, stop, active, max_concurrent]
+                properties:
+                  assignments:
+                    type: array
+                    items:
+                      type: object
+                      required: [workload_id, attempt, fence, image, resources]
+                      properties:
+                        workload_id: { type: string }
+                        attempt: { type: integer }
+                        fence: { type: string }
+                        image: { type: string }
+                        args: { type: array, items: { type: string } }
+                        resources: { $ref: '#/components/schemas/Resources' }
+                        deadline: { type: string, format: date-time }
+                  stop:
+                    type: array
+                    items:
+                      type: object
+                      required: [workload_id, attempt, fence]
+                      properties:
+                        workload_id: { type: string }
+                        attempt: { type: integer }
+                        fence: { type: string }
+                  active:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        workload_id: { type: string }
+                        attempt: { type: integer }
+                        fence: { type: string }
+                        state: { $ref: '#/components/schemas/State' }
+                  max_concurrent: { type: integer }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workers/{id}/assignments/{workload}/report:
+    parameters:
+      - $ref: '#/components/parameters/WorkerID'
+      - { name: workload, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: workerReport
+      description: Worker-token authenticated. Durable assignment report applied by the engine with fencing.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fence, phase]
+              properties:
+                fence: { type: string }
+                phase: { type: string, enum: [ack, running, exit, renew] }
+                exit_code: { type: integer, nullable: true }
+                started: { type: boolean }
+                started_at: { type: string, format: date-time, nullable: true }
+                log_tail: { type: string }
+      responses:
+        '202': { description: Queued }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/scheduler/status:
+    get:
+      operationId: schedulerStatus
+      description: Administrators only. Durable queue, assignments and recent placement decisions.
+      responses:
+        '200':
+          description: Scheduler summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  queue:
+                    type: object
+                    properties:
+                      depth: { type: integer }
+                      by_project: { type: object, additionalProperties: { type: integer } }
+                      oldest_waiting_seconds: { type: number }
+                  workers:
+                    type: array
+                    items: { type: object }
+                  assignments: { type: array, items: { type: object } }
+                  decisions:
+                    type: array
+                    items: { $ref: '#/components/schemas/PlacementDecision' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workloads/{id}/explanation:
+    parameters:
+      - $ref: '#/components/parameters/WorkloadID'
+    get:
+      operationId: workloadExplanation
+      description: Project members. Placement decisions for this workload, newest first.
+      responses:
+        '200':
+          description: Decision history
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/PlacementDecision' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/projects/{id}/scheduling-preferences:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      operationId: getProjectSchedulingPreferences
+      responses:
+        '200':
+          description: Defaults applied to submissions without an explicit placement
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectSchedulingPreferences' }
+        default: { $ref: '#/components/responses/Error' }
+    put:
+      operationId: putProjectSchedulingPreferences
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mode]
+              properties:
+                mode: { type: string, enum: [auto, manual, preferred] }
+                preferred_workers: { type: array, maxItems: 8, items: { type: string } }
+                fallback: { type: boolean, default: true }
+      responses:
+        '200': { description: Stored }
+        '400': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/projects/{id}/workers:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      operationId: listProjectWorkers
+      description: Project members. Workers whose policy permits this project.
+      responses:
+        '200':
+          description: Permitted workers
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { type: object }
+        default: { $ref: '#/components/responses/Error' }
 components:
   securitySchemes:
     bearerAuth: { type: http, scheme: bearer }
@@ -110,6 +416,11 @@ components:
       name: id
       required: true
       schema: { type: string, pattern: '^wl-[0-9a-f]{32}$' }
+    WorkerID:
+      in: path
+      name: id
+      required: true
+      schema: { type: string, pattern: '^wk-[0-9a-f]{32}$' }
   responses:
     Workload:
       description: Persisted workload snapshot
@@ -143,22 +454,35 @@ components:
           type: array
           maxItems: 64
           items: { type: string, maxLength: 4096 }
-        resources:
-          type: object
-          additionalProperties: false
-          properties:
-            cpu_millis: { type: integer, minimum: 10, maximum: 256000, default: 250 }
-            memory_bytes: { type: integer, format: int64, minimum: 16777216, maximum: 1099511627776, default: 134217728 }
-            os: { type: string, enum: [linux, windows, macos] }
-            arch: { type: string, enum: [amd64, arm64] }
-            gpu_count: { type: integer, minimum: 0, maximum: 64, default: 0 }
+        resources: { $ref: '#/components/schemas/Resources' }
         policy:
           type: object
           additionalProperties: false
           properties:
             timeout_seconds: { type: integer, minimum: 1, maximum: 86400, default: 300 }
             max_retries: { type: integer, minimum: 0, maximum: 3, default: 0 }
-        worker_id: { type: string, enum: [local] }
+        placement: { type: string, enum: [auto, manual, preferred], default: auto }
+        worker_id: { type: string, description: 'local or wk-…; required for manual placement' }
+        preferred_workers:
+          type: array
+          maxItems: 8
+          items: { type: string }
+        fallback: { type: boolean, description: preferred placement may fall back to automatic }
+        priority: { type: integer, minimum: 1, maximum: 100, default: 50 }
+    Resources:
+      type: object
+      additionalProperties: false
+      properties:
+        cpu_millis: { type: integer, minimum: 10, maximum: 256000, default: 250 }
+        memory_bytes: { type: integer, format: int64, minimum: 16777216, maximum: 1099511627776, default: 134217728 }
+        storage_bytes: { type: integer, format: int64, minimum: 0, maximum: 17592186044416, default: 0 }
+        os: { type: string, enum: [linux, windows, macos] }
+        arch: { type: string, enum: [amd64, arm64] }
+        gpu_count: { type: integer, minimum: 0, maximum: 64, default: 0 }
+        gpu_capabilities:
+          type: array
+          maxItems: 4
+          items: { type: string, enum: [cuda, rocm, metal, vulkan, level-zero, oneapi] }
     State:
       type: string
       enum: [PENDING, QUEUED, ASSIGNED, STARTING, RUNNING, UNHEALTHY, STOPPING, SUCCEEDED, FAILED, CANCELLED, STOPPED]
@@ -176,6 +500,7 @@ components:
         cancel_requested: { type: boolean }
         stop_reason: { type: string }
         queue_reason: { type: string }
+        submitter_id: { type: string }
         assignment:
           type: object
           required: [worker_id, runtime_id, attempt, lease_until, deadline, reservation]
@@ -201,8 +526,8 @@ components:
       type: object
       required: [id, health, heartbeat]
       properties:
-        id: { type: string, enum: [local] }
-        health: { type: string, enum: [probing, healthy, unavailable] }
+        id: { type: string, description: '"local" for the coordinator worker' }
+        health: { type: string, enum: [probing, healthy, degraded, unavailable] }
         heartbeat: { type: string, format: date-time }
         docker:
           type: object
@@ -217,6 +542,93 @@ components:
           properties:
             id: { type: string }
             capabilities: { $ref: '#/components/schemas/Capabilities' }
+    RemoteWorker:
+      type: object
+      required: [id, name, status, policy]
+      properties:
+        id: { type: string, pattern: '^wk-[0-9a-f]{32}$' }
+        name: { type: string }
+        hostname: { type: string }
+        state: { type: string, enum: [pending, approved, online, offline, draining, disabled, revoked] }
+        status: { type: string, enum: [pending, approved, draining, disabled, revoked] }
+        enrolled_at: { type: string, format: date-time }
+        last_heartbeat: { type: string, format: date-time, nullable: true }
+        capabilities: { $ref: '#/components/schemas/Capabilities' }
+        telemetry: { type: object }
+        policy: { $ref: '#/components/schemas/WorkerPolicy' }
+        latency_ms: { type: number }
+        reliability: { type: number }
+    WorkerPolicy:
+      type: object
+      properties:
+        cpu_millis_max: { type: integer, description: per-workload CPU allocation (0 = unlimited) }
+        memory_bytes_max: { type: integer, format: int64 }
+        storage_bytes_max: { type: integer, format: int64 }
+        gpu_allowed: { type: boolean }
+        workload_kinds: { type: array, items: { type: string, enum: [job, service] } }
+        projects: { type: array, items: { type: string } }
+        users: { type: array, items: { type: string } }
+        schedule:
+          type: array
+          items:
+            type: object
+            required: [start, end]
+            properties:
+              days: { type: array, items: { type: integer, minimum: 0, maximum: 6 } }
+              start: { type: string }
+              end: { type: string }
+        timezone: { type: string }
+        allow_heavy_on_battery: { type: boolean }
+        max_concurrent: { type: integer }
+    Enrollment:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        auto_approve: { type: boolean }
+        created_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        used_at: { type: string, format: date-time, nullable: true }
+        revoked_at: { type: string, format: date-time, nullable: true }
+    PlacementDecision:
+      type: object
+      required: [workload_id, attempt, mode, explanation, candidates, at]
+      properties:
+        workload_id: { type: string }
+        attempt: { type: integer }
+        mode: { type: string, enum: [auto, manual, preferred] }
+        chosen_worker: { type: string }
+        explanation: { type: string }
+        candidates:
+          type: array
+          items:
+            type: object
+            required: [worker_id, eligible]
+            properties:
+              worker_id: { type: string }
+              eligible: { type: boolean }
+              score: { type: number, nullable: true }
+              reasons: { type: array, items: { type: string } }
+              components:
+                type: array
+                items:
+                  type: object
+                  required: [name, value, weight]
+                  properties:
+                    name: { type: string }
+                    value: { type: number }
+                    weight: { type: number }
+                    detail: { type: string }
+        at: { type: string, format: date-time }
+    ProjectSchedulingPreferences:
+      type: object
+      required: [project_id, mode, fallback]
+      properties:
+        project_id: { type: string }
+        mode: { type: string, enum: [auto, manual, preferred] }
+        preferred_workers: { type: array, items: { type: string } }
+        fallback: { type: boolean }
+        updated_at: { type: string, format: date-time }
     Capabilities:
       type: object
       properties:

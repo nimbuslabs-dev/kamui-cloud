@@ -11,14 +11,19 @@ import (
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/identity"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/registry"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/scheduler"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/worker"
 )
 
 func NewRouter(cfg *config.Config, reg *registry.Registry, queue *scheduler.Queue) (http.Handler, error) {
-	return NewRouterWithServices(cfg, reg, queue, nil, nil, nil)
+	return NewRouterWithServices(cfg, reg, queue, nil, nil, nil, nil)
 }
 
 func NewRouterWithCore(cfg *config.Config, reg *registry.Registry, queue *scheduler.Queue, engine *core.Engine) (http.Handler, error) {
-	return NewRouterWithServices(cfg, reg, queue, engine, nil, nil)
+	return NewRouterWithServices(cfg, reg, queue, engine, nil, nil, nil)
+}
+
+func NewRouterWithIdentity(cfg *config.Config, reg *registry.Registry, queue *scheduler.Queue, engine *core.Engine, idStore *identity.Store, connStore *connect.Store) (http.Handler, error) {
+	return NewRouterWithServices(cfg, reg, queue, engine, idStore, connStore, nil)
 }
 
 func NewRouterWithServices(
@@ -28,10 +33,11 @@ func NewRouterWithServices(
 	engine *core.Engine,
 	idStore *identity.Store,
 	connStore *connect.Store,
+	workerStore *worker.Store,
 ) (http.Handler, error) {
 	mux := http.NewServeMux()
 	if engine != nil {
-		registerCoreWithIdentity(mux, engine, idStore)
+		registerCoreWithIdentity(mux, engine, idStore, workerStore)
 	}
 	mux.HandleFunc("GET /healthz", HandleHealthz)
 
@@ -143,6 +149,10 @@ func NewRouterWithServices(
 		mux.HandleFunc("GET /v1/connect/remote", ch.GetRemoteConfig)
 		mux.HandleFunc("PUT /v1/connect/remote", ch.UpdateRemoteConfig)
 		mux.HandleFunc("DELETE /v1/connect/remote", ch.DisableRemoteConfig)
+	}
+
+	if workerStore != nil {
+		newWorkerHandler(workerStore, engine, idStore).registerWorkerProtocol(publicMux, mux, adminOnly)
 	}
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

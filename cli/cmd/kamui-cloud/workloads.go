@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"regexp"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -53,6 +54,15 @@ func (a *app) workloadCommand(kind string) *cobra.Command {
 			},
 		})
 	}
+	group.AddCommand(&cobra.Command{
+		Use: "explain ID", Short: "Show the placement decision history for this workload", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !workloadID.MatchString(args[0]) {
+				return failure(2, "invalid_id", "provide a valid workload ID")
+			}
+			return a.send(cmd, "GET", "/v1/workloads/"+args[0]+"/explanation", nil, "")
+		},
+	})
 	return group
 }
 
@@ -135,17 +145,23 @@ func (a *app) workloadAction(cmd *cobra.Command, kind, operation, id string) err
 }
 
 type workloadSubmission struct {
-	Kind      string   `json:"kind"`
-	Service   string   `json:"service,omitempty"`
-	Image     string   `json:"image"`
-	Args      []string `json:"args,omitempty"`
-	WorkerID  string   `json:"worker_id,omitempty"`
-	Resources struct {
-		CPUMillis int64  `json:"cpu_millis,omitempty"`
-		Memory    int64  `json:"memory_bytes,omitempty"`
-		OS        string `json:"os,omitempty"`
-		Arch      string `json:"arch,omitempty"`
-		GPUCount  int    `json:"gpu_count,omitempty"`
+	Kind             string   `json:"kind"`
+	Service          string   `json:"service,omitempty"`
+	Image            string   `json:"image"`
+	Args             []string `json:"args,omitempty"`
+	WorkerID         string   `json:"worker_id,omitempty"`
+	Placement        string   `json:"placement,omitempty"`
+	PreferredWorkers []string `json:"preferred_workers,omitempty"`
+	Fallback         *bool    `json:"fallback,omitempty"`
+	Priority         int      `json:"priority,omitempty"`
+	Resources        struct {
+		CPUMillis       int64    `json:"cpu_millis,omitempty"`
+		Memory          int64    `json:"memory_bytes,omitempty"`
+		StorageBytes    int64    `json:"storage_bytes,omitempty"`
+		OS              string   `json:"os,omitempty"`
+		Arch            string   `json:"arch,omitempty"`
+		GPUCount        int      `json:"gpu_count,omitempty"`
+		GPUCapabilities []string `json:"gpu_capabilities,omitempty"`
 	} `json:"resources"`
 	Policy struct {
 		TimeoutSeconds int `json:"timeout_seconds,omitempty"`
@@ -156,6 +172,9 @@ type workloadSubmission struct {
 func (a *app) submitCommand(kind, action string) *cobra.Command {
 	var input workloadSubmission
 	var key string
+	var node string
+	var preferred string
+	var allowFallback bool
 	cmd := &cobra.Command{
 		Use: action + " IMAGE [-- ARG ...]", Short: "Submit a locally provisioned Linux Docker image",
 		Args: func(cmd *cobra.Command, args []string) error {
@@ -167,6 +186,19 @@ func (a *app) submitCommand(kind, action string) *cobra.Command {
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			input.Kind, input.Image, input.Args = kind, args[0], args[1:]
+			switch {
+			case node != "":
+				if node != "local" && !strings.HasPrefix(node, "wk-") {
+					return failure(2, "invalid_id", "--node must be a worker ID like wk-…")
+				}
+				input.Placement, input.WorkerID = "manual", node
+			case preferred != "":
+				input.Placement = "preferred"
+				input.PreferredWorkers = strings.Split(preferred, ",")
+				input.Fallback = &allowFallback
+			default:
+				input.Placement = "auto"
+			}
 			if key == "" {
 				key = rand.Text()
 			}
@@ -176,12 +208,18 @@ func (a *app) submitCommand(kind, action string) *cobra.Command {
 	flags := cmd.Flags()
 	flags.StringVar(&key, "idempotency-key", "", "Reuse this key to safely retry a submission")
 	flags.StringVar(&input.Service, "service", "", "Workload service label")
-	flags.StringVar(&input.WorkerID, "worker", "", "Assign explicitly to the local worker")
+	flags.StringVar(&node, "node", "", "Run on this worker (manual placement)")
+	flags.StringVar(&preferred, "preferred", "", "Comma-separated worker preference order (preferred placement)")
+	flags.BoolVar(&allowFallback, "allow-fallback", true, "Preferred placement may fall back to automatic selection")
+	flags.StringVar(&input.Placement, "placement", "", "Override placement mode: auto, manual or preferred")
+	flags.IntVar(&input.Priority, "priority", 0, "Queue priority 1–100 (default 50)")
 	flags.Int64Var(&input.Resources.CPUMillis, "cpu-millis", 0, "CPU request in millicores")
 	flags.Int64Var(&input.Resources.Memory, "memory-bytes", 0, "Memory request in bytes")
+	flags.Int64Var(&input.Resources.StorageBytes, "storage-bytes", 0, "Storage request in bytes")
 	flags.StringVar(&input.Resources.OS, "os", "", "Required Docker runtime OS")
 	flags.StringVar(&input.Resources.Arch, "arch", "", "Required Docker runtime architecture")
-	flags.IntVar(&input.Resources.GPUCount, "gpus", 0, "Required GPU count (queues until supported)")
+	flags.IntVar(&input.Resources.GPUCount, "gpus", 0, "Required GPU count")
+	flags.StringSliceVar(&input.Resources.GPUCapabilities, "gpu-capability", nil, "Required GPU capabilities (cuda, rocm, …)")
 	flags.IntVar(&input.Policy.TimeoutSeconds, "timeout", 0, "Batch runtime or service startup timeout in seconds")
 	flags.IntVar(&input.Policy.MaxRetries, "retries", 0, "Maximum retries after a failed attempt")
 	return cmd

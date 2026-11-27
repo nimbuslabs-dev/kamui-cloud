@@ -6,11 +6,13 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/apierr"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/auth"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/core"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/identity"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/worker"
 )
 
 func coreError(w http.ResponseWriter, err error) {
@@ -28,10 +30,10 @@ func coreError(w http.ResponseWriter, err error) {
 }
 
 func registerCore(mux *http.ServeMux, e *core.Engine) {
-	registerCoreWithIdentity(mux, e, nil)
+	registerCoreWithIdentity(mux, e, nil, nil)
 }
 
-func registerCoreWithIdentity(mux *http.ServeMux, e *core.Engine, idStore *identity.Store) {
+func registerCoreWithIdentity(mux *http.ServeMux, e *core.Engine, idStore *identity.Store, workerStore *worker.Store) {
 	authorizeProject := func(w http.ResponseWriter, r *http.Request, projectID string, perm identity.Permission) (identity.Principal, bool) {
 		if idStore == nil {
 			return auth.OperatorPrincipal(), true
@@ -67,20 +69,47 @@ func registerCoreWithIdentity(mux *http.ServeMux, e *core.Engine, idStore *ident
 			apierr.WriteError(w, http.StatusBadRequest, "invalid_request", "invalid workload JSON")
 			return
 		}
+		// A client that omits the placement mode inherits the project's
+		// scheduling preferences; explicit modes always win.
+		explicitPlacement := input.Placement
+		projectID := requestedProjectID(r, "")
+		if workerStore != nil && explicitPlacement == "" {
+			if prefs, err := workerStore.ProjectPrefs(r.Context(), projectID); err == nil && prefs.Mode != core.PlacementAuto {
+				input.Placement = prefs.Mode
+				if prefs.Mode == core.PlacementManual {
+					input.WorkerID = firstWorker(prefs.PreferredWorkers)
+					input.PreferredWorkers = nil
+				} else {
+					input.PreferredWorkers = prefs.PreferredWorkers
+					input.Fallback = &prefs.Fallback
+				}
+			}
+		}
 		if err := input.Normalize(); err != nil {
 			apierr.WriteError(w, http.StatusBadRequest, "invalid_workload", err.Error())
 			return
 		}
-		projectID := requestedProjectID(r, "")
 		p, ok := authorizeProject(w, r, projectID, identity.PermWorkloadWrite)
 		if !ok {
 			return
+		}
+		input.SetScope(projectID, p.User.ID)
+		if input.Placement == core.PlacementManual && workerStore != nil {
+			workers, err := workerStore.Workers(r.Context())
+			if err != nil {
+				coreError(w, err)
+				return
+			}
+			if err := core.CheckManualSubmission(input, projectID, p.User.ID, workers, time.Now().UTC()); err != nil {
+				apierr.WriteError(w, http.StatusUnprocessableEntity, "invalid_placement", err.Error())
+				return
+			}
 		}
 		var item core.Workload
 		var created bool
 		var err error
 		if store, ok := e.Repo.(*core.Store); ok {
-			item, created, err = store.SubmitForProject(r.Context(), projectID, input, key)
+			item, created, err = store.SubmitForProjectAs(r.Context(), projectID, p.User.ID, input, key)
 		} else {
 			item, created, err = e.Repo.Submit(r.Context(), input, key)
 		}
@@ -221,4 +250,11 @@ func registerCoreWithIdentity(mux *http.ServeMux, e *core.Engine, idStore *ident
 		}
 		apierr.WriteJSON(w, http.StatusOK, events)
 	})
+}
+
+func firstWorker(preferred []string) string {
+	if len(preferred) > 0 {
+		return preferred[0]
+	}
+	return ""
 }

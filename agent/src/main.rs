@@ -1,4 +1,10 @@
 mod capabilities;
+mod client;
+mod docker;
+mod enroll;
+mod state;
+mod telemetry;
+mod worker;
 
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -41,20 +47,9 @@ fn local_ip() -> Result<String, Box<dyn std::error::Error>> {
     Ok(socket.local_addr()?.ip().to_string())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = env::args_os().skip(1);
-    if args.next().is_some_and(|arg| arg == "capabilities") {
-        let path = args
-            .next()
-            .map_or_else(env::current_dir, |path| Ok(path.into()))?;
-        if args.next().is_some() {
-            return Err("usage: kamui-agent capabilities [storage-path]".into());
-        }
-        capabilities::report(&path, std::io::stdout().lock())?;
-        println!();
-        return Ok(());
-    }
-
+/// Legacy compatibility mode retained for the pre-existing deployment: node
+/// registration and CPU/memory heartbeats against the in-memory registry.
+fn legacy_run() -> Result<(), Box<dyn std::error::Error>> {
     let api_url = env::var("KAMUI_API_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
 
     let token =
@@ -177,4 +172,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Agent stopped.");
     Ok(())
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = env::args_os().skip(1);
+    let first = args.next();
+    match first.as_ref().and_then(|arg| arg.to_str()) {
+        Some("capabilities") => {
+            let path = args
+                .next()
+                .map_or_else(env::current_dir, |path| Ok(path.into()))?;
+            if args.next().is_some() {
+                return Err("usage: kamui-agent capabilities [storage-path]".into());
+            }
+            capabilities::report(&path, std::io::stdout().lock())?;
+            println!();
+            Ok(())
+        }
+        Some("enroll") => enroll::run(args.map(|a| a.into_string().unwrap_or_default()).collect())
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() }),
+        Some("worker") => worker::run(args.map(|a| a.into_string().unwrap_or_default()).collect())
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() }),
+        Some("help") | Some("--help") | Some("-h") => {
+            println!("kamui-agent — Kamui Cloud worker agent");
+            println!();
+            println!("USAGE:");
+            println!("  kamui-agent capabilities [storage-path]     Print hardware capabilities as JSON");
+            println!("  kamui-agent enroll --url URL --token TOKEN  Enroll this device as a worker");
+            println!("  kamui-agent worker [--ca-file PATH]         Run the worker loop (requires enrollment)");
+            println!();
+            println!("Running without arguments keeps the legacy node-registration heartbeat mode.");
+            Ok(())
+        }
+        Some(_) => {
+            // Legacy mode consumes nothing extra; keep its behavior identical.
+            legacy_run()
+        }
+        None => legacy_run(),
+    }
 }

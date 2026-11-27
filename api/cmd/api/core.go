@@ -15,16 +15,17 @@ import (
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/connect"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/core"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/identity"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/worker"
 )
 
-func openCore(ctx context.Context, cfg *config.Config) (*core.Engine, *identity.Store, *connect.Store, func(), error) {
+func openCore(ctx context.Context, cfg *config.Config) (*core.Engine, *identity.Store, *connect.Store, *worker.Store, func(), error) {
 	path := os.Getenv("KAMUI_CORE_DATA_FILE")
 	if path == "" {
 		path = filepath.Join(filepath.Dir(cfg.WorkspaceDataFile), "kamui-core.sqlite")
 	}
 	for _, candidate := range []string{path, path + ".lock", path + "-wal", path + "-shm"} {
 		if samePath(candidate, cfg.WorkspaceDataFile) {
-			return nil, nil, nil, nil, errors.New("core and workspace data must use separate files")
+			return nil, nil, nil, nil, nil, errors.New("core and workspace data must use separate files")
 		}
 	}
 
@@ -35,29 +36,29 @@ func openCore(ctx context.Context, cfg *config.Config) (*core.Engine, *identity.
 	case "", "local":
 		cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 		if err != nil {
-			return nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, err
 		}
 		closeExecutor = func() { _ = cli.Close() }
 		local, err := core.NewDockerExecutor(cli, "native")
 		if err != nil {
 			closeExecutor()
-			return nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, err
 		}
 		executor = local
 		probe = hostProbe(path)
 	case "manager":
 		bridge, err := core.NewBridge(cfg.WorkspaceManagerURL, cfg.Token)
 		if err != nil {
-			return nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, err
 		}
 		executor = bridge
 	default:
-		return nil, nil, nil, nil, errors.New("KAMUI_CORE_EXECUTOR must be local or manager")
+		return nil, nil, nil, nil, nil, errors.New("KAMUI_CORE_EXECUTOR must be local or manager")
 	}
 	store, err := core.Open(ctx, path)
 	if err != nil {
 		closeExecutor()
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 	cleanup := func() {
 		_ = store.Close()
@@ -66,15 +67,20 @@ func openCore(ctx context.Context, cfg *config.Config) (*core.Engine, *identity.
 	idStore := identity.NewStore(store.DB(), cfg.Token, cfg.AdminPassword)
 	if err := idStore.EnsureAdminBootstrap(ctx); err != nil {
 		cleanup()
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 	connStore := connect.NewStore(store.DB(), idStore, cfg.CAPath)
 	engine := core.NewEngine(store, executor, probe)
+	workers := worker.NewStore(store.DB())
+	workers.UseLocalStore(store)
+	// Cluster scheduling extends the engine; a nil store would keep the
+	// single-host behavior, which is never what a Kamui deployment wants here.
+	engine.Cluster = workers
 	if err := engine.Register(ctx); err != nil {
 		cleanup()
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
-	return engine, idStore, connStore, cleanup, nil
+	return engine, idStore, connStore, workers, cleanup, nil
 }
 
 func samePath(a, b string) bool {
