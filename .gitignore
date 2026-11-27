@@ -43,3 +43,6 @@ datasets/
 # Local Kamui HTTPS files
 /ops/tls-local/
 /api/workspaces.json
+
+# Local coordinator persistence
+kamui-core.sqlite*

@@ -21,6 +21,7 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/apierr"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/auth"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/core"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/workspaceinput"
 )
 
@@ -171,6 +172,13 @@ func managerRouter(wm *WorkspaceManager, token string) http.Handler {
 		apierr.WriteJSON(w, http.StatusOK, result)
 	})
 	mux.Handle("/workspace/", auth.Middleware(token)(privileged))
+	if wm.docker != nil {
+		executor, err := core.NewDockerExecutor(wm.docker, wm.project)
+		if err != nil {
+			panic(err)
+		}
+		mux.Handle("/internal/core/docker/", auth.Middleware(token)(core.BridgeHandler(executor)))
+	}
 	return mux
 }
 

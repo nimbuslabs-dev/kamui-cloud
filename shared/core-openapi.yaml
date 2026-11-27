@@ -1,0 +1,255 @@
+openapi: 3.0.3
+info:
+  title: Kamui Cloud Core API
+  version: 1.0.0
+  description: Private administrative API for durable local workloads.
+servers:
+  - url: http://127.0.0.1:8080
+    description: Native coordinator
+  - url: http://api:8080
+    description: Compose control network
+security:
+  - bearerAuth: []
+paths:
+  /v1/workers/local:
+    get:
+      operationId: getLocalWorker
+      responses:
+        '200':
+          description: Registered local worker and available capabilities
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Worker' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workloads:
+    post:
+      operationId: submitWorkload
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, pattern: '^[a-zA-Z0-9_.:-]{1,128}$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Submission' }
+      responses:
+        '202': { $ref: '#/components/responses/Workload' }
+        '200': { $ref: '#/components/responses/Workload' }
+        '409': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+    get:
+      operationId: listWorkloads
+      responses:
+        '200':
+          description: Up to 100 workloads, newest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Workload' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workloads/{id}:
+    parameters:
+      - $ref: '#/components/parameters/WorkloadID'
+    get:
+      operationId: getWorkload
+      responses:
+        '200': { $ref: '#/components/responses/Workload' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workloads/{id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/WorkloadID'
+    post:
+      operationId: cancelWorkload
+      description: Records cancellation intent. A terminal workload is returned as-is.
+      responses:
+        '200': { $ref: '#/components/responses/Workload' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workloads/{id}/logs:
+    parameters:
+      - $ref: '#/components/parameters/WorkloadID'
+    get:
+      operationId: getWorkloadLogs
+      responses:
+        '200':
+          description: Bounded combined stdout and stderr from the current or most recent attempt
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [attempt, tail]
+                properties:
+                  attempt: { type: integer, minimum: 0 }
+                  tail: { type: string }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workload-events:
+    get:
+      operationId: listWorkloadEvents
+      parameters:
+        - name: after
+          in: query
+          schema: { type: integer, format: int64, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: Up to 100 state changes in ascending event ID order
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Event' }
+        default: { $ref: '#/components/responses/Error' }
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer }
+  parameters:
+    WorkloadID:
+      in: path
+      name: id
+      required: true
+      schema: { type: string, pattern: '^wl-[0-9a-f]{32}$' }
+  responses:
+    Workload:
+      description: Persisted workload snapshot
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Workload' }
+    Error:
+      description: Request could not be completed
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error]
+            properties:
+              error:
+                type: object
+                required: [code, message]
+                properties:
+                  code: { type: string }
+                  message: { type: string }
+  schemas:
+    Submission:
+      type: object
+      required: [image]
+      additionalProperties: false
+      properties:
+        service: { type: string, enum: [workspace, run, deploy, train, infer, store], default: run }
+        kind: { type: string, enum: [job, service], default: job }
+        image: { type: string, minLength: 1, maxLength: 255 }
+        args:
+          type: array
+          maxItems: 64
+          items: { type: string, maxLength: 4096 }
+        resources:
+          type: object
+          additionalProperties: false
+          properties:
+            cpu_millis: { type: integer, minimum: 10, maximum: 256000, default: 250 }
+            memory_bytes: { type: integer, format: int64, minimum: 16777216, maximum: 1099511627776, default: 134217728 }
+            os: { type: string, enum: [linux, windows, macos] }
+            arch: { type: string, enum: [amd64, arm64] }
+            gpu_count: { type: integer, minimum: 0, maximum: 64, default: 0 }
+        policy:
+          type: object
+          additionalProperties: false
+          properties:
+            timeout_seconds: { type: integer, minimum: 1, maximum: 86400, default: 300 }
+            max_retries: { type: integer, minimum: 0, maximum: 3, default: 0 }
+        worker_id: { type: string, enum: [local] }
+    State:
+      type: string
+      enum: [PENDING, QUEUED, ASSIGNED, STARTING, RUNNING, UNHEALTHY, STOPPING, SUCCEEDED, FAILED, CANCELLED, STOPPED]
+    Workload:
+      type: object
+      required: [id, project_id, submission, state, created_at, updated_at, attempt, cancel_requested]
+      properties:
+        id: { type: string }
+        project_id: { type: string }
+        submission: { $ref: '#/components/schemas/Submission' }
+        state: { $ref: '#/components/schemas/State' }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        attempt: { type: integer, minimum: 0 }
+        cancel_requested: { type: boolean }
+        stop_reason: { type: string }
+        queue_reason: { type: string }
+        assignment:
+          type: object
+          required: [worker_id, runtime_id, attempt, lease_until, deadline, reservation]
+          properties:
+            worker_id: { type: string }
+            runtime_id: { type: string }
+            attempt: { type: integer }
+            lease_until: { type: string, format: date-time }
+            deadline: { type: string, format: date-time }
+            reservation:
+              type: object
+              required: [cpu_millis, memory_bytes]
+              properties:
+                cpu_millis: { type: integer }
+                memory_bytes: { type: integer, format: int64 }
+        result:
+          type: object
+          required: [exit_code]
+          properties:
+            exit_code: { type: integer, nullable: true }
+            reason: { type: string }
+    Worker:
+      type: object
+      required: [id, health, heartbeat]
+      properties:
+        id: { type: string, enum: [local] }
+        health: { type: string, enum: [probing, healthy, unavailable] }
+        heartbeat: { type: string, format: date-time }
+        docker:
+          type: object
+          properties:
+            id: { type: string }
+            os: { type: string }
+            arch: { type: string }
+            logical_cpus: { type: integer }
+            memory_total_bytes: { type: integer, format: int64 }
+        device:
+          type: object
+          properties:
+            id: { type: string }
+            capabilities: { $ref: '#/components/schemas/Capabilities' }
+    Capabilities:
+      type: object
+      properties:
+        hostname: { type: string }
+        os: { type: string }
+        arch: { type: string }
+        logical_cpus: { type: integer, nullable: true }
+        memory_total_bytes: { type: integer, format: int64, nullable: true }
+        memory_available_bytes: { type: integer, format: int64, nullable: true }
+        storage_available_bytes: { type: integer, format: int64, nullable: true }
+        docker_available: { type: boolean, nullable: true }
+        runtimes:
+          type: array
+          nullable: true
+          items: { type: string }
+        gpus:
+          type: array
+          nullable: true
+          items:
+            type: object
+            properties:
+              vendor: { type: string }
+              model: { type: string }
+              available_memory_bytes: { type: integer, format: int64, nullable: true }
+              capabilities:
+                type: array
+                items: { type: string }
+    Event:
+      type: object
+      required: [id, workload_id, state, attempt, at]
+      properties:
+        id: { type: integer, format: int64 }
+        workload_id: { type: string }
+        state: { $ref: '#/components/schemas/State' }
+        attempt: { type: integer }
+        at: { type: string, format: date-time }

@@ -2,7 +2,10 @@ openapi: 3.0.3
 info:
   title: Kamui Cloud API
   version: 0.1.0
-  description: One contract for api (8080), store (9000) and infer (8090). Only the head edits this file.
+  description: Compatibility contract for api (8080), store (9000) and infer (8090).
+externalDocs:
+  description: Durable coordinator workloads, workers and events
+  url: ./core-openapi.yaml
 servers:
   - url: http://localhost:8080
 security:

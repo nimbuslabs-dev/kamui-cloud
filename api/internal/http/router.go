@@ -6,12 +6,20 @@ import (
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/apierr"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/auth"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/config"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/core"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/registry"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/scheduler"
 )
 
 func NewRouter(cfg *config.Config, reg *registry.Registry, queue *scheduler.Queue) (http.Handler, error) {
+	return NewRouterWithCore(cfg, reg, queue, nil)
+}
+
+func NewRouterWithCore(cfg *config.Config, reg *registry.Registry, queue *scheduler.Queue, engine *core.Engine) (http.Handler, error) {
 	mux := http.NewServeMux()
+	if engine != nil {
+		registerCore(mux, engine)
+	}
 	mux.HandleFunc("GET /healthz", HandleHealthz)
 
 	nodeHandler := NewNodeHandler(reg)

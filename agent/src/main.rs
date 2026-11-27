@@ -1,3 +1,5 @@
+mod capabilities;
+
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::net::UdpSocket;
@@ -40,6 +42,19 @@ fn local_ip() -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = env::args_os().skip(1);
+    if args.next().is_some_and(|arg| arg == "capabilities") {
+        let path = args
+            .next()
+            .map_or_else(env::current_dir, |path| Ok(path.into()))?;
+        if args.next().is_some() {
+            return Err("usage: kamui-agent capabilities [storage-path]".into());
+        }
+        capabilities::report(&path, std::io::stdout().lock())?;
+        println!();
+        return Ok(());
+    }
+
     let api_url = env::var("KAMUI_API_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
 
     let token =

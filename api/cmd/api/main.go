@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -18,6 +19,7 @@ import (
 )
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
@@ -26,14 +28,26 @@ func main() {
 
 	reg := registry.NewRegistry()
 	queue := scheduler.NewQueue(time.Now)
-	router, err := httpapi.NewRouter(cfg, reg, queue)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	engine, closeCore, err := openCore(ctx, cfg)
+	if err != nil {
+		slog.Error("initialize core", "error", err)
+		os.Exit(1)
+	}
+	defer closeCore()
+	router, err := httpapi.NewRouterWithCore(cfg, reg, queue, engine)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "initialize API: %v\n", err)
 		os.Exit(1)
 	}
 
+	host := "127.0.0.1"
+	if os.Getenv("KAMUI_CORE_EXECUTOR") == "manager" {
+		host = ""
+	}
 	srv := &http.Server{
-		Addr:              net.JoinHostPort("", cfg.Port),
+		Addr:              net.JoinHostPort(host, cfg.Port),
 		Handler:           router,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       10 * time.Second,
@@ -41,8 +55,9 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	engineDone := make(chan struct{})
+	go func() { defer close(engineDone); engine.Run(ctx) }()
+	defer func() { stop(); <-engineDone }()
 
 	serverErr := make(chan error, 1)
 	go func() {
