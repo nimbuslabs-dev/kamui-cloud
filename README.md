@@ -79,7 +79,7 @@ Kamui is **not** a replacement for AWS, Google Cloud or Zoho. Those run huge dat
 | **Infer** | Serve a trained model as an API | SageMaker Endpoints |
 | **Drop** | Send files between phone and laptop | AirDrop |
 | **Console** | Web dashboard for nodes, files and jobs | AWS Console |
-| **CLI** | The `kamui` command | AWS CLI |
+| **CLI** | The [`kamui-cloud` command](cli/README.md) | AWS CLI |
 
 ## How it works
 
@@ -167,7 +167,7 @@ kamui-cloud/
   api/       Coordinator: registry and scheduler (Go)
   store/     File storage service (Go)
   run/       Docker job runner (Go)
-  cli/       The kamui command (Go)
+  cli/       The kamui-cloud command (Go)
   train/     Model training (Python)
   infer/     Model serving (Python)
   console/   Web dashboard (TypeScript)
