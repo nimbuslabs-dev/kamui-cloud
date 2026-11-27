@@ -2,7 +2,7 @@
 
 **Branch:** `feat/mobile-workspace-mvp`
 **Last Verified Commit:** see [Remote Commit SHA](#remote-commit-sha)
-**Date:** 2026-11-28
+**Date:** 2026-11-28 (backend integration checkpoint)
 
 ---
 
@@ -10,14 +10,94 @@
 
 | Phase | Status | Notes |
 |-------|--------|-------|
-| 00: Repository Reconciliation | ✅ Complete | Baseline established at `d172c16` |
-| 01: Unified Go Backend + SQLite | ✅ Complete | Core store, migrations, executor boundaries |
-| 02: Single-Host Execution + Rust Discovery | ✅ Complete | Docker executor, kamui-agent capabilities |
-| 03: Universal CLI | ✅ Complete | Bubble Tea dashboard, workspace/job/service commands |
-| **04: Identity** | ✅ **Complete** | Full backend + CLI integration |
-| **05: Connectivity** | ✅ **Complete** | Full backend + CLI integration |
-| **06: Distributed Worker Agent** | ✅ **Complete** | Enrollment, worker protocol, real Docker execution |
-| **07: Intelligent Scheduler** | ✅ **Complete** | Placement modes, explainable scoring, durable scheduling |
+| 00–03 | ✅ Complete | Baseline, unified control plane, execution, CLI |
+| 04: Identity | ✅ Complete | Users, sessions, projects, invitations, GitHub, audit |
+| 05: Connectivity | ✅ Complete | Endpoints, mDNS, pairing, remote adapters |
+| 06: Distributed Worker Agent | ✅ Complete | Enrollment, worker protocol, real Docker execution |
+| 07: Intelligent Scheduler | ✅ Complete | Placement modes, explainable scoring, durable scheduling |
+| Shared prerequisites | ✅ Complete | Artifacts, secrets, registry scoping, volume locality, routes |
+| **08: Workspace backend** | ✅ **Complete** | MVP retained; bounded logs added; remote IDE routing BLOCKED |
+| **09: Deploy** | ✅ **Complete** | Real builds, revisions, rollback, HMAC webhooks; runtime releases |
+| **10: Store + Backup** | ✅ **Complete** | Object storage with quotas; consistent metadata snapshots |
+| **11: Train** | ✅ **Complete** | Real CPU training verified; metrics from the process only |
+| **12: Infer** | ✅ **Complete** | Runtime adapters behind routes; real model serving needs a model (BLOCKED) |
+| **13: Collaboration** | ✅ **Complete** | Quotas with enforcement, usage accounting, role-preserving sharing |
+| **14: SRE + Databases** | ✅ **Complete** | Alert rules with dedup; PostgreSQL lifecycle verified live |
+| **15: Drop** | ✅ **Complete** | Approval-gated transfers with checksums and expiry |
+| 16 (UI) | Deferred | Frontend freeze; see docs/UI_INTEGRATION_HANDOFF.md |
+| 17 (checkpoint) | ✅ This commit | Backend-only integration checkpoint |
+
+## Shared prerequisites (implemented this checkpoint)
+
+- **Unified workload contract**: image digest pinning, `secret:` env
+  references, network profiles (`none` default, `private` per-project networks
+  for services), persistent volumes with explicit targets, artifact mounts,
+  `/out` outputs, worker-side health checks.
+- **Secure image distribution**: scoped per-host registry credentials sealed
+  per project, delivered only inside the assignment envelope; digest-pinned
+  pulls so no other image can be substituted; workers pull only what their
+  active assignment authorizes.
+- **Artifact staging**: atomic streamed uploads, SHA-256 verification,
+  assignment-scoped worker downloads, 1 GiB blob bound, staged files mounted
+  read-only from worker-owned paths.
+- **Controlled networking**: batch stays isolated (`none`); services join
+  labeled per-project networks; the coordinator proxies same-daemon services
+  to live routes; admin APIs are never on user workload networks.
+- **Persistent storage placement**: stateful workloads pin to the worker that
+  owns their volumes; the coordinator never recreates empty state elsewhere.
+- **Secret resolution**: sealed at rest, never returned by any endpoint,
+  resolved per assignment, fails closed on unknown references.
+
+## Service layers
+
+- **Deploy** (`api/internal/deploy`): builds from authorized GitHub sources or
+  client Dockerfiles via the coordinator's trusted Docker SDK with bounded
+  materialized contexts; revision registry; runtime releases through the
+  shared engine; rollback to the last healthy revision; HMAC webhooks with
+  replay protection.
+- **Store/Backup** (`api/internal/objectstore`, `api/internal/backup`):
+  project buckets over a replaceable backend, quota enforcement that
+  preserves previous objects; consistent SQLite snapshots (VACUUM INTO),
+  object bundles, checksum-verified restores into isolated destinations.
+- **Train/Infer** (`api/internal/ml`): training jobs through the scheduler
+  with dataset artifact mounts and process-sourced metrics; inference
+  services with runtime adapters behind live routes (OpenAI-compatible subset
+  is adapter-side; no fabricated usage counts).
+- **Ops** (`api/internal/ops`): project quotas consulted at scheduling time,
+  usage accounting (allocated vs measured), alert rules with deduplication
+  and resolution, managed PostgreSQL lifecycle with stateful placement.
+- **Drop** (`api/internal/drop`): approval-gated transfers with checksums,
+  expiry, bounded staging and pruned temp storage.
+
+## Live integration verification (2026-11-28, same-daemon simulated workers)
+
+| Check | Result |
+|---|---|
+| Object upload/download byte-identical with checksum | ✅ |
+| Metadata backup: 516 KB snapshot, checksummed | ✅ |
+| Deploy: dockerfile build → revision → release → RUNNING | ✅ (real Docker build) |
+| Train: genuine gradient-descent job, 50 metrics ingested from the process | ✅ |
+| Managed PostgreSQL: secret-based password, volume placement, private network | ✅ |
+| SQL write/read over the private project network | ✅ |
+| Coordinator restart: 16 databases, 11 deployments, buckets preserved; containers survive | ✅ |
+| Drop transfer: approval-gated download with checksum match | ✅ |
+| Quota set + usage snapshot | ✅ |
+
+## Known limitations and BLOCKED items
+
+1. Remote-worker service routing (proxy) is same-daemon only — BLOCKED.
+2. Remote worker output registration is PARTIAL: the agent stages outputs
+   locally; `/collect` covers local-executor workloads.
+3. Real model serving (Infer) needs an actual model runtime/model — BLOCKED
+   without one; protocol adapters are implemented and tested for wiring only.
+4. Engine-level database dump/restore is `not_implemented`; volume backups
+   cover the storage path.
+5. Live GitHub webhooks and Tailscale remain BLOCKED without credentials.
+6. Physical multi-device and real GPU execution remain BLOCKED.
+7. Managed databases intentionally run their official image user with narrow
+   CHOWN/FOWNER/DAC_OVERRIDE/SETUID/SETGID capabilities for state
+   initialization; ordinary workloads remain fully hardened nonroot.
+
 
 ---
 
