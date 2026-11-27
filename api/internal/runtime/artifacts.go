@@ -577,6 +577,11 @@ func (s *Store) PruneRoutes(ctx context.Context) {
 	_, _ = s.db.ExecContext(ctx, "DELETE FROM service_routes WHERE expires_at<?", s.now().UnixNano())
 }
 
+// RouteLookup resolves the live route for a workload, for the service proxy.
+func (s *Store) RouteLookup(ctx context.Context, workloadID string) (ServiceRoute, error) {
+	return s.GetRoute(ctx, workloadID)
+}
+
 // --- Assignment payload assembly -------------------------------------------------
 
 // AssignmentEnvelope is the coordinator-resolved, assignment-scoped payload a

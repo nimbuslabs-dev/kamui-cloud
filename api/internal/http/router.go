@@ -5,27 +5,43 @@ import (
 
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/apierr"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/auth"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/backup"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/config"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/connect"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/core"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/deploy"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/drop"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/identity"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/ml"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/objectstore"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/ops"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/registry"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/runtime"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/scheduler"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/worker"
 )
 
+// ServiceStores aggregates the optional service-layer stores. Zero-value
+// fields keep the corresponding routes unregistered.
+type ServiceStores struct {
+	Objects *objectstore.Store
+	Backups *backup.Store
+	Train   *ml.TrainStore
+	Infer   *ml.InferStore
+	Ops     *ops.Store
+	Drop    *drop.Store
+}
+
 func NewRouter(cfg *config.Config, reg *registry.Registry, queue *scheduler.Queue) (http.Handler, error) {
-	return NewRouterWithServices(cfg, reg, queue, nil, nil, nil, nil, nil, nil)
+	return NewRouterWithServices(cfg, reg, queue, nil, nil, nil, nil, nil, nil, nil)
 }
 
 func NewRouterWithCore(cfg *config.Config, reg *registry.Registry, queue *scheduler.Queue, engine *core.Engine) (http.Handler, error) {
-	return NewRouterWithServices(cfg, reg, queue, engine, nil, nil, nil, nil, nil)
+	return NewRouterWithServices(cfg, reg, queue, engine, nil, nil, nil, nil, nil, nil)
 }
 
 func NewRouterWithIdentity(cfg *config.Config, reg *registry.Registry, queue *scheduler.Queue, engine *core.Engine, idStore *identity.Store, connStore *connect.Store) (http.Handler, error) {
-	return NewRouterWithServices(cfg, reg, queue, engine, idStore, connStore, nil, nil, nil)
+	return NewRouterWithServices(cfg, reg, queue, engine, idStore, connStore, nil, nil, nil, nil)
 }
 
 func NewRouterWithServices(
@@ -38,6 +54,7 @@ func NewRouterWithServices(
 	workerStore *worker.Store,
 	runtimeStore *runtime.Store,
 	deployStore *deploy.Store,
+	serviceStores *ServiceStores,
 ) (http.Handler, error) {
 	mux := http.NewServeMux()
 	if engine != nil {

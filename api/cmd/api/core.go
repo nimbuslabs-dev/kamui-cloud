@@ -11,23 +11,29 @@ import (
 	goruntime "runtime"
 
 	"github.com/docker/docker/client"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/backup"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/config"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/connect"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/core"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/deploy"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/drop"
+	httpapi "github.com/nimbuslabs-dev/kamui-cloud/api/internal/http"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/identity"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/ml"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/objectstore"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/ops"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/runtime"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/worker"
 )
 
-func openCore(ctx context.Context, cfg *config.Config) (*core.Engine, *identity.Store, *connect.Store, *worker.Store, *runtime.Store, *deploy.Store, func(), error) {
+func openCore(ctx context.Context, cfg *config.Config) (*core.Engine, *identity.Store, *connect.Store, *worker.Store, *runtime.Store, *deploy.Store, *httpapi.ServiceStores, func(), error) {
 	path := os.Getenv("KAMUI_CORE_DATA_FILE")
 	if path == "" {
 		path = filepath.Join(filepath.Dir(cfg.WorkspaceDataFile), "kamui-core.sqlite")
 	}
 	for _, candidate := range []string{path, path + ".lock", path + "-wal", path + "-shm"} {
 		if samePath(candidate, cfg.WorkspaceDataFile) {
-			return nil, nil, nil, nil, nil, nil, nil, errors.New("core and workspace data must use separate files")
+			return nil, nil, nil, nil, nil, nil, nil, nil, errors.New("core and workspace data must use separate files")
 		}
 	}
 
@@ -38,29 +44,29 @@ func openCore(ctx context.Context, cfg *config.Config) (*core.Engine, *identity.
 	case "", "local":
 		cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 		if err != nil {
-			return nil, nil, nil, nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, nil, nil, nil, err
 		}
 		closeExecutor = func() { _ = cli.Close() }
 		local, err := core.NewDockerExecutor(cli, "native")
 		if err != nil {
 			closeExecutor()
-			return nil, nil, nil, nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, nil, nil, nil, err
 		}
 		executor = local
 		probe = hostProbe(path)
 	case "manager":
 		bridge, err := core.NewBridge(cfg.WorkspaceManagerURL, cfg.Token)
 		if err != nil {
-			return nil, nil, nil, nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, nil, nil, nil, err
 		}
 		executor = bridge
 	default:
-		return nil, nil, nil, nil, nil, nil, nil, errors.New("KAMUI_CORE_EXECUTOR must be local or manager")
+		return nil, nil, nil, nil, nil, nil, nil, nil, errors.New("KAMUI_CORE_EXECUTOR must be local or manager")
 	}
 	store, err := core.Open(ctx, path)
 	if err != nil {
 		closeExecutor()
-		return nil, nil, nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, nil, nil, err
 	}
 	cleanup := func() {
 		_ = store.Close()
@@ -69,7 +75,7 @@ func openCore(ctx context.Context, cfg *config.Config) (*core.Engine, *identity.
 	idStore := identity.NewStore(store.DB(), cfg.Token, cfg.AdminPassword)
 	if err := idStore.EnsureAdminBootstrap(ctx); err != nil {
 		cleanup()
-		return nil, nil, nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, nil, nil, err
 	}
 	connStore := connect.NewStore(store.DB(), idStore, cfg.CAPath)
 	engine := core.NewEngine(store, executor, probe)
@@ -86,13 +92,9 @@ func openCore(ctx context.Context, cfg *config.Config) (*core.Engine, *identity.
 	engine.Volumes = runtimeStore
 	if err := engine.Register(ctx); err != nil {
 		cleanup()
-		return nil, nil, nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, nil, nil, err
 	}
 	var builder *deploy.Builder
-	if executor == nil {
-		// unreachable: executor is always set above
-		return nil, nil, nil, nil, nil, nil, nil, errors.New("executor missing")
-	}
 	if _, isLocal := executor.(*core.DockerExecutor); isLocal {
 		// Builds run on the coordinator's own trusted daemon.
 		if dockerCli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation()); err == nil {
@@ -107,7 +109,28 @@ func openCore(ctx context.Context, cfg *config.Config) (*core.Engine, *identity.
 		}
 		return route.WorkloadID, nil
 	})
-	return engine, idStore, connStore, workers, runtimeStore, deployStore, cleanup, nil
+
+	opsStore := ops.NewStore(store.DB(), store)
+	objects := objectstore.NewStore(store.DB(), &objectstore.LocalBackend{Root: storageRoot},
+		func(ctx context.Context, projectID string) (int64, error) {
+			return objectstore.ProjectStorageBytes(store.DB(), projectID)
+		},
+		func(ctx context.Context, projectID string) (int64, bool) {
+			quota, err := opsStore.GetQuota(ctx, projectID)
+			if err != nil {
+				return 0, false
+			}
+			return quota.MaxStorageBytes, quota.MaxStorageBytes > 0
+		})
+	trainStore := ml.NewTrainStore(store.DB(), store)
+	inferStore := ml.NewInferStore(store.DB(), store)
+	backupStore := backup.NewStore(store.DB(), idStore, storageRoot, nil)
+	dropStore := drop.NewStore(store.DB(), storageRoot)
+	services := &httpapi.ServiceStores{
+		Objects: objects, Backups: backupStore, Train: trainStore, Infer: inferStore,
+		Ops: opsStore, Drop: dropStore,
+	}
+	return engine, idStore, connStore, workers, runtimeStore, deployStore, services, cleanup, nil
 }
 
 func samePath(a, b string) bool {
