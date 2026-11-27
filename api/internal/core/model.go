@@ -185,6 +185,22 @@ type Reservation struct {
 	MemoryBytes int64 `json:"memory_bytes"`
 }
 
+// Validate checks standalone resource requests for service layers that submit
+// without going through the full Submission path.
+func (r Resources) Validate() error {
+	if r.CPUMillis < 10 || r.CPUMillis > 256000 || r.MemoryBytes < 16<<20 || r.MemoryBytes > 1<<40 ||
+		r.StorageBytes < 0 || r.StorageBytes > 16<<40 || r.GPUCount < 0 || r.GPUCount > 64 {
+		return errors.New("CPU, memory, storage or GPU request is outside the supported range")
+	}
+	if r.Arch != "" && r.Arch != "amd64" && r.Arch != "arm64" {
+		return errors.New("architecture must be amd64 or arm64")
+	}
+	if r.OS != "" && r.OS != "linux" && r.OS != "windows" && r.OS != "macos" {
+		return errors.New("OS must be linux, windows or macos")
+	}
+	return nil
+}
+
 type Placement interface {
 	Select(Submission, Worker, Reservation) (workerID, reason string)
 }

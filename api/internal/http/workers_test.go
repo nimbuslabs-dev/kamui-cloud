@@ -66,8 +66,8 @@ func newWorkerTestEnv(t *testing.T) *workerTestEnv {
 	engineDone := make(chan struct{})
 	go func() { defer close(engineDone); engine.Run(engineCtx) }()
 	t.Cleanup(func() { cancelEngine(); <-engineDone })
-		runtimeStore := runtime.NewStore(coreStore.DB(), cfg.Token, t.TempDir())
-	router, err := NewRouterWithServices(cfg, registry.NewRegistry(), scheduler.NewQueue(nil), engine, idStore, nil, workerStore, runtimeStore)
+	runtimeStore := runtime.NewStore(coreStore.DB(), cfg.Token, t.TempDir())
+	router, err := NewRouterWithServices(cfg, registry.NewRegistry(), scheduler.NewQueue(nil), engine, idStore, nil, workerStore, runtimeStore, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

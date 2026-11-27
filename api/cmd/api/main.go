@@ -31,13 +31,13 @@ func main() {
 	queue := scheduler.NewQueue(time.Now)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	engine, idStore, connStore, workerStore, runtimeStore, closeCore, err := openCore(ctx, cfg)
+	engine, idStore, connStore, workerStore, runtimeStore, deployStore, closeCore, err := openCore(ctx, cfg)
 	if err != nil {
 		slog.Error("initialize core", "error", err)
 		os.Exit(1)
 	}
 	defer closeCore()
-	router, err := httpapi.NewRouterWithServices(cfg, reg, queue, engine, idStore, connStore, workerStore, runtimeStore)
+	router, err := httpapi.NewRouterWithServices(cfg, reg, queue, engine, idStore, connStore, workerStore, runtimeStore, deployStore)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "initialize API: %v\n", err)
 		os.Exit(1)

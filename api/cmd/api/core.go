@@ -14,19 +14,20 @@ import (
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/config"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/connect"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/core"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/deploy"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/identity"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/runtime"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/worker"
 )
 
-func openCore(ctx context.Context, cfg *config.Config) (*core.Engine, *identity.Store, *connect.Store, *worker.Store, *runtime.Store, func(), error) {
+func openCore(ctx context.Context, cfg *config.Config) (*core.Engine, *identity.Store, *connect.Store, *worker.Store, *runtime.Store, *deploy.Store, func(), error) {
 	path := os.Getenv("KAMUI_CORE_DATA_FILE")
 	if path == "" {
 		path = filepath.Join(filepath.Dir(cfg.WorkspaceDataFile), "kamui-core.sqlite")
 	}
 	for _, candidate := range []string{path, path + ".lock", path + "-wal", path + "-shm"} {
 		if samePath(candidate, cfg.WorkspaceDataFile) {
-			return nil, nil, nil, nil, nil, nil, errors.New("core and workspace data must use separate files")
+			return nil, nil, nil, nil, nil, nil, nil, errors.New("core and workspace data must use separate files")
 		}
 	}
 
@@ -37,29 +38,29 @@ func openCore(ctx context.Context, cfg *config.Config) (*core.Engine, *identity.
 	case "", "local":
 		cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 		if err != nil {
-			return nil, nil, nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, nil, nil, err
 		}
 		closeExecutor = func() { _ = cli.Close() }
 		local, err := core.NewDockerExecutor(cli, "native")
 		if err != nil {
 			closeExecutor()
-			return nil, nil, nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, nil, nil, err
 		}
 		executor = local
 		probe = hostProbe(path)
 	case "manager":
 		bridge, err := core.NewBridge(cfg.WorkspaceManagerURL, cfg.Token)
 		if err != nil {
-			return nil, nil, nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, nil, nil, err
 		}
 		executor = bridge
 	default:
-		return nil, nil, nil, nil, nil, nil, errors.New("KAMUI_CORE_EXECUTOR must be local or manager")
+		return nil, nil, nil, nil, nil, nil, nil, errors.New("KAMUI_CORE_EXECUTOR must be local or manager")
 	}
 	store, err := core.Open(ctx, path)
 	if err != nil {
 		closeExecutor()
-		return nil, nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, nil, err
 	}
 	cleanup := func() {
 		_ = store.Close()
@@ -68,7 +69,7 @@ func openCore(ctx context.Context, cfg *config.Config) (*core.Engine, *identity.
 	idStore := identity.NewStore(store.DB(), cfg.Token, cfg.AdminPassword)
 	if err := idStore.EnsureAdminBootstrap(ctx); err != nil {
 		cleanup()
-		return nil, nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, nil, err
 	}
 	connStore := connect.NewStore(store.DB(), idStore, cfg.CAPath)
 	engine := core.NewEngine(store, executor, probe)
@@ -85,9 +86,28 @@ func openCore(ctx context.Context, cfg *config.Config) (*core.Engine, *identity.
 	engine.Volumes = runtimeStore
 	if err := engine.Register(ctx); err != nil {
 		cleanup()
-		return nil, nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, nil, err
 	}
-	return engine, idStore, connStore, workers, runtimeStore, cleanup, nil
+	var builder *deploy.Builder
+	if executor == nil {
+		// unreachable: executor is always set above
+		return nil, nil, nil, nil, nil, nil, nil, errors.New("executor missing")
+	}
+	if _, isLocal := executor.(*core.DockerExecutor); isLocal {
+		// Builds run on the coordinator's own trusted daemon.
+		if dockerCli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation()); err == nil {
+			builder = deploy.NewBuilder(dockerCli, os.TempDir())
+		}
+	}
+	deployStore := deploy.NewStore(store.DB(), idStore, store, builder)
+	deployStore.SetRouteCheck(func(ctx context.Context, workloadID string) (string, error) {
+		route, err := runtimeStore.GetRoute(ctx, workloadID)
+		if err != nil {
+			return "", err
+		}
+		return route.WorkloadID, nil
+	})
+	return engine, idStore, connStore, workers, runtimeStore, deployStore, cleanup, nil
 }
 
 func samePath(a, b string) bool {

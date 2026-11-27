@@ -2,7 +2,7 @@
 //! execution, lease renewal, cancellation, reconciliation and reconnects.
 
 use crate::capabilities;
-use crate::client::{Coordinator, Heartbeat, ReportBody, Telemetry};
+use crate::client::{AssignmentEnvelope, Coordinator, HealthCheck, Heartbeat, ReportBody, Telemetry};
 use crate::docker::{self, RunSpec};
 use crate::state::{self, WorkerState};
 use crate::telemetry::Sampler;
@@ -24,7 +24,13 @@ struct Tracked {
     attempt: i64,
     fence: String,
     running_reported: bool,
+    ready_reported: bool,
     last_renew: Instant,
+    last_health_probe: Instant,
+    envelope: Option<AssignmentEnvelope>,
+    /// Retained for diagnostics; execution uses envelope.image.
+    #[allow(dead_code)]
+    image: String,
 }
 
 #[derive(Clone)]
@@ -197,13 +203,37 @@ impl WorkerLoop {
     }
 
     fn adopt(&mut self, assignment: &crate::client::PollAssignment) {
-        let mut tracked = self.tracked.lock().expect("tracked assignments");
-        if tracked.contains_key(&assignment.workload_id) {
-            return;
+        {
+            let tracked = self.tracked.lock().expect("tracked assignments");
+            if tracked.contains_key(&assignment.workload_id) {
+                return;
+            }
         }
+        // Resolve the envelope first. Problems fail the attempt closed before
+        // any side effect; the image on the assignment is never substituted.
+        let envelope = match assignment.envelope.clone() {
+            Some(mut envelope) => {
+                if !envelope.problems.is_empty() {
+                    let detail = envelope.problems.join("; ");
+                    self.fail_before_start(&assignment.workload_id, &assignment.fence, detail);
+                    return;
+                }
+                if envelope.image.is_empty() {
+                    envelope.image = assignment.image.clone();
+                }
+                envelope
+            }
+            None => AssignmentEnvelope {
+                image: assignment.image.clone(),
+                args: assignment.args.clone(),
+                ..Default::default()
+            },
+        };
+
+        let image = envelope.image.clone();
         let spec = RunSpec {
-            image: assignment.image.clone(),
-            args: assignment.args.clone(),
+            image: image.clone(),
+            args: envelope.args.clone(),
             cpu_millis: assignment.resources.cpu_millis,
             memory_bytes: assignment.resources.memory_bytes,
             gpu_count: assignment.resources.gpu_count,
@@ -211,7 +241,12 @@ impl WorkerLoop {
             workload_id: assignment.workload_id.clone(),
             attempt: assignment.attempt,
         };
-        match docker::run(&spec) {
+        let result = self.prepare_and_run(&spec, &envelope);
+        let mut tracked = self.tracked.lock().expect("tracked assignments");
+        if tracked.contains_key(&assignment.workload_id) {
+            return;
+        }
+        match result {
             Ok(()) => {
                 tracked.insert(
                     assignment.workload_id.clone(),
@@ -219,10 +254,18 @@ impl WorkerLoop {
                         attempt: assignment.attempt,
                         fence: assignment.fence.clone(),
                         running_reported: false,
+                        ready_reported: false,
                         last_renew: Instant::now(),
+                        last_health_probe: Instant::now(),
+                        envelope: Some(envelope),
+                        image,
                     },
                 );
+                let live: Vec<String> = tracked.keys().cloned().collect();
+                let storage = self.storage_path.clone();
+                let worker = self.state.worker_id.clone();
                 drop(tracked);
+                docker::prune_staging(&storage, &worker, &live);
                 self.queue_report(QueuedReport {
                     workload_id: assignment.workload_id.clone(),
                     fence: assignment.fence.clone(),
@@ -232,23 +275,52 @@ impl WorkerLoop {
             }
             Err(err) => {
                 drop(tracked);
-                eprintln!(
-                    "start attempt for {} failed: {err}",
-                    assignment.workload_id
-                );
-                self.queue_report(QueuedReport {
-                    workload_id: assignment.workload_id.clone(),
-                    fence: assignment.fence.clone(),
-                    phase: "exit",
-                    body: ReportBody {
-                        exit_code: None,
-                        started: false,
-                        started_at: None,
-                        log_tail: err,
-                    },
-                });
+                eprintln!("start attempt for {} failed: {err}", assignment.workload_id);
+                self.fail_before_start(&assignment.workload_id, &assignment.fence, err);
             }
         }
+    }
+
+    fn fail_before_start(&mut self, workload_id: &str, fence: &str, reason: String) {
+        self.queue_report(QueuedReport {
+            workload_id: workload_id.to_string(),
+            fence: fence.to_string(),
+            phase: "exit",
+            body: ReportBody {
+                exit_code: None,
+                started: false,
+                started_at: None,
+                log_tail: reason,
+                port: None,
+                route_kind: String::new(),
+            },
+        });
+    }
+
+    /// Authorized pull, volume/network preparation, artifact staging and the
+    /// hardened container create. Every step fails closed.
+    fn prepare_and_run(&mut self, spec: &RunSpec, envelope: &AssignmentEnvelope) -> Result<(), String> {
+        if !envelope.problems.is_empty() {
+            return Err(envelope.problems.join("; "));
+        }
+        docker::pull(spec, envelope.image_digest.as_str(), envelope.registry_auth.as_ref())?;
+        for volume in &envelope.volumes {
+            docker::ensure_volume(volume)?;
+        }
+        if !envelope.project_network.is_empty() {
+            docker::ensure_project_network(&envelope.project_network)?;
+        }
+        let mut staged: Vec<(String, std::path::PathBuf)> = Vec::new();
+        for mount in &envelope.artifacts {
+            let path = docker::stage_artifact(&self.state.worker_id, &self.storage_path, &mount.artifact_id, &self.coordinator_for_staging())?;
+            staged.push((mount.path.clone(), path));
+        }
+        docker::run_enriched(spec, envelope, &staged)
+    }
+
+    fn coordinator_for_staging(&self) -> Coordinator {
+        Coordinator::new(&self.state.coordinator, &self.state.worker_token, None)
+            .expect("staging client")
     }
 
     fn stop_workload(&mut self, workload_id: &str, fence: &str) {
@@ -272,12 +344,24 @@ impl WorkerLoop {
                 started: true,
                 started_at: None,
                 log_tail: logs,
+                port: None,
+                route_kind: String::new(),
             },
         });
     }
 
     fn supervise(&mut self) {
-        let snapshot: Vec<(String, i64, String, bool, Instant)> = {
+        type Supervision = (
+            String,
+            i64,
+            String,
+            bool,
+            Instant,
+            bool,
+            Instant,
+            Option<AssignmentEnvelope>,
+        );
+        let snapshot: Vec<Supervision> = {
             let tracked = self.tracked.lock().expect("tracked assignments");
             tracked
                 .iter()
@@ -288,11 +372,14 @@ impl WorkerLoop {
                         t.fence.clone(),
                         t.running_reported,
                         t.last_renew,
+                        t.ready_reported,
+                        t.last_health_probe,
+                        t.envelope.clone(),
                     )
                 })
                 .collect()
         };
-        for (workload_id, attempt, fence, running_reported, last_renew) in snapshot {
+        for (workload_id, attempt, fence, running_reported, last_renew, ready_reported, last_health_probe, tracked_envelope) in snapshot {
             match docker::inspect(&workload_id, attempt) {
                 Some(state) if state.status == "running" || state.status == "created" => {
                     let now = Instant::now();
@@ -306,6 +393,8 @@ impl WorkerLoop {
                                 started: true,
                                 started_at: Some(now_or(&state.started_at)),
                                 log_tail: docker::logs_tail(&workload_id, attempt).unwrap_or_default(),
+                                port: None,
+                                route_kind: String::new(),
                             },
                         });
                         self.mark_running(&workload_id);
@@ -318,13 +407,61 @@ impl WorkerLoop {
                         });
                         self.mark_renewed(&workload_id);
                     }
+                    // Worker-side readiness probing for hosted services. The
+                    // route report only fires once the probe actually passes.
+                    if let Some(envelope) = &tracked_envelope {
+                        if let Some(check) = &envelope.health_check {
+                            if now.duration_since(last_health_probe) >= health_interval(check) {
+                                if let Some(t) = self.tracked.lock().expect("tracked assignments").get_mut(&workload_id) {
+                                    t.last_health_probe = now;
+                                }
+                                if !ready_reported && docker::probe_readiness(&workload_id, attempt, check) {
+                                    if let Some(t) = self.tracked.lock().expect("tracked assignments").get_mut(&workload_id) {
+                                        t.ready_reported = true;
+                                    }
+                                    self.queue_report(QueuedReport {
+                                        workload_id: workload_id.clone(),
+                                        fence: fence.clone(),
+                                        phase: "route",
+                                        body: ReportBody {
+                                            exit_code: None,
+                                            started: true,
+                                            started_at: None,
+                                            log_tail: String::new(),
+                                            port: Some(check.port),
+                                            route_kind: if check.kind == "tcp" { "tcp".into() } else { "http".into() },
+                                        },
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
                 Some(state) => {
-                    // Exited (or dead): report the exit and clean up.
+                    // Exited (or dead): collect declared outputs, then report
+                    // the exit and clean up every artifact of the attempt.
+                    let mut collected: Vec<String> = Vec::new();
+                    if let Some(envelope) = &tracked_envelope {
+                        for output in &envelope.outputs {
+                            match docker::collect_output(&workload_id, attempt, output, &self.storage_path, &self.state.worker_id) {
+                                Ok(path) => collected.push(path.to_string_lossy().to_string()),
+                                Err(err) => eprintln!("output collection failed for {workload_id} at {output}: {err}"),
+                            }
+                        }
+                    }
                     let logs = docker::logs_tail(&workload_id, attempt).unwrap_or_default();
                     let exit_code = state.exit_code as i32;
                     let started = !state.started_at.is_empty();
                     let _ = docker::remove(&workload_id, attempt);
+                    docker::remove_output_volume(&workload_id, attempt);
+                    let live: Vec<String> = self
+                        .tracked
+                        .lock()
+                        .expect("tracked assignments")
+                        .keys()
+                        .cloned()
+                        .collect();
+                    docker::prune_staging(&self.storage_path, &self.state.worker_id, &live);
                     self.tracked
                         .lock()
                         .expect("tracked assignments")
@@ -338,8 +475,11 @@ impl WorkerLoop {
                             started,
                             started_at: None,
                             log_tail: logs,
+                            port: None,
+                            route_kind: String::new(),
                         },
                     });
+                    let _ = collected;
                 }
                 None => {
                     // The container vanished without our involvement.
@@ -356,6 +496,8 @@ impl WorkerLoop {
                             started: false,
                             started_at: None,
                             log_tail: "container disappeared from the local runtime".into(),
+                            port: None,
+                            route_kind: String::new(),
                         },
                     });
                 }
@@ -477,6 +619,11 @@ impl HeartbeatWorker {
         }
         json!({ "os": std::env::consts::OS, "arch": std::env::consts::ARCH })
     }
+}
+
+fn health_interval(check: &HealthCheck) -> Duration {
+    let seconds = if check.interval_seconds < 5 { 5 } else { check.interval_seconds };
+    Duration::from_secs(seconds as u64)
 }
 
 fn now_or(raw: &str) -> String {

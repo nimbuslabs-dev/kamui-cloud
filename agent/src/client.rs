@@ -47,6 +47,72 @@ pub struct PollAssignment {
     #[serde(default)]
     pub args: Vec<String>,
     pub resources: Resources,
+    #[serde(default)]
+    pub envelope: Option<AssignmentEnvelope>,
+}
+
+/// Coordinator-resolved, assignment-scoped execution payload. Problems abort
+/// the assignment before any container is created.
+#[derive(Deserialize, Default, Clone)]
+pub struct AssignmentEnvelope {
+    /// The profile recorded on the submission; workers act on project_network.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub network: String,
+    #[serde(default)]
+    pub image: String,
+    #[serde(default)]
+    pub image_digest: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub project_network: String,
+    #[serde(default)]
+    pub volumes: Vec<VolumeRequest>,
+    #[serde(default)]
+    pub artifacts: Vec<ArtifactMount>,
+    #[serde(default)]
+    pub outputs: Vec<String>,
+    #[serde(default)]
+    pub health_check: Option<HealthCheck>,
+    #[serde(default)]
+    pub registry_auth: Option<RegistryAuth>,
+    #[serde(default)]
+    pub problems: Vec<String>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct VolumeRequest {
+    pub name: String,
+    /// Advisory on the local volume driver; coordinator quotas enforce size.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub size_bytes: i64,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct ArtifactMount {
+    pub artifact_id: String,
+    pub path: String,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct HealthCheck {
+    pub kind: String,
+    pub port: i64,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub interval_seconds: i64,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct RegistryAuth {
+    pub host: String,
+    pub username: String,
+    pub password: String,
 }
 
 #[derive(Deserialize)]
@@ -92,6 +158,10 @@ pub struct ReportBody {
     pub started_at: Option<String>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub log_tail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<i64>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub route_kind: String,
 }
 
 pub struct Coordinator {
@@ -152,6 +222,36 @@ impl Coordinator {
         response.json().map_err(|e| format!("decode enrollment: {e}"))
     }
 
+    /// Fetch an assignment-scoped artifact as a stream.
+    pub fn download_artifact(&self, worker_id: &str, artifact_id: &str, sink: &mut dyn FnMut(&[u8]) -> Result<(), String>) -> Result<u64, String> {
+        let url = format!("{}/v1/workers/{worker_id}/artifacts/{artifact_id}/content", self.base);
+        let response = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.worker_token)
+            .header("X-Kamui-Worker", worker_id)
+            .send()
+            .map_err(|e| format!("GET {url}: {e}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().unwrap_or_default();
+            return Err(format!("artifact fetch failed: {status} — {}", summarize(&text)));
+        }
+        use std::io::Read;
+        let mut reader = response;
+        let mut total = 0u64;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let n = reader.read(&mut buffer).map_err(|e| format!("artifact stream: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            sink(&buffer[..n])?;
+            total += n as u64;
+        }
+        Ok(total)
+    }
+
     fn post(&self, path: &str, payload: &impl Serialize) -> Result<reqwest::blocking::Response, String> {
         let url = format!("{}{}", self.base, path);
         let response = self
@@ -197,6 +297,20 @@ impl Coordinator {
         phase: &str,
         body: &ReportBody,
     ) -> Result<(), String> {
+        if phase == "route" {
+            let path = format!("/v1/workers/{worker_id}/assignments/{workload_id}/report");
+            let mut payload = serde_json::json!({ "fence": fence, "phase": "route", "port": body.port.unwrap_or(0) });
+            if !body.route_kind.is_empty() {
+                payload["route_kind"] = serde_json::json!(body.route_kind);
+            }
+            let response = self.post(&path, &payload)?;
+            let status = response.status();
+            let text = response.text().unwrap_or_default();
+            if !status.is_success() {
+                return Err(format!("route registration failed: {status} — {}", summarize(&text)));
+            }
+            return Ok(());
+        }
         let path = format!("/v1/workers/{worker_id}/assignments/{workload_id}/report");
         let payload = serde_json::json!({ "fence": fence, "phase": phase });
         let mut payload = payload;
@@ -242,6 +356,8 @@ mod tests {
             started: true,
             started_at: Some("2026-01-01T00:00:00Z".into()),
             log_tail: "hello".into(),
+            port: Some(8080),
+            route_kind: "http".into(),
         };
         let value = serde_json::to_value(&body).unwrap();
         assert_eq!(value["exit_code"], 0);

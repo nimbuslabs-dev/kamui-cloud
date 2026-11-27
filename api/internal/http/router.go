@@ -8,6 +8,7 @@ import (
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/config"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/connect"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/core"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/deploy"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/identity"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/registry"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/runtime"
@@ -16,15 +17,15 @@ import (
 )
 
 func NewRouter(cfg *config.Config, reg *registry.Registry, queue *scheduler.Queue) (http.Handler, error) {
-	return NewRouterWithServices(cfg, reg, queue, nil, nil, nil, nil, nil)
+	return NewRouterWithServices(cfg, reg, queue, nil, nil, nil, nil, nil, nil)
 }
 
 func NewRouterWithCore(cfg *config.Config, reg *registry.Registry, queue *scheduler.Queue, engine *core.Engine) (http.Handler, error) {
-	return NewRouterWithServices(cfg, reg, queue, engine, nil, nil, nil, nil)
+	return NewRouterWithServices(cfg, reg, queue, engine, nil, nil, nil, nil, nil)
 }
 
 func NewRouterWithIdentity(cfg *config.Config, reg *registry.Registry, queue *scheduler.Queue, engine *core.Engine, idStore *identity.Store, connStore *connect.Store) (http.Handler, error) {
-	return NewRouterWithServices(cfg, reg, queue, engine, idStore, connStore, nil, nil)
+	return NewRouterWithServices(cfg, reg, queue, engine, idStore, connStore, nil, nil, nil)
 }
 
 func NewRouterWithServices(
@@ -36,6 +37,7 @@ func NewRouterWithServices(
 	connStore *connect.Store,
 	workerStore *worker.Store,
 	runtimeStore *runtime.Store,
+	deployStore *deploy.Store,
 ) (http.Handler, error) {
 	mux := http.NewServeMux()
 	if engine != nil {

@@ -3,6 +3,7 @@ package httpapi
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -120,6 +121,7 @@ func (h *workerHandler) registerWorkerProtocol(publicMux, mux *http.ServeMux, ad
 	publicMux.HandleFunc("POST /v1/workers/{id}/heartbeat", h.heartbeat)
 	publicMux.HandleFunc("POST /v1/workers/{id}/poll", h.poll)
 	publicMux.HandleFunc("POST /v1/workers/{id}/assignments/{workload}/report", h.report)
+	publicMux.HandleFunc("GET /v1/workers/{id}/artifacts/{art}/content", h.workerArtifactContent)
 
 	mux.HandleFunc("POST /v1/workers/enrollments", adminOnly(h.CreateEnrollment))
 	mux.HandleFunc("GET /v1/workers/enrollments", adminOnly(h.ListEnrollments))
@@ -351,6 +353,78 @@ func (h *workerHandler) report(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	apierr.WriteJSON(w, http.StatusAccepted, map[string]any{"ok": true})
+}
+
+// workerArtifactContent streams an artifact to a worker only while the
+// artifact is mounted by one of that worker's active assignments. When the
+// assignment ends, access ends with it.
+func (h *workerHandler) workerArtifactContent(w http.ResponseWriter, r *http.Request) {
+	if h.runtime == nil {
+		apierr.WriteError(w, http.StatusServiceUnavailable, "artifacts_unavailable", "artifact staging is not enabled")
+		return
+	}
+	workerID, ok := h.authenticateWorker(r)
+	if !ok {
+		apierr.WriteError(w, http.StatusUnauthorized, "worker_unauthorized", "worker credentials are invalid")
+		return
+	}
+	artifactID := r.PathValue("art")
+	if artifactID == "" {
+		apierr.WriteError(w, http.StatusBadRequest, "invalid_request", "an artifact ID is required")
+		return
+	}
+	assignments, err := h.store.WorkerAssignments(r.Context(), workerID)
+	if err != nil {
+		slog.Warn("worker artifact lookup", "worker_id", workerID, "error", err)
+		apierr.WriteError(w, http.StatusServiceUnavailable, "artifacts_unavailable", "artifact lookup is temporarily unavailable")
+		return
+	}
+	authorized := false
+	for _, item := range assignments {
+		if item.Assignment == nil || item.Assignment.WorkerID != workerID {
+			continue
+		}
+		for _, mount := range item.Submission.Artifacts {
+			if mount.ArtifactID == artifactID {
+				authorized = true
+				break
+			}
+		}
+		if authorized {
+			break
+		}
+	}
+	if !authorized {
+		apierr.WriteError(w, http.StatusForbidden, "artifact_forbidden", "this artifact is not mounted by an active assignment of this worker")
+		return
+	}
+	// The owning project scopes the blob; resolve it via the assignment.
+	projectID := ""
+	for _, item := range assignments {
+		for _, mount := range item.Submission.Artifacts {
+			if mount.ArtifactID == artifactID {
+				projectID = item.ProjectID
+			}
+		}
+	}
+	artifact, err := h.runtime.GetArtifact(r.Context(), projectID, artifactID)
+	if err != nil {
+		runtimeError(w, err)
+		return
+	}
+	reader, size, err := h.runtime.OpenArtifact(r.Context(), artifact)
+	if err != nil {
+		runtimeError(w, err)
+		return
+	}
+	defer reader.Close()
+	w.Header().Set("Content-Type", artifact.ContentType)
+	w.Header().Set("X-Checksum-Sha256", artifact.Checksum)
+	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+	if _, err := io.Copy(w, reader); err != nil {
+		slog.Warn("worker artifact download failed", "artifact", artifact.ID, "error", err)
+	}
+	h.runtime.MarkArtifactDownloaded(r.Context(), artifact.ID)
 }
 
 func (h *workerHandler) CreateEnrollment(w http.ResponseWriter, r *http.Request) {
