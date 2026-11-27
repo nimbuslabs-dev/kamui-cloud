@@ -13,11 +13,14 @@ import (
 	"unicode"
 
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/apierr"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/auth"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/identity"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/workspaceinput"
 )
 
 type WorkspaceHandler struct {
 	store      *workspaceStore
+	identity   *identity.Store
 	managerURL string
 	token      string
 	client     *http.Client
@@ -25,12 +28,16 @@ type WorkspaceHandler struct {
 }
 
 func newWorkspaceHandler(dataPath, managerURL, token string) (*WorkspaceHandler, error) {
+	return newWorkspaceHandlerWithIdentity(dataPath, managerURL, token, nil)
+}
+
+func newWorkspaceHandlerWithIdentity(dataPath, managerURL, token string, id *identity.Store) (*WorkspaceHandler, error) {
 	store, err := openWorkspaceStore(dataPath)
 	if err != nil {
 		return nil, err
 	}
 	return &WorkspaceHandler{
-		store: store, managerURL: strings.TrimRight(managerURL, "/"), token: token,
+		store: store, identity: id, managerURL: strings.TrimRight(managerURL, "/"), token: token,
 		client: &http.Client{
 			Timeout: 75 * time.Second,
 			CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -55,6 +62,56 @@ func validateWorkspaceCreate(input WorkspaceCreate) string {
 	}
 }
 
+func workspaceProjectID(ws Workspace) string {
+	if ws.ProjectID != "" {
+		return ws.ProjectID
+	}
+	return identity.DefaultProject
+}
+
+func requestedProjectID(r *http.Request, bodyProject string) string {
+	if bodyProject != "" {
+		return bodyProject
+	}
+	if h := strings.TrimSpace(r.Header.Get("X-Kamui-Project")); h != "" {
+		return h
+	}
+	if q := strings.TrimSpace(r.URL.Query().Get("project_id")); q != "" {
+		return q
+	}
+	if p, ok := auth.FromContext(r.Context()); ok && p.ActiveProjectID != "" {
+		return p.ActiveProjectID
+	}
+	return identity.DefaultProject
+}
+
+func (h *WorkspaceHandler) authorizeProject(w http.ResponseWriter, r *http.Request, projectID string, perm identity.Permission) (identity.Principal, bool) {
+	if h.identity == nil {
+		return auth.OperatorPrincipal(), true
+	}
+	p, ok := auth.FromContext(r.Context())
+	if !ok {
+		apierr.WriteError(w, http.StatusUnauthorized, "unauthorized", "unauthorized")
+		return identity.Principal{}, false
+	}
+	if _, err := h.identity.Authorize(r.Context(), p, projectID, perm); err != nil {
+		apierr.WriteError(w, http.StatusForbidden, "forbidden", "you do not have permission for this project operation")
+		return identity.Principal{}, false
+	}
+	return p, true
+}
+
+func (h *WorkspaceHandler) userGitToken(ctx context.Context, p identity.Principal) string {
+	if h.identity == nil || p.User.ID == "" {
+		return ""
+	}
+	tok, err := h.identity.GetUserGitHubToken(ctx, p.User.ID)
+	if err != nil {
+		return ""
+	}
+	return tok
+}
+
 func (h *WorkspaceHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var input WorkspaceCreate
 	if !readWorkspaceJSON(w, r, &input) {
@@ -64,10 +121,24 @@ func (h *WorkspaceHandler) Create(w http.ResponseWriter, r *http.Request) {
 		apierr.WriteError(w, http.StatusBadRequest, "bad_request", message)
 		return
 	}
-	workspace, err := h.store.create(input)
+	projectID := requestedProjectID(r, input.ProjectID)
+	p, ok := h.authorizeProject(w, r, projectID, identity.PermWorkspaceWrite)
+	if !ok {
+		return
+	}
+	var workspace Workspace
+	var err error
+	if h.identity == nil {
+		workspace, err = h.store.create(input)
+	} else {
+		workspace, err = h.store.createOwned(input, projectID, p.User.ID)
+	}
 	if err != nil {
 		apierr.WriteError(w, http.StatusInternalServerError, "storage_error", "could not save workspace metadata")
 		return
+	}
+	if h.identity != nil {
+		_ = h.identity.RecordAudit(r.Context(), p.User.ID, projectID, "workspace.create", "workspace", workspace.ID, "success", workspace.Name)
 	}
 	apierr.WriteJSON(w, http.StatusCreated, workspace)
 }
@@ -162,23 +233,60 @@ func (h *WorkspaceHandler) List(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 4*time.Second)
 	defer cancel()
 
-	workspaces := h.store.list()
-	for i := range workspaces {
-		workspaces[i] = h.dockerStatus(ctx, workspaces[i])
+	allowed := map[string]bool{}
+	explicitProject := strings.TrimSpace(r.Header.Get("X-Kamui-Project"))
+	if explicitProject == "" {
+		explicitProject = strings.TrimSpace(r.URL.Query().Get("project_id"))
+	}
+	if h.identity != nil {
+		p, ok := auth.FromContext(r.Context())
+		if !ok {
+			apierr.WriteError(w, http.StatusUnauthorized, "unauthorized", "unauthorized")
+			return
+		}
+		if explicitProject != "" {
+			if _, ok := h.authorizeProject(w, r, explicitProject, identity.PermWorkspaceRead); !ok {
+				return
+			}
+			allowed[explicitProject] = true
+		} else {
+			ids, err := h.identity.UserProjectIDs(r.Context(), p.User.ID)
+			if err != nil {
+				apierr.WriteError(w, http.StatusInternalServerError, "storage_error", "could not load project memberships")
+				return
+			}
+			for _, id := range ids {
+				allowed[id] = true
+			}
+		}
+	}
+
+	all := h.store.list()
+	workspaces := make([]Workspace, 0, len(all))
+	for _, ws := range all {
+		if h.identity != nil && !allowed[workspaceProjectID(ws)] {
+			continue
+		}
+		workspaces = append(workspaces, h.dockerStatus(ctx, ws))
 	}
 	apierr.WriteJSON(w, http.StatusOK, workspaces)
 }
 
-func (h *WorkspaceHandler) workspace(w http.ResponseWriter, r *http.Request) (Workspace, bool) {
+func (h *WorkspaceHandler) workspace(w http.ResponseWriter, r *http.Request, perm identity.Permission) (Workspace, identity.Principal, bool) {
 	workspace, ok := h.store.get(r.PathValue("id"))
 	if !ok {
 		apierr.WriteError(w, http.StatusNotFound, "not_found", "workspace not found")
+		return Workspace{}, identity.Principal{}, false
 	}
-	return workspace, ok
+	p, ok := h.authorizeProject(w, r, workspaceProjectID(workspace), perm)
+	if !ok {
+		return Workspace{}, identity.Principal{}, false
+	}
+	return workspace, p, true
 }
 
 func (h *WorkspaceHandler) Get(w http.ResponseWriter, r *http.Request) {
-	if workspace, ok := h.workspace(w, r); ok {
+	if workspace, _, ok := h.workspace(w, r, identity.PermWorkspaceRead); ok {
 		apierr.WriteJSON(w, http.StatusOK, h.dockerStatus(r.Context(), workspace))
 	}
 }
@@ -219,7 +327,7 @@ func (h *WorkspaceHandler) lifecycle(w http.ResponseWriter, r *http.Request, ope
 	}
 	defer func() { <-h.operations }()
 
-	workspace, ok := h.workspace(w, r)
+	workspace, principal, ok := h.workspace(w, r, identity.PermWorkspaceWrite)
 	if !ok {
 		return
 	}
@@ -234,10 +342,14 @@ func (h *WorkspaceHandler) lifecycle(w http.ResponseWriter, r *http.Request, ope
 	}
 	input := any(id)
 	if operation == "start" {
-		input = map[string]string{
+		payload := map[string]string{
 			"id": workspace.ID, "name": workspace.Name,
 			"repository_url": workspace.RepositoryURL, "branch": workspace.Branch,
 		}
+		if gitToken := h.userGitToken(ctx, principal); gitToken != "" {
+			payload["git_token"] = gitToken
+		}
+		input = payload
 	}
 	if failure := h.manager(ctx, http.MethodPost, "/workspace/"+operation, input, nil); failure != nil {
 		failure.write(w)
@@ -277,6 +389,7 @@ type gitCommand struct {
 	WorkspaceID string   `json:"workspace_id"`
 	Command     string   `json:"command"`
 	Args        []string `json:"args,omitempty"`
+	GitToken    string   `json:"git_token,omitempty"`
 }
 
 func (h *WorkspaceHandler) git(w http.ResponseWriter, r *http.Request, command string, args []string, result any) bool {
@@ -285,11 +398,18 @@ func (h *WorkspaceHandler) git(w http.ResponseWriter, r *http.Request, command s
 	}
 	defer func() { <-h.operations }()
 
-	workspace, ok := h.workspace(w, r)
+	perm := identity.PermWorkspaceWrite
+	if command == "status" {
+		perm = identity.PermWorkspaceRead
+	}
+	workspace, principal, ok := h.workspace(w, r, perm)
 	if !ok {
 		return false
 	}
 	input := gitCommand{WorkspaceID: workspace.ID, Command: command, Args: args}
+	if command == "push" || command == "pull" {
+		input.GitToken = h.userGitToken(r.Context(), principal)
+	}
 	if failure := h.manager(r.Context(), http.MethodPost, "/workspace/git", input, result); failure != nil {
 		failure.write(w)
 		return false

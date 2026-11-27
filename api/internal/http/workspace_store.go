@@ -20,6 +20,8 @@ import (
 
 type Workspace struct {
 	ID            string     `json:"id"`
+	ProjectID     string     `json:"project_id,omitempty"`
+	OwnerID       string     `json:"owner_id,omitempty"`
 	Name          string     `json:"name"`
 	RepositoryURL string     `json:"repository_url"`
 	Branch        string     `json:"branch"`
@@ -35,6 +37,7 @@ type WorkspaceCreate struct {
 	Name          string `json:"name"`
 	RepositoryURL string `json:"repository_url"`
 	Branch        string `json:"branch,omitempty"`
+	ProjectID     string `json:"project_id,omitempty"`
 }
 
 type workspaceFile struct {
@@ -136,13 +139,21 @@ func (s *workspaceStore) put(id string, ws *Workspace) error {
 }
 
 func (s *workspaceStore) create(input WorkspaceCreate) (Workspace, error) {
+	return s.createOwned(input, "", "")
+}
+
+func (s *workspaceStore) createOwned(input WorkspaceCreate, projectID, ownerID string) (Workspace, error) {
 	now := time.Now().UTC()
 	var id [16]byte
 	if _, err := rand.Read(id[:]); err != nil {
 		return Workspace{}, err
 	}
+	if projectID == "" {
+		projectID = input.ProjectID
+	}
 	ws := Workspace{
-		ID: "ws-" + hex.EncodeToString(id[:]), Name: strings.TrimSpace(input.Name),
+		ID: "ws-" + hex.EncodeToString(id[:]), ProjectID: projectID, OwnerID: ownerID,
+		Name:          strings.TrimSpace(input.Name),
 		RepositoryURL: input.RepositoryURL, Branch: input.Branch, Status: "stopped",
 		CreatedAt: now, UpdatedAt: now,
 	}

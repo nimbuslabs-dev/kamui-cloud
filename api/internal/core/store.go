@@ -19,7 +19,12 @@ import (
 )
 
 //go:embed migrations/001.sql
-var schema string
+var schema001 string
+
+//go:embed migrations/002.sql
+var schema002 string
+
+const LatestSchemaVersion = 2
 
 type Repository interface {
 	EventReader
@@ -88,6 +93,8 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	return s, nil
 }
 
+func (s *Store) DB() *sql.DB { return s.db }
+
 func (s *Store) Close() error { return errors.Join(s.db.Close(), s.lock.Close()) }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -100,10 +107,14 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := tx.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
-	for _, migration := range []struct {
+	migrations := []struct {
 		version int
 		sql     string
-	}{{1, schema}} {
+	}{
+		{1, schema001},
+		{2, schema002},
+	}
+	for _, migration := range migrations {
 		if version < migration.version {
 			if _, err := tx.ExecContext(ctx, migration.sql); err != nil {
 				return fmt.Errorf("migration %d: %w", migration.version, err)
@@ -113,7 +124,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			}
 		}
 	}
-	if version > 1 {
+	if version > LatestSchemaVersion {
 		return fmt.Errorf("database schema version %d is newer than this coordinator", version)
 	}
 	return tx.Commit()
@@ -138,7 +149,14 @@ func scanWorkload(row scanner) (Workload, error) {
 }
 
 func (s *Store) Submit(ctx context.Context, spec Submission, key string) (Workload, bool, error) {
+	return s.SubmitForProject(ctx, defaultProject, spec, key)
+}
+
+func (s *Store) SubmitForProject(ctx context.Context, projectID string, spec Submission, key string) (Workload, bool, error) {
 	var zero Workload
+	if projectID == "" {
+		projectID = defaultProject
+	}
 	data, err := json.Marshal(spec)
 	if err != nil {
 		return zero, false, err
@@ -151,7 +169,7 @@ func (s *Store) Submit(ctx context.Context, spec Submission, key string) (Worklo
 	}
 	defer tx.Rollback()
 	var priorID, priorHash string
-	err = tx.QueryRowContext(ctx, "SELECT id, fingerprint FROM workloads WHERE project_id=? AND idempotency_key=?", defaultProject, key).Scan(&priorID, &priorHash)
+	err = tx.QueryRowContext(ctx, "SELECT id, fingerprint FROM workloads WHERE project_id=? AND idempotency_key=?", projectID, key).Scan(&priorID, &priorHash)
 	if err == nil {
 		if priorHash != fingerprint {
 			return zero, false, ErrConflict
@@ -170,7 +188,7 @@ func (s *Store) Submit(ctx context.Context, spec Submission, key string) (Worklo
 		return zero, false, ErrLimit
 	}
 	now := time.Now().UTC()
-	w := Workload{ID: newID(), ProjectID: defaultProject, Submission: spec, State: Pending, CreatedAt: now, UpdatedAt: now, Revision: 1}
+	w := Workload{ID: newID(), ProjectID: projectID, Submission: spec, State: Pending, CreatedAt: now, UpdatedAt: now, Revision: 1}
 	snapshot, err := json.Marshal(w)
 	if err != nil {
 		return zero, false, err
@@ -196,6 +214,33 @@ func (s *Store) List(ctx context.Context, activeOnly bool) ([]Workload, error) {
 		query = "SELECT " + columns + " FROM workloads WHERE " + active + " ORDER BY created_at, id"
 	}
 	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]Workload, 0)
+	for rows.Next() {
+		w, err := scanWorkload(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, w)
+	}
+	return items, rows.Err()
+}
+
+func (s *Store) ListForProjects(ctx context.Context, projectIDs []string) ([]Workload, error) {
+	if len(projectIDs) == 0 {
+		return []Workload{}, nil
+	}
+	placeholders := strings.Repeat("?,", len(projectIDs))
+	placeholders = placeholders[:len(placeholders)-1]
+	args := make([]any, len(projectIDs))
+	for i, id := range projectIDs {
+		args[i] = id
+	}
+	query := "SELECT " + columns + " FROM workloads WHERE project_id IN (" + placeholders + ") ORDER BY created_at DESC, id DESC LIMIT 100"
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -255,6 +300,36 @@ func recordEvent(ctx context.Context, tx *sql.Tx, w Workload) error {
 
 func (s *Store) Events(ctx context.Context, after int64) ([]Event, error) {
 	rows, err := s.db.QueryContext(ctx, "SELECT id,workload_id,state,attempt,at FROM events WHERE id>? ORDER BY id LIMIT 100", after)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	events := make([]Event, 0)
+	for rows.Next() {
+		var e Event
+		var at int64
+		if err := rows.Scan(&e.ID, &e.WorkloadID, &e.State, &e.Attempt, &at); err != nil {
+			return nil, err
+		}
+		e.At = time.Unix(0, at).UTC()
+		events = append(events, e)
+	}
+	return events, rows.Err()
+}
+
+func (s *Store) EventsForProjects(ctx context.Context, projectIDs []string, after int64) ([]Event, error) {
+	if len(projectIDs) == 0 {
+		return []Event{}, nil
+	}
+	placeholders := strings.Repeat("?,", len(projectIDs))
+	placeholders = placeholders[:len(placeholders)-1]
+	args := make([]any, 0, 1+len(projectIDs))
+	args = append(args, after)
+	for _, id := range projectIDs {
+		args = append(args, id)
+	}
+	query := "SELECT e.id,e.workload_id,e.state,e.attempt,e.at FROM events e JOIN workloads w ON w.id=e.workload_id WHERE e.id>? AND w.project_id IN (" + placeholders + ") ORDER BY e.id LIMIT 100"
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

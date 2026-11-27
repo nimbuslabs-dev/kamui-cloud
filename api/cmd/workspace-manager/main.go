@@ -32,6 +32,7 @@ type WorkspaceConfig struct {
 	Name          string `json:"name"`
 	RepositoryURL string `json:"repository_url"`
 	Branch        string `json:"branch"`
+	GitToken      string `json:"git_token,omitempty"`
 }
 
 type WorkspaceManager struct {

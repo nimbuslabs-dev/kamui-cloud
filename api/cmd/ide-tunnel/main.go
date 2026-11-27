@@ -90,6 +90,7 @@ func (t *ideTunnel) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	leaseReq.Header.Set("Origin", req.Header.Get("Origin"))
 	leaseReq.Header.Set("X-Forwarded-Proto", "https")
 	leaseReq.Header.Set("X-Kamui-Upgrade", "websocket")
+	leaseReq.Header.Set("X-Kamui-Workspace-ID", id)
 	lease, err := t.auth.Do(leaseReq)
 	if err != nil {
 		unavailable(w)

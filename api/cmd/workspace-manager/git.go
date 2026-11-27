@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"iter"
@@ -44,15 +45,21 @@ type commandResult struct {
 }
 
 func (wm *WorkspaceManager) exec(ctx context.Context, containerID string, args ...string) (commandResult, error) {
+	return wm.execWithEnv(ctx, containerID, nil, args...)
+}
+
+func (wm *WorkspaceManager) execWithEnv(ctx context.Context, containerID string, extraEnv []string, args ...string) (commandResult, error) {
 	// Closing the Docker stream does not kill exec's process. Give commands an
 	// independent deadline in the container, including their child processes.
 	cmd := append([]string{"/usr/bin/timeout", "--kill-after=2s", "45s"}, args...)
+	env := []string{
+		"GIT_TERMINAL_PROMPT=0", "LC_ALL=C",
+		"GIT_SSH_COMMAND=/usr/bin/ssh -F /dev/null -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/dev/null",
+	}
+	env = append(env, extraEnv...)
 	created, err := wm.docker.ContainerExecCreate(ctx, containerID, container.ExecOptions{
 		Cmd: cmd, WorkingDir: projectDir, User: "1000:1000", AttachStdout: true, AttachStderr: true,
-		Env: []string{
-			"GIT_TERMINAL_PROMPT=0", "LC_ALL=C",
-			"GIT_SSH_COMMAND=/usr/bin/ssh -F /dev/null -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/dev/null",
-		},
+		Env: env,
 	})
 	if err != nil {
 		return commandResult{}, fmt.Errorf("create workspace command: %w", err)
@@ -90,8 +97,21 @@ func (wm *WorkspaceManager) exec(ctx context.Context, containerID string, args .
 }
 
 func (wm *WorkspaceManager) git(ctx context.Context, id string, args ...string) (commandResult, error) {
+	return wm.gitWithToken(ctx, id, "", args...)
+}
+
+func (wm *WorkspaceManager) gitWithToken(ctx context.Context, id, token string, args ...string) (commandResult, error) {
 	global := []string{"/usr/bin/git", "-c", "credential.helper=", "-c", "core.hooksPath=/dev/null", "-c", "protocol.allow=never", "-c", "protocol.https.allow=always", "-c", "protocol.ssh.allow=always", "-c", "http.followRedirects=false"}
-	return wm.exec(ctx, id, append(global, args...)...)
+	var extraEnv []string
+	if token != "" && !strings.ContainsAny(token, "\r\n\x00") {
+		basic := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
+		extraEnv = []string{
+			"GIT_CONFIG_COUNT=1",
+			"GIT_CONFIG_KEY_0=http.https://github.com/.extraheader",
+			"GIT_CONFIG_VALUE_0=AUTHORIZATION: basic " + basic,
+		}
+	}
+	return wm.execWithEnv(ctx, id, extraEnv, append(global, args...)...)
 }
 
 func gitFailure(op string, result commandResult) error {
@@ -139,7 +159,7 @@ func pushNeedsReconciliation(output string) bool {
 	return false
 }
 
-func (wm *WorkspaceManager) cloneRepository(ctx context.Context, id, repo, branch string) error {
+func (wm *WorkspaceManager) cloneRepository(ctx context.Context, id, repo, branch, gitToken string) error {
 	const cloneMarker = ".git/kamui-clone-complete"
 	probe, err := wm.exec(ctx, id, "/usr/bin/test", "-e", ".git")
 	if err != nil {
@@ -167,7 +187,7 @@ func (wm *WorkspaceManager) cloneRepository(ctx context.Context, id, repo, branc
 		if branch != "" {
 			args = append(args, "--branch", branch)
 		}
-		result, err := wm.git(ctx, id, append(args, "--", repo, ".")...)
+		result, err := wm.gitWithToken(ctx, id, gitToken, append(args, "--", repo, ".")...)
 		if err != nil {
 			return err
 		}
@@ -195,6 +215,7 @@ type gitRequest struct {
 	WorkspaceID string   `json:"workspace_id"`
 	Command     string   `json:"command"`
 	Args        []string `json:"args"`
+	GitToken    string   `json:"git_token,omitempty"`
 }
 
 func buildGitArgs(req gitRequest) ([]string, error) {
@@ -299,7 +320,11 @@ func (wm *WorkspaceManager) workspaceGit(ctx context.Context, req gitRequest) (a
 			return nil, gitFailure("branch", ref)
 		}
 	}
-	result, err := wm.git(ctx, id, args...)
+	token := ""
+	if req.Command == "push" || req.Command == "pull" {
+		token = req.GitToken
+	}
+	result, err := wm.gitWithToken(ctx, id, token, args...)
 	if err != nil {
 		return nil, err
 	}

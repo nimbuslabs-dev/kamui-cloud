@@ -11,7 +11,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var dashboardTabs = [...]string{"Device", "Jobs", "Services", "Workspaces"}
+var dashboardTabs = [...]string{"Device", "Jobs", "Services", "Workspaces", "Identity", "Projects", "Connect"}
 
 type dashboardModel struct {
 	app       *app
@@ -57,20 +57,27 @@ func (m dashboardModel) load() tea.Cmd {
 			return reply
 		}
 		path := "/v1/workloads"
-		if m.tab == 0 {
+		switch m.tab {
+		case 0: // Device
 			path = "/v1/workers/local"
-		} else if m.tab == 3 {
+		case 3: // Workspaces
 			path = workspacesPath
+		case 4: // Identity
+			path = "/v1/auth/me"
+		case 5: // Projects
+			path = "/v1/projects"
+		case 6: // Connect
+			path = "/v1/connect/info?mdns=1"
 		}
 		data, err := client.request(m.ctx, "GET", path, nil, "")
 		switch {
 		case err != nil:
 			reply.err = err
-		case m.tab == 0:
+		case m.tab == 0 || m.tab == 4 || m.tab == 6:
 			reply.detail = jsonLines(data)
-		case m.tab == 3:
+		case m.tab == 3 || m.tab == 5:
 			reply.err = json.Unmarshal(data, &reply.items)
-		default:
+		default: // Jobs (1) or Services (2)
 			kind := "job"
 			if m.tab == 2 {
 				kind = "service"
@@ -118,7 +125,7 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch key := value.String(); key {
 		case "q", "ctrl+c":
 			return m, tea.Quit
-		case "1", "2", "3", "4", "tab", "shift+tab", "r":
+		case "1", "2", "3", "4", "5", "6", "7", "tab", "shift+tab", "r":
 			switch key {
 			case "tab":
 				m.tab = (m.tab + 1) % len(dashboardTabs)
@@ -205,7 +212,7 @@ func (m dashboardModel) View() string {
 			view.WriteString(truncate(cursor+dashboardRow(m.items[i]), m.width) + "\n")
 		}
 	}
-	view.WriteString("\n1–4 views · ↑/↓ navigate · Enter details · l logs · Esc back · r refresh · q quit")
+	view.WriteString("\n1–7 views · ↑/↓ navigate · Enter details · l logs · Esc back · r refresh · q quit")
 	return view.String()
 }
 

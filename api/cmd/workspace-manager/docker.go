@@ -181,7 +181,7 @@ func (wm *WorkspaceManager) startWorkspace(ctx context.Context, req WorkspaceCon
 			return fmt.Errorf("start workspace container: %w", err)
 		}
 	}
-	if err := wm.cloneRepository(ctx, id, req.RepositoryURL, req.Branch); err != nil {
+	if err := wm.cloneRepository(ctx, id, req.RepositoryURL, req.Branch, req.GitToken); err != nil {
 		return wm.stopFailedStart(id, err)
 	}
 	mark, err := wm.exec(ctx, id, "/usr/bin/touch", "/home/coder/.kamui-initialized")

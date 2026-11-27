@@ -5,9 +5,12 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/apierr"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/auth"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/core"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/identity"
 )
 
 func coreError(w http.ResponseWriter, err error) {
@@ -25,6 +28,26 @@ func coreError(w http.ResponseWriter, err error) {
 }
 
 func registerCore(mux *http.ServeMux, e *core.Engine) {
+	registerCoreWithIdentity(mux, e, nil)
+}
+
+func registerCoreWithIdentity(mux *http.ServeMux, e *core.Engine, idStore *identity.Store) {
+	authorizeProject := func(w http.ResponseWriter, r *http.Request, projectID string, perm identity.Permission) (identity.Principal, bool) {
+		if idStore == nil {
+			return auth.OperatorPrincipal(), true
+		}
+		p, ok := auth.FromContext(r.Context())
+		if !ok {
+			apierr.WriteError(w, http.StatusUnauthorized, "unauthorized", "unauthorized")
+			return identity.Principal{}, false
+		}
+		if _, err := idStore.Authorize(r.Context(), p, projectID, perm); err != nil {
+			apierr.WriteError(w, http.StatusForbidden, "forbidden", "you do not have permission for this project workload")
+			return identity.Principal{}, false
+		}
+		return p, true
+	}
+
 	mux.HandleFunc("GET /v1/workers/local", func(w http.ResponseWriter, r *http.Request) {
 		item, err := e.Repo.Worker(r.Context())
 		if err != nil {
@@ -48,10 +71,25 @@ func registerCore(mux *http.ServeMux, e *core.Engine) {
 			apierr.WriteError(w, http.StatusBadRequest, "invalid_workload", err.Error())
 			return
 		}
-		item, created, err := e.Repo.Submit(r.Context(), input, key)
+		projectID := requestedProjectID(r, "")
+		p, ok := authorizeProject(w, r, projectID, identity.PermWorkloadWrite)
+		if !ok {
+			return
+		}
+		var item core.Workload
+		var created bool
+		var err error
+		if store, ok := e.Repo.(*core.Store); ok {
+			item, created, err = store.SubmitForProject(r.Context(), projectID, input, key)
+		} else {
+			item, created, err = e.Repo.Submit(r.Context(), input, key)
+		}
 		if err != nil {
 			coreError(w, err)
 			return
+		}
+		if created && idStore != nil {
+			_ = idStore.RecordAudit(r.Context(), p.User.ID, projectID, "workload.submit", "workload", item.ID, "success", item.Submission.Kind+":"+item.Submission.Image)
 		}
 		w.Header().Set("Location", "/v1/workloads/"+item.ID)
 		status := http.StatusOK
@@ -61,6 +99,40 @@ func registerCore(mux *http.ServeMux, e *core.Engine) {
 		apierr.WriteJSON(w, status, item)
 	})
 	mux.HandleFunc("GET /v1/workloads", func(w http.ResponseWriter, r *http.Request) {
+		if idStore != nil {
+			p, ok := auth.FromContext(r.Context())
+			if !ok {
+				apierr.WriteError(w, http.StatusUnauthorized, "unauthorized", "unauthorized")
+				return
+			}
+			explicit := strings.TrimSpace(r.Header.Get("X-Kamui-Project"))
+			if explicit == "" {
+				explicit = strings.TrimSpace(r.URL.Query().Get("project_id"))
+			}
+			var projectIDs []string
+			if explicit != "" {
+				if _, ok := authorizeProject(w, r, explicit, identity.PermWorkloadRead); !ok {
+					return
+				}
+				projectIDs = []string{explicit}
+			} else {
+				var err error
+				projectIDs, err = idStore.UserProjectIDs(r.Context(), p.User.ID)
+				if err != nil {
+					coreError(w, err)
+					return
+				}
+			}
+			if store, ok := e.Repo.(*core.Store); ok {
+				items, err := store.ListForProjects(r.Context(), projectIDs)
+				if err != nil {
+					coreError(w, err)
+					return
+				}
+				apierr.WriteJSON(w, http.StatusOK, items)
+				return
+			}
+		}
 		items, err := e.Repo.List(r.Context(), false)
 		if err != nil {
 			coreError(w, err)
@@ -74,9 +146,20 @@ func registerCore(mux *http.ServeMux, e *core.Engine) {
 			coreError(w, err)
 			return
 		}
+		if _, ok := authorizeProject(w, r, item.ProjectID, identity.PermWorkloadRead); !ok {
+			return
+		}
 		apierr.WriteJSON(w, http.StatusOK, item)
 	})
 	mux.HandleFunc("POST /v1/workloads/{id}/cancel", func(w http.ResponseWriter, r *http.Request) {
+		existing, err := e.Repo.Get(r.Context(), r.PathValue("id"))
+		if err != nil {
+			coreError(w, err)
+			return
+		}
+		if _, ok := authorizeProject(w, r, existing.ProjectID, identity.PermWorkloadWrite); !ok {
+			return
+		}
 		item, err := e.Cancel(r.Context(), r.PathValue("id"))
 		if err != nil {
 			coreError(w, err)
@@ -85,6 +168,14 @@ func registerCore(mux *http.ServeMux, e *core.Engine) {
 		apierr.WriteJSON(w, http.StatusOK, item)
 	})
 	mux.HandleFunc("GET /v1/workloads/{id}/logs", func(w http.ResponseWriter, r *http.Request) {
+		existing, err := e.Repo.Get(r.Context(), r.PathValue("id"))
+		if err != nil {
+			coreError(w, err)
+			return
+		}
+		if _, ok := authorizeProject(w, r, existing.ProjectID, identity.PermWorkloadRead); !ok {
+			return
+		}
 		logs, err := e.Logs(r.Context(), r.PathValue("id"))
 		if err != nil {
 			coreError(w, err)
@@ -101,6 +192,27 @@ func registerCore(mux *http.ServeMux, e *core.Engine) {
 				return
 			}
 			after = id
+		}
+		if idStore != nil {
+			if store, ok := e.Repo.(*core.Store); ok {
+				p, ok := auth.FromContext(r.Context())
+				if !ok {
+					apierr.WriteError(w, http.StatusUnauthorized, "unauthorized", "unauthorized")
+					return
+				}
+				projectIDs, err := idStore.UserProjectIDs(r.Context(), p.User.ID)
+				if err != nil {
+					coreError(w, err)
+					return
+				}
+				events, err := store.EventsForProjects(r.Context(), projectIDs, after)
+				if err != nil {
+					coreError(w, err)
+					return
+				}
+				apierr.WriteJSON(w, http.StatusOK, events)
+				return
+			}
 		}
 		events, err := e.Repo.Events(r.Context(), after)
 		if err != nil {

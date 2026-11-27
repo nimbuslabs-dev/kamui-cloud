@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/config"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/connect"
 	httpapi "github.com/nimbuslabs-dev/kamui-cloud/api/internal/http"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/registry"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/scheduler"
@@ -30,16 +31,35 @@ func main() {
 	queue := scheduler.NewQueue(time.Now)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	engine, closeCore, err := openCore(ctx, cfg)
+	engine, idStore, connStore, closeCore, err := openCore(ctx, cfg)
 	if err != nil {
 		slog.Error("initialize core", "error", err)
 		os.Exit(1)
 	}
 	defer closeCore()
-	router, err := httpapi.NewRouterWithCore(cfg, reg, queue, engine)
+	router, err := httpapi.NewRouterWithServices(cfg, reg, queue, engine, idStore, connStore)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "initialize API: %v\n", err)
 		os.Exit(1)
+	}
+	if cfg.MDNSEnabled {
+		hostname, _ := os.Hostname()
+		if hostname == "" {
+			hostname = "kamui-cloud"
+		}
+		endpoints := connect.DiscoverLocalEndpoints(cfg.CLIGatewayPort, "https")
+		for _, ep := range endpoints {
+			if ep.Kind == "lan" && ep.Address != "" {
+				_ = connect.StartMDNSResponder(ctx, connect.MDNSService{
+					Instance: "kamui-" + hostname,
+					Host:     hostname,
+					Address:  ep.Address,
+					Port:     cfg.CLIGatewayPort,
+					TXT:      map[string]string{"version": "1", "tls": "1"},
+				})
+				break
+			}
+		}
 	}
 
 	host := "127.0.0.1"

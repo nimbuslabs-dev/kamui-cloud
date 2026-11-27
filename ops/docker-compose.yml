@@ -6,6 +6,8 @@ services:
       context: ../api
     environment:
       KAMUI_TOKEN: ${KAMUI_TOKEN:?Set a strong KAMUI_TOKEN in ops/.env}
+      KAMUI_ADMIN_PASSWORD: ${KAMUI_ADMIN_PASSWORD:-}
+      KAMUI_CLI_PORT: "${KAMUI_CLI_PORT:-8443}"
       WORKSPACE_MANAGER_URL: http://workspace-manager:8082
       KAMUI_WORKSPACE_DATA_FILE: /data/workspaces.json
       KAMUI_CORE_DATA_FILE: /data/kamui-core.sqlite

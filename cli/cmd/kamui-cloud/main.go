@@ -108,7 +108,7 @@ func (a *app) command() *cobra.Command {
 	a.cloud.VerifyStart = a.verifyLocalStart
 	cloud := cloudCommand(&a.cloud)
 	cloud.AddCommand(a.healthCommand())
-	cmd.AddCommand(cloud, dockerCommand(&a.cloud), a.configCommand(), a.deviceCommand(), a.workloadCommand("job"), a.workloadCommand("service"), a.workspaceCommand())
+	cmd.AddCommand(cloud, dockerCommand(&a.cloud), a.configCommand(), a.deviceCommand(), a.workloadCommand("job"), a.workloadCommand("service"), a.workspaceCommand(), a.identityCommand(), a.connectCommand())
 	return cmd
 }
 
