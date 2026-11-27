@@ -1,0 +1,444 @@
+openapi: 3.0.3
+info:
+  title: Kamui Cloud Services API
+  version: 1.1.0
+  description: >-
+    Service-layer APIs over the shared execution stack: artifact staging,
+    secrets, scoped registry credentials, object storage, backup/restore,
+    deployments, training, inference, collaboration quotas, alerts, managed
+    databases and Drop transfers.
+security:
+  - bearerAuth: []
+paths:
+  /v1/projects/{id}/artifacts:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: uploadArtifact
+      parameters:
+        - { name: name, in: query, required: true, schema: { type: string } }
+        - { name: kind, in: query, schema: { type: string, default: generic } }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream: { schema: { type: string, format: binary } }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Artifact' } } } }
+        '413': { description: Blob exceeds the size limit }
+        default: { $ref: '#/components/responses/Error' }
+    get:
+      operationId: listArtifacts
+      responses:
+        '200':
+          description: Recent artifacts, newest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Artifact' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/projects/{id}/artifacts/{art}/content:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: art, in: path, required: true, schema: { type: string } }
+    get:
+      operationId: downloadArtifact
+      description: >
+        Streams the verified blob with X-Checksum-Sha256. Workers holding an
+        active assignment that mounts this artifact may fetch it via the
+        worker-token endpoint /v1/workers/{id}/artifacts/{art}/content.
+      responses:
+        '200':
+          description: Blob bytes
+          content:
+            application/octet-stream: { schema: { type: string, format: binary } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/projects/{id}/secrets/{name}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: name, in: path, required: true, schema: { type: string } }
+    put:
+      operationId: putSecret
+      description: Sealed storage; values are never returned by any endpoint.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [value]
+              properties:
+                value: { type: string, maxLength: 65536 }
+      responses:
+        '200': { description: Stored or rotated }
+        default: { $ref: '#/components/responses/Error' }
+    delete:
+      operationId: deleteSecret
+      responses:
+        '200': { description: Deleted }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/projects/{id}/buckets:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: createBucket
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [name], properties: { name: { type: string } } }
+      responses:
+        '201': { description: Created }
+        default: { $ref: '#/components/responses/Error' }
+    get:
+      operationId: listBuckets
+      responses:
+        '200': { description: Project buckets }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/projects/{id}/buckets/{bucket}/objects/{key}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: bucket, in: path, required: true, schema: { type: string } }
+      - { name: key, in: path, required: true, schema: { type: string } }
+    put:
+      operationId: putObject
+      description: Streams the upload atomically; quota breaches preserve the previous object.
+      parameters:
+        - { name: bucket, in: path, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream: { schema: { type: string, format: binary } }
+      responses:
+        '201': { description: Stored }
+        '407': { description: Quota exceeded }
+        default: { $ref: '#/components/responses/Error' }
+    get:
+      operationId: getObject
+      description: Raw bytes with X-Checksum-Sha256; add ?metadata=true for metadata JSON.
+      responses:
+        '200': { description: Object bytes or metadata }
+        default: { $ref: '#/components/responses/Error' }
+    delete:
+      operationId: deleteObject
+      responses:
+        '200': { description: Deleted }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/backups/metadata:
+    post:
+      operationId: createMetadataBackup
+      description: Consistent coordinator SQLite snapshot via VACUUM INTO. Administrators only.
+      responses:
+        '201': { description: Backup record, content: { application/json: { schema: { $ref: '#/components/schemas/Backup' } } } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/backups/{bck}:
+    parameters:
+      - { name: bck, in: path, required: true, schema: { type: string } }
+    get:
+      operationId: getBackup
+      responses:
+        '200': { description: Backup metadata, content: { application/json: { schema: { $ref: '#/components/schemas/Backup' } } } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/backups/{bck}/restore:
+    parameters:
+      - { name: bck, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: restoreBackup
+      description: Checksum-verified restore into an isolated destination; never overwrites live data.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [destination]
+              properties:
+                destination: { type: string }
+      responses:
+        '200': { description: Restored to the isolated path }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/projects/{id}/deployments:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: createDeployment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, source]
+              properties:
+                name: { type: string, pattern: '^[a-z][a-z0-9-]{1,62}$' }
+                source: { type: string, enum: [git, dockerfile, image] }
+                source_ref: { type: string }
+                build_image: { type: string }
+                placement: { type: string, enum: [auto, manual, preferred] }
+                worker_id: { type: string }
+                resources: { $ref: 'core-openapi.yaml#/components/schemas/Resources' }
+                env:
+                  type: object
+                  additionalProperties: { type: string }
+      responses:
+        '201': { description: Created }
+        default: { $ref: '#/components/responses/Error' }
+    get:
+      operationId: listDeployments
+      responses:
+        '200': { description: Project deployments }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/projects/{id}/deployments/{dep}/builds:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: dep, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: triggerBuild
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                commit: { type: string }
+                dockerfile: { type: string }
+      responses:
+        '202': { description: Build queued }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/projects/{id}/deployments/{dep}/revisions/{rev}/release:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: dep, in: path, required: true, schema: { type: string } }
+      - { name: rev, in: path, required: true, schema: { type: integer } }
+    post:
+      operationId: releaseRevision
+      description: Schedules the revision runtime through the shared engine.
+      responses:
+        '202': { description: Releasing }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/projects/{id}/deployments/{dep}/rollback:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: dep, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: rollbackDeployment
+      description: Re-releases the last healthy revision.
+      responses:
+        '202': { description: Rollback started }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/webhooks/{webhook}:
+    parameters:
+      - { name: webhook, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: webhookTrigger
+      security: []
+      description: >-
+        HMAC-SHA256 signature over "timestamp.body" in X-Kamui-Signature;
+        X-Kamui-Timestamp must be within five minutes (replay bound).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                branch: { type: string }
+                commit: { type: string }
+      responses:
+        '202': { description: Build queued }
+        '403': { description: Signature, timestamp or branch filter rejected }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/projects/{id}/training:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: submitTraining
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, image]
+              properties:
+                name: { type: string }
+                image: { type: string }
+                args: { type: array, items: { type: string } }
+                dataset_artifact: { type: string, description: mounted read-only at /kamui/dataset }
+                placement: { type: string }
+                worker_id: { type: string }
+                timeout_seconds: { type: integer }
+                resources: { $ref: 'core-openapi.yaml#/components/schemas/Resources' }
+      responses:
+        '202': { description: Scheduled }
+        default: { $ref: '#/components/responses/Error' }
+    get:
+      operationId: listTrainings
+      responses:
+        '200': { description: Training jobs }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/projects/{id}/training/{trn}/collect:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: trn, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: collectTrainingOutputs
+      description: >-
+        Collects declared outputs from a finished local attempt and ingests
+        observed metrics from /out/metrics.jsonl. Remote-worker output
+        registration is PARTIAL in this checkpoint.
+      responses:
+        '200': { description: Metrics ingested }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/projects/{id}/inference:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: createInferService
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, runtime, image]
+              properties:
+                name: { type: string }
+                runtime: { type: string, enum: [ollama, llamacpp, vllm, openai-compatible, proxy] }
+                image: { type: string }
+                model_id: { type: string }
+                upstream_url: { type: string }
+      responses:
+        '201': { description: Scheduled }
+        default: { $ref: '#/components/responses/Error' }
+    get:
+      operationId: listInferServices
+      responses:
+        '200': { description: Inference services }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/projects/{id}/quotas:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    put:
+      operationId: setQuota
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                max_active_workloads: { type: integer, minimum: 0, maximum: 128 }
+                max_cpu_millis: { type: integer, minimum: 0 }
+                max_memory_bytes: { type: integer, format: int64, minimum: 0 }
+                max_storage_bytes: { type: integer, format: int64, minimum: 0 }
+      responses:
+        '200': { description: Stored }
+        default: { $ref: '#/components/responses/Error' }
+    get:
+      operationId: getQuota
+      responses:
+        '200': { description: Quota plus current usage }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/projects/{id}/databases:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: createDatabase
+      description: >-
+        Creates a stateful service with a persistent volume pinned to its
+        worker and the engine's declared data path. The password secret
+        db-{name}-password must exist before submission.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, engine]
+              properties:
+                name: { type: string }
+                engine: { type: string, enum: [postgres] }
+                version: { type: string }
+      responses:
+        '201': { description: Created and scheduled }
+        default: { $ref: '#/components/responses/Error' }
+    get:
+      operationId: listDatabases
+      responses:
+        '200': { description: Databases }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/drop/transfers:
+    post:
+      operationId: createTransfer
+      description: >
+        Streams an upload (max 512 MiB) to an authorized recipient. Status is
+        pending until the recipient approves; approval gates download.
+      parameters:
+        - { name: recipient, in: query, required: true, schema: { type: string } }
+        - { name: filename, in: query, required: true, schema: { type: string } }
+        - { name: ttl_seconds, in: query, schema: { type: integer, default: 86400 } }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream: { schema: { type: string, format: binary } }
+      responses:
+        '201': { description: Pending transfer }
+        default: { $ref: '#/components/responses/Error' }
+    get:
+      operationId: listTransfers
+      responses:
+        '200': { description: Transfers sent or received by the caller }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/drop/transfers/{xfr}/approve:
+    parameters:
+      - { name: xfr, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: approveTransfer
+      description: Only the named recipient may approve.
+      responses:
+        '200': { description: Approved }
+        default: { $ref: '#/components/responses/Error' }
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer }
+  responses:
+    Error:
+      description: Request could not be completed
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error]
+            properties:
+              error:
+                type: object
+                required: [code, message]
+                properties:
+                  code: { type: string }
+                  message: { type: string }
+  schemas:
+    Artifact:
+      type: object
+      required: [id, project_id, name, kind, size_bytes, checksum, content_type, created_at]
+      properties:
+        id: { type: string }
+        project_id: { type: string }
+        name: { type: string }
+        kind: { type: string }
+        size_bytes: { type: integer, format: int64 }
+        checksum: { type: string }
+        content_type: { type: string }
+        created_at: { type: string, format: date-time }
+    Backup:
+      type: object
+      required: [id, kind, target, status, created_at]
+      properties:
+        id: { type: string }
+        project_id: { type: string }
+        kind: { type: string, enum: [metadata, objects, volume] }
+        target: { type: string }
+        status: { type: string, enum: [in_progress, succeeded, failed] }
+        size_bytes: { type: integer, format: int64 }
+        checksum: { type: string }
+        created_at: { type: string, format: date-time }
