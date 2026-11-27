@@ -47,6 +47,9 @@ type Engine struct {
 	// EnvResolver expands `secret:NAME` environment references at container
 	// create time. nil keeps environment entries as-is.
 	EnvResolver func(ctx context.Context, projectID string, env map[string]string) (map[string]string, error)
+	// RouteRevoker drops service routes for terminal workloads. nil keeps
+	// routes until their TTL expires.
+	RouteRevoker func(ctx context.Context, workloadID string)
 }
 
 // VolumeDirectory is the persistent storage locality surface consulted by the
@@ -361,6 +364,14 @@ func (e *Engine) reconcileCluster(ctx context.Context) {
 	}
 }
 
+// revokeRoute drops the service route of a finished workload when a revoker
+// is wired; TTL-based pruning remains the fallback.
+func (e *Engine) revokeRoute(ctx context.Context, workloadID string) {
+	if e.RouteRevoker != nil {
+		e.RouteRevoker(ctx, workloadID)
+	}
+}
+
 func runtimeID(worker Worker) string {
 	if worker.ID == LocalWorker && worker.Runtime != nil {
 		return worker.Runtime.ID
@@ -481,6 +492,7 @@ func (e *Engine) finishRemote(ctx context.Context, w Workload, report WorkerRepo
 		state, reason = Failed, "nonzero exit code"
 		retry = w.Attempt <= w.Submission.Policy.MaxRetries
 	}
+	e.revokeRoute(ctx, w.ID)
 	w.State, w.Assignment, w.StopReason = state, nil, ""
 	w.Result = &Result{ExitCode: code, Reason: reason}
 	w.LogTail = report.LogTail
@@ -573,6 +585,7 @@ func (e *Engine) finishLostWorker(ctx context.Context, w Workload) error {
 	} else {
 		state, reason = Failed, "worker lost contact during execution; not retried to avoid duplicate side effects"
 	}
+	e.revokeRoute(ctx, w.ID)
 	w.State, w.Assignment, w.StopReason = state, nil, ""
 	w.Result = &Result{Reason: reason}
 	if err := e.Repo.Save(ctx, w, false); err != nil {
@@ -783,6 +796,7 @@ func (e *Engine) finishObserved(ctx context.Context, w Workload, ref ExecutionRe
 }
 
 func (e *Engine) finish(ctx context.Context, w Workload, state State, reason string, code *int, logs string, cleanup, retry bool) error {
+	e.revokeRoute(ctx, w.ID)
 	w.State, w.Assignment, w.StopReason = state, nil, ""
 	w.Result, w.LogTail = &Result{ExitCode: code, Reason: reason}, logs
 	if retry && w.Attempt <= w.Submission.Policy.MaxRetries {

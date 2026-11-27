@@ -23,6 +23,7 @@ import (
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/ml"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/objectstore"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/ops"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/routing"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/runtime"
 )
 
@@ -37,13 +38,14 @@ type servicesHandler struct {
 	drop    *drop.Store
 	ids     *identity.Store
 	engine  *core.Engine
+	hub     *routing.Hub
 }
 
 func newServicesHandler(objects *objectstore.Store, backups *backup.Store, train *ml.TrainStore,
-	infer *ml.InferStore, opsStore *ops.Store, dropStore *drop.Store, ids *identity.Store, engine *core.Engine) *servicesHandler {
+	infer *ml.InferStore, opsStore *ops.Store, dropStore *drop.Store, ids *identity.Store, engine *core.Engine, hub *routing.Hub) *servicesHandler {
 	return &servicesHandler{
 		objects: objects, backups: backups, train: train, infer: infer,
-		ops: opsStore, drop: dropStore, ids: ids, engine: engine,
+		ops: opsStore, drop: dropStore, ids: ids, engine: engine, hub: hub,
 	}
 }
 

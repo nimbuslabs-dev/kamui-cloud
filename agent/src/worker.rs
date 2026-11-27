@@ -4,6 +4,7 @@
 use crate::capabilities;
 use crate::client::{AssignmentEnvelope, Coordinator, HealthCheck, Heartbeat, ReportBody, Telemetry};
 use crate::docker::{self, RunSpec};
+use crate::tunnel::{TunnelClient, TrackedSnapshot};
 use crate::state::{self, WorkerState};
 use crate::telemetry::Sampler;
 use serde_json::json;
@@ -101,6 +102,24 @@ impl WorkerLoop {
         let heartbeat_running = Arc::clone(&self.running);
         let heartbeat_worker = self.clone_for_heartbeat();
         thread::spawn(move || heartbeat_worker.heartbeat_loop(heartbeat_running));
+
+        // Remote service routing: an outbound authenticated tunnel that the
+        // coordinator uses to reach this worker's live service routes.
+        let tunnel_client = TunnelClient::new(
+            self.state.clone(),
+            Arc::clone(&self.running),
+            Arc::clone(&self.tracked_snapshot()),
+        );
+        {
+            let tracked = self.tracked.lock().expect("tracked assignments");
+            let snapshot: std::collections::HashMap<String, (i64, String)> = tracked
+                .iter()
+                .map(|(id, t)| (id.clone(), (t.attempt, t.fence.clone())))
+                .collect();
+            drop(tracked);
+            tunnel_client.update_assignments(&snapshot);
+        }
+        thread::spawn(move || tunnel_client.run());
 
         let mut backoff = POLL_INTERVAL;
         while self.running.load(Ordering::SeqCst) {
@@ -515,6 +534,10 @@ impl WorkerLoop {
             tracked.running_reported = true;
             tracked.last_renew = Instant::now();
         }
+    }
+
+    fn tracked_snapshot(&self) -> Arc<Mutex<HashMap<String, TrackedSnapshot>>> {
+        Arc::new(Mutex::new(HashMap::new()))
     }
 
     fn mark_renewed(&self, workload_id: &str) {

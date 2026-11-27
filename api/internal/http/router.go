@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/apierr"
@@ -16,6 +17,7 @@ import (
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/objectstore"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/ops"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/registry"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/routing"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/runtime"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/scheduler"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/worker"
@@ -172,8 +174,18 @@ func NewRouterWithServices(
 		mux.HandleFunc("DELETE /v1/connect/remote", ch.DisableRemoteConfig)
 	}
 
+	var hub *routing.Hub
 	if workerStore != nil {
-		newWorkerHandler(workerStore, engine, idStore, runtimeStore).registerWorkerProtocol(publicMux, mux, adminOnly)
+		if engine != nil {
+			// Service routes for terminal workloads are revoked promptly.
+			engine.RouteRevoker = func(ctx context.Context, workloadID string) {
+				if runtimeStore != nil {
+					_ = runtimeStore.RevokeRoute(ctx, workloadID)
+				}
+			}
+		}
+		hub = routing.NewHub()
+		newWorkerHandler(workerStore, engine, idStore, runtimeStore, hub).registerWorkerProtocol(publicMux, mux, adminOnly)
 		if runtimeStore != nil {
 			newRuntimeHandler(runtimeStore, engine, idStore).register(mux)
 		}
@@ -184,7 +196,7 @@ func NewRouterWithServices(
 	}
 	if serviceStores != nil {
 		newServicesHandler(serviceStores.Objects, serviceStores.Backups, serviceStores.Train,
-			serviceStores.Infer, serviceStores.Ops, serviceStores.Drop, idStore, engine).register(mux)
+			serviceStores.Infer, serviceStores.Ops, serviceStores.Drop, idStore, engine, hub).register(mux)
 	}
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

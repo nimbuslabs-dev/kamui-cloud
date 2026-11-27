@@ -4,6 +4,7 @@ mod docker;
 mod enroll;
 mod state;
 mod telemetry;
+mod tunnel;
 mod worker;
 
 use serde::{Deserialize, Serialize};

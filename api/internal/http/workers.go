@@ -14,6 +14,7 @@ import (
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/auth"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/core"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/identity"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/routing"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/runtime"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/worker"
 )
@@ -27,10 +28,11 @@ type workerHandler struct {
 	engine  *core.Engine
 	ids     *identity.Store
 	runtime *runtime.Store
+	hub     *routing.Hub
 }
 
-func newWorkerHandler(store *worker.Store, engine *core.Engine, ids *identity.Store, rt *runtime.Store) *workerHandler {
-	return &workerHandler{store: store, engine: engine, ids: ids, runtime: rt}
+func newWorkerHandler(store *worker.Store, engine *core.Engine, ids *identity.Store, rt *runtime.Store, hub *routing.Hub) *workerHandler {
+	return &workerHandler{store: store, engine: engine, ids: ids, runtime: rt, hub: hub}
 }
 
 type heartbeatInput struct {
@@ -122,6 +124,7 @@ func (h *workerHandler) registerWorkerProtocol(publicMux, mux *http.ServeMux, ad
 	publicMux.HandleFunc("POST /v1/workers/{id}/poll", h.poll)
 	publicMux.HandleFunc("POST /v1/workers/{id}/assignments/{workload}/report", h.report)
 	publicMux.HandleFunc("GET /v1/workers/{id}/artifacts/{art}/content", h.workerArtifactContent)
+	publicMux.HandleFunc("GET /v1/workers/{id}/tunnel", h.tunnel)
 
 	mux.HandleFunc("POST /v1/workers/enrollments", adminOnly(h.CreateEnrollment))
 	mux.HandleFunc("GET /v1/workers/enrollments", adminOnly(h.ListEnrollments))
@@ -139,6 +142,48 @@ func (h *workerHandler) registerWorkerProtocol(publicMux, mux *http.ServeMux, ad
 	mux.HandleFunc("GET /v1/projects/{id}/scheduling-preferences", h.GetProjectPrefs)
 	mux.HandleFunc("PUT /v1/projects/{id}/scheduling-preferences", h.PutProjectPrefs)
 	mux.HandleFunc("GET /v1/projects/{id}/workers", h.ListProjectWorkers)
+}
+
+// tunnel upgrades an authenticated worker connection into the remote service
+// transport. The worker dials outbound; the coordinator never opens inbound
+// ports on workers.
+func (h *workerHandler) tunnel(w http.ResponseWriter, r *http.Request) {
+	workerID, ok := h.authenticateWorker(r)
+	if !ok {
+		apierr.WriteError(w, http.StatusUnauthorized, "worker_unauthorized", "worker credentials are invalid")
+		return
+	}
+	if h.hub == nil {
+		apierr.WriteError(w, http.StatusServiceUnavailable, "routing_unavailable", "service routing is not enabled")
+		return
+	}
+	info, err := h.store.RequireWorker(r.Context(), workerID)
+	if err != nil {
+		workerAuthFailed(w, err)
+		return
+	}
+	if info.Status != core.WorkerStateApproved && info.Status != core.WorkerStateDraining {
+		apierr.WriteError(w, http.StatusForbidden, "worker_forbidden", "worker is not approved for service routing")
+		return
+	}
+	hijacker, supportsHijack := w.(http.Hijacker)
+	if !supportsHijack || r.Header.Get("Upgrade") != "kamui-tunnel" {
+		apierr.WriteError(w, http.StatusBadRequest, "invalid_request", "the tunnel requires a kamui-tunnel upgrade request")
+		return
+	}
+	conn, rw, err := hijacker.Hijack()
+	if err != nil {
+		apierr.WriteError(w, http.StatusInternalServerError, "tunnel_failed", "connection upgrade failed")
+		return
+	}
+	// Complete the HTTP upgrade on the raw connection.
+	rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: kamui-tunnel\r\nConnection: Upgrade\r\n\r\n")
+	rw.Flush()
+	var tunnel *routing.Tunnel
+	tunnel = routing.NewTunnel(workerID, conn, func() { h.hub.Remove(workerID, tunnel) })
+	h.hub.Register(tunnel)
+	slog.Info("worker tunnel established", "worker_id", workerID)
+	tunnel.Serve()
 }
 
 func (h *workerHandler) Enroll(w http.ResponseWriter, r *http.Request) {
