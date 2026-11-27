@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"errors"
 	"fmt"
 	"net/http"
@@ -245,6 +246,29 @@ func (wm *WorkspaceManager) stopWorkspace(ctx context.Context, id string) error 
 		return fmt.Errorf("stop workspace container: %w", err)
 	}
 	return nil
+}
+
+// workspaceLogs returns the bounded tail of a workspace container's logs.
+func (wm *WorkspaceManager) workspaceLogs(ctx context.Context, id string) (string, error) {
+	inspected, err := wm.findContainer(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	if inspected.ID == "" {
+		return "", nil
+	}
+	logs, err := wm.docker.ContainerLogs(ctx, inspected.ID, container.LogsOptions{
+		ShowStdout: true, ShowStderr: true, Tail: "200",
+	})
+	if err != nil {
+		return "", fmt.Errorf("workspace container logs: %w", err)
+	}
+	defer logs.Close()
+	output, err := io.ReadAll(io.LimitReader(logs, 64<<10))
+	if err != nil {
+		return "", err
+	}
+	return string(output), nil
 }
 
 func (wm *WorkspaceManager) deleteWorkspace(ctx context.Context, id string) error {

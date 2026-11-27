@@ -153,6 +153,16 @@ func managerRouter(wm *WorkspaceManager, token string) http.Handler {
 		}
 	}
 	privileged.HandleFunc("POST /workspace/stop", handleAction(wm.stopWorkspace))
+	privileged.HandleFunc("GET /workspace/logs", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		logs, err := wm.workspaceLogs(r.Context(), r.URL.Query().Get("id"))
+		if err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"tail": logs})
+	})
 	privileged.HandleFunc("POST /workspace/delete", handleAction(wm.deleteWorkspace))
 	privileged.HandleFunc("POST /workspace/git", func(w http.ResponseWriter, r *http.Request) {
 		var req gitRequest

@@ -321,6 +321,22 @@ func (h *WorkspaceHandler) acquire(w http.ResponseWriter, r *http.Request) bool 
 	}
 }
 
+// Logs streams the bounded workspace container log tail through the manager.
+func (h *WorkspaceHandler) Logs(w http.ResponseWriter, r *http.Request) {
+	workspace, _, ok := h.workspace(w, r, identity.PermWorkspaceRead)
+	if !ok {
+		return
+	}
+	var result struct {
+		Tail string `json:"tail"`
+	}
+	if failure := h.manager(r.Context(), "GET", "/workspace/logs?id="+url.QueryEscape(workspace.ID), nil, &result); failure != nil {
+		failure.write(w)
+		return
+	}
+	apierr.WriteJSON(w, http.StatusOK, result)
+}
+
 func (h *WorkspaceHandler) lifecycle(w http.ResponseWriter, r *http.Request, operation string) {
 	if !h.acquire(w, r) {
 		return
