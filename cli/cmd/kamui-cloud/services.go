@@ -161,6 +161,37 @@ func (a *app) deployCommand() *cobra.Command {
 			return a.serviceSend(cmd, "DELETE", svcProjectPath("/deployments/"+args[0]), nil)
 		},
 	})
+	group.AddCommand(&cobra.Command{
+		Use: "webhook", Short: "Manage deployment webhooks",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if a.cloud.JSON {
+				return failure(2, "usage", "select a webhook subcommand when using --json")
+			}
+			return cmd.Help()
+		},
+	})
+	webhookGroup := group.Commands()[len(group.Commands())-1]
+	webhookGroup.AddCommand(&cobra.Command{
+		Use: "create DEPLOYMENT", Short: "Create a webhook for a deployment", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			branchFilter, _ := cmd.Flags().GetString("branch-filter")
+			body := map[string]any{"branch_filter": branchFilter}
+			return a.serviceSend(cmd, "POST", svcProjectPath("/deployments/"+args[0]+"/webhooks"), body)
+		},
+	})
+	webhookGroup.Commands()[0].Flags().String("branch-filter", "", "Only trigger on this branch")
+	webhookGroup.AddCommand(&cobra.Command{
+		Use: "list DEPLOYMENT", Short: "List webhooks for a deployment", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "GET", svcProjectPath("/deployments/"+args[0]+"/webhooks"), nil)
+		},
+	})
+	webhookGroup.AddCommand(&cobra.Command{
+		Use: "delete DEPLOYMENT WEBHOOK", Short: "Delete a webhook", Args: usageArgs(cobra.ExactArgs(2)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "DELETE", svcProjectPath("/deployments/"+args[0]+"/webhooks/"+args[1]), nil)
+		},
+	})
 	return group
 }
 
