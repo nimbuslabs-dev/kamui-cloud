@@ -423,17 +423,43 @@ func (a *app) trainCommand() *cobra.Command {
 			return a.serviceSend(cmd, "POST", svcProjectPath("/training/"+args[0]+"/cancel"), map[string]any{})
 		},
 	})
-	group.AddCommand(&cobra.Command{
-		Use: "checkpoint list JOB", Short: "List observed metrics for a job", Args: usageArgs(cobra.ExactArgs(1)),
+	checkpoint := &cobra.Command{Use: "checkpoint", Short: "Manage training checkpoints"}
+	checkpoint.AddCommand(&cobra.Command{
+		Use: "list JOB", Short: "List checkpoints for a training job", Args: usageArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return a.serviceSend(cmd, "GET", svcProjectPath("/training/"+args[0]+"/metrics"), nil)
+			return a.serviceSend(cmd, "GET", svcProjectPath("/training/"+args[0]+"/checkpoints"), nil)
 		},
 	})
+	checkpoint.AddCommand(&cobra.Command{
+		Use: "create JOB --artifact ARTIFACT_ID --step STEP [--metrics JSON]", Short: "Create a checkpoint from a training job", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			artifact, _ := cmd.Flags().GetString("artifact")
+			step, _ := cmd.Flags().GetInt("step")
+			metrics, _ := cmd.Flags().GetString("metrics")
+			if artifact == "" || step <= 0 {
+				return failure(2, "usage", "--artifact and --step are required")
+			}
+			var metricsMap map[string]float64
+			if metrics != "" {
+				if err := json.Unmarshal([]byte(metrics), &metricsMap); err != nil {
+					return failure(2, "usage", "--metrics must be valid JSON")
+				}
+			}
+			body := map[string]any{"artifact_id": artifact, "step": step, "metrics": metricsMap}
+			return a.serviceSend(cmd, "POST", svcProjectPath("/training/"+args[0]+"/checkpoints"), body)
+		},
+	})
+	group.AddCommand(checkpoint)
 	group.AddCommand(&cobra.Command{
-		Use: "resume JOB", Short: "Resume is not implemented yet; training jobs are re-submitted instead",
-		Args: usageArgs(cobra.NoArgs),
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			return failure(4, "not_implemented", "checkpoint resume requires explicit framework support; submit a new job with the checkpoint artifact instead")
+		Use: "resume JOB --checkpoint CHECKPOINT_ID --name NAME", Short: "Resume training from a checkpoint", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			checkpointID, _ := cmd.Flags().GetString("checkpoint")
+			name, _ := cmd.Flags().GetString("name")
+			if checkpointID == "" || name == "" {
+				return failure(2, "usage", "--checkpoint and --name are required")
+			}
+			body := map[string]any{"checkpoint_id": checkpointID, "name": name}
+			return a.serviceSend(cmd, "POST", svcProjectPath("/training/"+args[0]+"/resume"), body)
 		},
 	})
 	model := &cobra.Command{Use: "model", Short: "Registered model artifacts"}

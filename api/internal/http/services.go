@@ -75,6 +75,10 @@ func (h *servicesHandler) register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/projects/{id}/training/{trn}/metrics", h.ListTrainingMetrics)
 	mux.HandleFunc("POST /v1/projects/{id}/training/{trn}/cancel", h.CancelTraining)
 	mux.HandleFunc("POST /v1/projects/{id}/training/{trn}/collect", h.CollectTrainingOutputs)
+	// Training checkpoints
+	mux.HandleFunc("GET /v1/projects/{id}/training/{trn}/checkpoints", h.ListCheckpoints)
+	mux.HandleFunc("POST /v1/projects/{id}/training/{trn}/checkpoints", h.CreateCheckpoint)
+	mux.HandleFunc("POST /v1/projects/{id}/training/{trn}/resume", h.ResumeFromCheckpoint)
 	mux.HandleFunc("POST /v1/projects/{id}/models", h.RegisterModel)
 	mux.HandleFunc("GET /v1/projects/{id}/models", h.ListModels)
 	mux.HandleFunc("GET /v1/projects/{id}/models/{model}", h.GetModel)
@@ -644,6 +648,75 @@ func (h *servicesHandler) CollectTrainingOutputs(w http.ResponseWriter, r *http.
 		"metric_lines":     len(metricLines),
 		"collector":        p.User.ID,
 	})
+}
+
+// ListCheckpoints lists all checkpoints for a training job.
+func (h *servicesHandler) ListCheckpoints(w http.ResponseWriter, r *http.Request) {
+	projectID := r.PathValue("id")
+	if _, ok := h.authorize(w, r, projectID, identity.PermWorkloadRead); !ok {
+		return
+	}
+	items, err := h.train.ListCheckpoints(r.Context(), r.PathValue("trn"))
+	if err != nil {
+		servicesError(w, err)
+		return
+	}
+	apierr.WriteJSON(w, http.StatusOK, items)
+}
+
+// CreateCheckpoint creates a checkpoint for a training job.
+func (h *servicesHandler) CreateCheckpoint(w http.ResponseWriter, r *http.Request) {
+	projectID := r.PathValue("id")
+	p, ok := h.authorize(w, r, projectID, identity.PermWorkloadWrite)
+	if !ok {
+		return
+	}
+	var input struct {
+		ArtifactID string             `json:"artifact_id"`
+		Step       int                `json:"step"`
+		Metrics    map[string]float64 `json:"metrics,omitempty"`
+	}
+	if err := readJSON(w, r, 64<<10, &input); err != nil {
+		apierr.WriteError(w, http.StatusBadRequest, "invalid_request", "invalid checkpoint JSON")
+		return
+	}
+	if input.ArtifactID == "" || input.Step <= 0 {
+		apierr.WriteError(w, http.StatusBadRequest, "invalid_request", "artifact_id and step are required")
+		return
+	}
+	chk, err := h.train.CreateCheckpoint(r.Context(), r.PathValue("trn"), input.ArtifactID, input.Step, input.Metrics, p.User.ID)
+	if err != nil {
+		servicesError(w, err)
+		return
+	}
+	apierr.WriteJSON(w, http.StatusCreated, chk)
+}
+
+// ResumeFromCheckpoint creates a new training job that resumes from a checkpoint.
+func (h *servicesHandler) ResumeFromCheckpoint(w http.ResponseWriter, r *http.Request) {
+	projectID := r.PathValue("id")
+	p, ok := h.authorize(w, r, projectID, identity.PermWorkloadWrite)
+	if !ok {
+		return
+	}
+	var input struct {
+		CheckpointID string `json:"checkpoint_id"`
+		Name         string `json:"name"`
+	}
+	if err := readJSON(w, r, 8<<10, &input); err != nil {
+		apierr.WriteError(w, http.StatusBadRequest, "invalid_request", "invalid resume request")
+		return
+	}
+	if input.CheckpointID == "" || input.Name == "" {
+		apierr.WriteError(w, http.StatusBadRequest, "invalid_request", "checkpoint_id and name are required")
+		return
+	}
+	job, err := h.train.ResumeFromCheckpoint(r.Context(), projectID, input.Name, input.CheckpointID, p.User.ID)
+	if err != nil {
+		servicesError(w, err)
+		return
+	}
+	apierr.WriteJSON(w, http.StatusAccepted, job)
 }
 
 // OutputCollector is implemented by the local Docker executor.

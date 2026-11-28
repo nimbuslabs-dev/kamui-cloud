@@ -294,6 +294,50 @@ paths:
       responses:
         '200': { description: Metrics ingested }
         default: { $ref: '#/components/responses/Error' }
+  /v1/projects/{id}/training/{trn}/checkpoints:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: trn, in: path, required: true, schema: { type: string } }
+    get:
+      operationId: listCheckpoints
+      responses:
+        '200': { description: Checkpoints, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/TrainingCheckpoint' } } } } }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      operationId: createCheckpoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [artifact_id, step]
+              properties:
+                artifact_id: { type: string }
+                step: { type: integer }
+                metrics: { type: object, additionalProperties: { type: number } }
+      responses:
+        '201': { description: Checkpoint created }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/projects/{id}/training/{trn}/resume:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: trn, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: resumeFromCheckpoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [checkpoint_id, name]
+              properties:
+                checkpoint_id: { type: string }
+                name: { type: string }
+      responses:
+        '202': { description: Training job resumed from checkpoint }
+        default: { $ref: '#/components/responses/Error' }
   /v1/projects/{id}/inference:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }
@@ -555,3 +599,14 @@ components:
         created_by: { type: string }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+    TrainingCheckpoint:
+      type: object
+      required: [id, training_id, artifact_id, step, metrics, created_by, created_at]
+      properties:
+        id: { type: string }
+        training_id: { type: string }
+        artifact_id: { type: string }
+        step: { type: integer }
+        metrics: { type: object, additionalProperties: { type: number } }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
