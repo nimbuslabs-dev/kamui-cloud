@@ -6,6 +6,10 @@
 
 ---
 
+## Independent backend audit checkpoint
+
+See [backend acceptance](BACKEND_ACCEPTANCE.md) for current results and the ordered remediation backlog. Backup inspection, download, listing and restore require an explicit project scope. Omitting it selects administrator-only coordinator metadata. Restore publishes a checksum-verified isolated filesystem export and returns a path relative to the coordinator storage root. Project object import and actual volume restore remain open.
+
 ## Completed Phases
 
 | Phase | Status | Notes |
@@ -338,7 +342,7 @@ These are marked **BLOCKED** per requirements — implementation is complete, li
 ### Phase 10: Store + Backup (this checkpoint)
 - `api/internal/objectstore/s3.go` — New: S3-compatible backend using AWS SDK v2 (MinIO, AWS S3 compatible)
 - `api/internal/objectstore/store.go` — Added `NewS3BackendFromConfig`, `S3Config` types
-- `api/internal/backup/backup.go` — Added `RestoreObjectBackup`, `RestoreVolumeBackup`; object backups as tar bundles with SHA-256
+- `api/internal/backup/backup.go` — Object backups are tar bundles with SHA-256; object restore creates an isolated export, and managed volume restore returns HTTP 501
 - `api/internal/ops/ops.go` — Added `DatabaseBackup` (pg_dump -Fc), `DatabaseRestore` (pg_restore -Fc) via docker exec; **verified: defaults to isolated restore, force parameter for destructive overwrite**
 - `api/internal/http/services.go` — Added `BackupDatabase`, `RestoreDatabase`, `RestoreBackup` handlers; force parameter for destructive restore requires system admin
 - `api/internal/config/config.go` — Added S3 config: `S3Region`, `S3Endpoint`, `S3Bucket`, `S3AccessKeyID`, `S3SecretAccessKey`, `S3UsePathStyle`, `S3RootPrefix`

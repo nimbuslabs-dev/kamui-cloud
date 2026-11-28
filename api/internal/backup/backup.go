@@ -7,12 +7,15 @@ package backup
 import (
 	"archive/tar"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,14 +25,16 @@ import (
 )
 
 const (
-	MaxBackupBytes = int64(8) << 30
-	MaxRestoreScan = int64(8) << 30
+	MaxBackupBytes    = int64(8) << 30
+	MaxRestoreScan    = int64(8) << 30
+	MaxRestoreEntries = 10000
 )
 
 var (
-	ErrNotFound = errors.New("backup not found")
-	ErrBadInput = errors.New("invalid backup request")
-	ErrConflict = errors.New("restore target already exists")
+	ErrNotFound       = errors.New("backup not found")
+	ErrBadInput       = errors.New("invalid backup request")
+	ErrNotImplemented = errors.New("managed volume restore is unavailable")
+	ErrForbidden      = errors.New("coordinator metadata requires a system administrator")
 )
 
 type Store struct {
@@ -93,7 +98,10 @@ func (s *Store) backupPath(id string) (string, error) {
 func (s *Store) CreateMetadataBackup(ctx context.Context, actor string) (Backup, error) {
 	id := newID("bck")
 	target := "coordinator-metadata"
-	record := recordStart(s, id, "", "metadata", target, actor)
+	record, err := s.recordStart(ctx, id, "", "metadata", target, actor)
+	if err != nil {
+		return Backup{}, err
+	}
 	path, err := s.backupPath(id)
 	if err != nil {
 		return record.failed(err), err
@@ -102,25 +110,30 @@ func (s *Store) CreateMetadataBackup(ctx context.Context, actor string) (Backup,
 		os.Remove(path)
 		return record.failed(fmt.Errorf("snapshot failed: %w", err)), fmt.Errorf("snapshot failed: %w", err)
 	}
-	return s.finalize(id, path)
+	return record.finalize(ctx, path)
 }
 
 // CreateObjectBackup bundles one project's stored objects with their metadata.
 func (s *Store) CreateObjectBackup(ctx context.Context, projectID, actor string, objects []ObjectRef, openObject func(context.Context, ObjectRef) (io.ReadCloser, error)) (Backup, error) {
 	id := newID("bck")
 	target := "objects:" + projectID
-	record := recordStart(s, id, projectID, "objects", target, actor)
+	if projectID == "" || len(objects) > MaxRestoreEntries {
+		return Backup{}, ErrBadInput
+	}
+	record, err := s.recordStart(ctx, id, projectID, "objects", target, actor)
+	if err != nil {
+		return Backup{}, err
+	}
 	path, err := s.backupPath(id)
 	if err != nil {
 		return record.failed(err), err
 	}
-	file, err := os.Create(path)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
 		return record.failed(err), err
 	}
 	defer file.Close()
-	hasher := sha256.New()
-	writer := tar.NewWriter(io.MultiWriter(file, hasher))
+	writer := tar.NewWriter(file)
 	var total int64
 	for _, ref := range objects {
 		reader, err := openObject(ctx, ref)
@@ -156,8 +169,11 @@ func (s *Store) CreateObjectBackup(ctx context.Context, projectID, actor string,
 		os.Remove(path)
 		return record.failed(err), err
 	}
-	file.Close()
-	return s.finalize(id, path)
+	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
+		return record.failed(err), err
+	}
+	return record.finalize(ctx, path)
 }
 
 // ErrTooBig marks an oversized backup request.
@@ -169,23 +185,25 @@ func (s *Store) CreateVolumeBackup(ctx context.Context, projectID, volume, actor
 	if s.volumeTar == nil {
 		return Backup{}, fmt.Errorf("%w: volume backups require the workspace manager on this host", ErrBadInput)
 	}
-	if !validVolumeName(volume) {
+	if projectID == "" || !validVolumeName(volume) {
 		return Backup{}, fmt.Errorf("%w: invalid volume name", ErrBadInput)
 	}
 	id := newID("bck")
 	target := "volume:" + volume
-	record := recordStart(s, id, projectID, "volume", target, actor)
+	record, err := s.recordStart(ctx, id, projectID, "volume", target, actor)
+	if err != nil {
+		return Backup{}, err
+	}
 	path, err := s.backupPath(id)
 	if err != nil {
 		return record.failed(err), err
 	}
-	file, err := os.Create(path)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
 		return record.failed(err), err
 	}
 	defer file.Close()
-	hasher := sha256.New()
-	counter := &countingWriter{w: io.MultiWriter(file, hasher)}
+	counter := &countingWriter{w: file}
 	if err := s.volumeTar(ctx, volume, counter); err != nil {
 		os.Remove(path)
 		return record.failed(err), err
@@ -194,8 +212,11 @@ func (s *Store) CreateVolumeBackup(ctx context.Context, projectID, volume, actor
 		os.Remove(path)
 		return record.failed(ErrTooBig), ErrTooBig
 	}
-	file.Close()
-	return s.finalize(id, path)
+	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
+		return record.failed(err), err
+	}
+	return record.finalize(ctx, path)
 }
 
 type countingWriter struct {
@@ -204,6 +225,9 @@ type countingWriter struct {
 }
 
 func (c *countingWriter) Write(p []byte) (int, error) {
+	if int64(len(p)) > MaxBackupBytes-c.n {
+		return 0, ErrTooBig
+	}
 	n, err := c.w.Write(p)
 	c.n += int64(n)
 	return n, err
@@ -222,78 +246,73 @@ type ObjectRef struct {
 	Size   int64
 }
 
-func recordStart(s *Store, id, projectID, kind, target, actor string) *pendingBackup {
+func (s *Store) recordStart(ctx context.Context, id, projectID, kind, target, actor string) (*pendingBackup, error) {
 	now := time.Now().UTC().UnixNano()
-	_, _ = s.db.Exec("INSERT INTO backups(id,project_id,kind,target,status,created_by,created_at) VALUES(?,?,?,?, 'in_progress', ?, ?)",
+	_, err := s.db.ExecContext(ctx, "INSERT INTO backups(id,project_id,kind,target,status,created_by,created_at) VALUES(?,?,?,?, 'in_progress', ?, ?)",
 		id, projectID, kind, target, actor, now)
-	return &pendingBackup{store: s, id: id, projectID: projectID, kind: kind, target: target, actor: actor, createdAt: now}
+	if err != nil {
+		return nil, err
+	}
+	return &pendingBackup{store: s, id: id, projectID: projectID}, nil
 }
 
 type pendingBackup struct {
-	store     *Store
-	id        string
-	projectID string
-	kind      string
-	target    string
-	actor     string
-	createdAt int64
+	store         *Store
+	id, projectID string
 }
 
-func (p *pendingBackup) failed(err error) Backup {
-	_, _ = p.store.db.Exec("UPDATE backups SET status='failed', reason=?, finished_at=? WHERE id=?",
-		err.Error(), time.Now().UTC().UnixNano(), p.id)
-	return Backup{ID: p.id, Status: "failed", Reason: err.Error()}
+func (p *pendingBackup) failed(cause error) Backup {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	const reason = "backup creation failed"
+	if _, err := p.store.db.ExecContext(ctx, "UPDATE backups SET status='failed', reason=?, finished_at=? WHERE id=?",
+		reason, time.Now().UTC().UnixNano(), p.id); err != nil {
+		slog.Warn("record backup failure", "backup_id", p.id, "error", err, "cause", cause)
+	}
+	return Backup{ID: p.id, Status: "failed", Reason: reason}
 }
 
-// finalize hashes the completed blob, records the checksum and size, and
-// returns the persisted backup record.
-func (s *Store) finalize(id, path string) (Backup, error) {
+func (p *pendingBackup) finalize(ctx context.Context, path string) (Backup, error) {
 	file, err := os.Open(path)
+	if err == nil {
+		hash := sha256.New()
+		size, readErr := io.Copy(hash, io.LimitReader(contextReader{ctx, file}, MaxBackupBytes+1))
+		err = errors.Join(readErr, file.Close())
+		if err == nil && size > MaxBackupBytes {
+			err = ErrTooBig
+		}
+		if err == nil {
+			sum := "sha256:" + hex.EncodeToString(hash.Sum(nil))
+			_, err = p.store.db.ExecContext(ctx, "UPDATE backups SET status='succeeded', size_bytes=?, checksum=?, finished_at=? WHERE id=?",
+				size, sum, time.Now().UTC().UnixNano(), p.id)
+		}
+	}
 	if err != nil {
-		return Backup{}, err
+		_ = os.Remove(path)
+		return p.failed(err), err
 	}
-	info, err := file.Stat()
-	if err != nil {
-		file.Close()
-		return Backup{}, err
-	}
-	hasher := sha256.New()
-	if _, err := io.Copy(hasher, file); err != nil {
-		file.Close()
-		return Backup{}, err
-	}
-	file.Close()
-	checksum := "sha256:" + hex.EncodeToString(hasher.Sum(nil))
-	_, err = s.db.Exec("UPDATE backups SET status='succeeded', size_bytes=?, checksum=?, finished_at=? WHERE id=?",
-		info.Size(), checksum, time.Now().UTC().UnixNano(), id)
-	if err != nil {
-		return Backup{}, err
-	}
-	return s.GetBackup(context.Background(), id)
+	return p.store.GetBackup(ctx, p.projectID, p.id)
 }
 
-func (s *Store) GetBackup(ctx context.Context, id string) (Backup, error) {
-	row := s.db.QueryRowContext(ctx, "SELECT "+backupColumns+" FROM backups WHERE id=?", id)
-	backup, err := scanBackup(row)
-	if errors.Is(err, sql.ErrNoRows) {
+// GetBackup requires the exact project. An empty project selects coordinator metadata.
+func (s *Store) GetBackup(ctx context.Context, projectID, id string) (Backup, error) {
+	row := s.db.QueryRowContext(ctx, "SELECT "+backupColumns+" FROM backups WHERE id=? AND project_id=?", id, projectID)
+	result, err := scanBackup(row)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && (result.Kind == "metadata") != (projectID == "")) {
 		return Backup{}, ErrNotFound
 	}
-	return backup, err
+	return result, err
 }
 
 func (s *Store) ListBackups(ctx context.Context, projectID string, limit int) ([]Backup, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 50
 	}
-	args := []any{}
-	query := "SELECT " + backupColumns + " FROM backups"
-	if projectID != "" {
-		query += " WHERE project_id=? OR project_id=''"
-		args = append(args, projectID)
+	query := "SELECT " + backupColumns + " FROM backups WHERE project_id=? AND kind != 'metadata' ORDER BY created_at DESC LIMIT ?"
+	if projectID == "" {
+		query = "SELECT " + backupColumns + " FROM backups WHERE project_id=? AND kind = 'metadata' ORDER BY created_at DESC LIMIT ?"
 	}
-	query += " ORDER BY created_at DESC LIMIT ?"
-	args = append(args, limit)
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.db.QueryContext(ctx, query, projectID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -309,178 +328,228 @@ func (s *Store) ListBackups(ctx context.Context, projectID string, limit int) ([
 	return items, rows.Err()
 }
 
-// OpenBackup returns the raw backup blob for download and verification.
-func (s *Store) OpenBackup(ctx context.Context, id string) (io.ReadSeekCloser, int64, error) {
-	backup, err := s.GetBackup(ctx, id)
+// OpenBackup returns the blob only when the scoped record is complete.
+func (s *Store) OpenBackup(ctx context.Context, projectID, id string) (io.ReadSeekCloser, int64, error) {
+	record, err := s.GetBackup(ctx, projectID, id)
 	if err != nil {
 		return nil, 0, err
 	}
-	if backup.Status != "succeeded" {
-		return nil, 0, fmt.Errorf("%w: backup %s", ErrBadInput, backup.Status)
+	return s.openBackup(record)
+}
+
+func (s *Store) openBackup(record Backup) (*os.File, int64, error) {
+	if record.Status != "succeeded" {
+		return nil, 0, fmt.Errorf("%w: backup is not complete", ErrBadInput)
 	}
-	path, err := s.backupPath(id)
+	path, err := s.backupPath(record.ID)
 	if err != nil {
 		return nil, 0, err
 	}
-	file, err := os.Open(path)
+	root, err := os.OpenRoot(filepath.Dir(path))
 	if err != nil {
 		return nil, 0, err
 	}
-	info, _ := file.Stat()
+	defer root.Close()
+	info, err := root.Lstat(filepath.Base(path))
+	if err != nil {
+		return nil, 0, err
+	}
+	if !info.Mode().IsRegular() || info.Size() != record.SizeBytes || info.Size() > MaxRestoreScan {
+		return nil, 0, fmt.Errorf("%w: backup blob has an invalid type or size", ErrBadInput)
+	}
+	file, err := root.Open(filepath.Base(path))
+	if err != nil {
+		return nil, 0, err
+	}
+	opened, err := file.Stat()
+	if err != nil || !os.SameFile(info, opened) || opened.Size() != info.Size() {
+		file.Close()
+		return nil, 0, fmt.Errorf("%w: backup blob changed", ErrBadInput)
+	}
 	return file, info.Size(), nil
 }
 
-// RestoreMetadata writes a coordinator metadata snapshot into an isolated
-// destination file. Restores never touch the live database; operators move the
-// verified snapshot into place with the service stopped.
-func (s *Store) RestoreMetadata(ctx context.Context, id, destinationDir string) (string, error) {
-	backup, err := s.GetBackup(ctx, id)
-	if err != nil {
-		return "", err
-	}
-	if backup.Kind != "metadata" || backup.Status != "succeeded" {
-		return "", fmt.Errorf("%w: only succeeded metadata backups can restore", ErrBadInput)
-	}
-	if err := os.MkdirAll(destinationDir, 0700); err != nil {
-		return "", err
-	}
-	target := filepath.Join(destinationDir, "restored-kamui-core.sqlite")
-	if _, err := os.Stat(target); err == nil {
-		return "", ErrConflict
-	}
-	path, err := s.backupPath(id)
-	if err != nil {
-		return "", err
-	}
-	if err := verifyFileChecksum(path, backup.Checksum); err != nil {
-		return "", err
-	}
-	source, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer source.Close()
-	dest, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
-	if err != nil {
-		return "", err
-	}
-	defer dest.Close()
-	if _, err := io.Copy(dest, source); err != nil {
-		os.Remove(target)
-		return "", err
-	}
-	return target, nil
+type contextReader struct {
+	ctx context.Context
+	io.Reader
 }
 
-// RestoreObjectBackup extracts a project's stored objects from a backup into
-// an isolated destination bucket. The destination must not exist.
-func (s *Store) RestoreObjectBackup(ctx context.Context, id, destinationDir string) (string, error) {
-	backup, err := s.GetBackup(ctx, id)
-	if err != nil {
-		return "", err
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
 	}
-	if backup.Kind != "objects" || backup.Status != "succeeded" {
-		return "", fmt.Errorf("%w: only succeeded object backups can restore", ErrBadInput)
-	}
-	if err := os.MkdirAll(destinationDir, 0700); err != nil {
-		return "", err
-	}
-	// Verify backup integrity
-	path, err := s.backupPath(id)
-	if err != nil {
-		return "", err
-	}
-	if err := verifyFileChecksum(path, backup.Checksum); err != nil {
-		return "", err
-	}
-	// Extract tar archive
-	source, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer source.Close()
-	tr := tar.NewReader(source)
-	for {
-		header, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return "", fmt.Errorf("tar read error: %w", err)
-		}
-		// Validate header name doesn't contain traversal
-		if strings.Contains(header.Name, "..") || filepath.IsAbs(header.Name) {
-			return "", fmt.Errorf("%w: invalid path in backup archive", ErrBadInput)
-		}
-		// Create target file
-		target := filepath.Join(destinationDir, header.Name)
-		if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
-			return "", err
-		}
-		if header.Typeflag == tar.TypeReg {
-			dest, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
-			if err != nil {
-				return "", err
-			}
-			if _, err := io.Copy(dest, tr); err != nil {
-				dest.Close()
-				return "", err
-			}
-			dest.Close()
-		}
-	}
-	return destinationDir, nil
+	return r.Reader.Read(p)
 }
 
-// RestoreVolumeBackup extracts a Docker volume backup into a new named volume.
-// The destination volume name must not already exist.
-// This uses the Docker executor to run a container that extracts the tar into the new volume.
-func (s *Store) RestoreVolumeBackup(ctx context.Context, id, destinationVolume string) error {
-	backup, err := s.GetBackup(ctx, id)
-	if err != nil {
-		return err
+func (s *Store) RestoreMetadata(ctx context.Context, principal identity.Principal, id string) (string, error) {
+	if !principal.User.IsSystemAdmin {
+		return "", ErrForbidden
 	}
-	if backup.Kind != "volume" || backup.Status != "succeeded" {
-		return fmt.Errorf("%w: only succeeded volume backups can restore", ErrBadInput)
-	}
-	if !validVolumeName(destinationVolume) {
-		return fmt.Errorf("%w: invalid destination volume name", ErrBadInput)
-	}
-	// Verify backup integrity
-	path, err := s.backupPath(id)
-	if err != nil {
-		return err
-	}
-	if err := verifyFileChecksum(path, backup.Checksum); err != nil {
-		return err
-	}
-	// The backup is a tar archive. We need to extract it into a new Docker volume.
-	// We'll use a temporary container with the destination volume mounted and the backup tar piped in.
-	// This requires access to the Docker daemon, which we may not have directly in the backup store.
-	// For now, return an error indicating the limitation - the actual restore should be
-	// triggered through the workspace-manager which has Docker access.
-	return fmt.Errorf("%w: volume restore requires workspace-manager; use the workspace-manager's restore API", ErrBadInput)
+	return s.restore(ctx, "", id, "metadata")
 }
 
-func verifyFileChecksum(path, expected string) error {
-	file, err := os.Open(path)
+// RestoreObjectBackup produces an isolated export for this project.
+func (s *Store) RestoreObjectBackup(ctx context.Context, projectID, id string) (string, error) {
+	if projectID == "" {
+		return "", ErrNotFound
+	}
+	return s.restore(ctx, projectID, id, "objects")
+}
+
+func (s *Store) RestoreVolumeBackup(ctx context.Context, projectID, id string) error {
+	record, err := s.GetBackup(ctx, projectID, id)
 	if err != nil {
 		return err
+	}
+	if record.Kind != "volume" {
+		return ErrBadInput
+	}
+	return ErrNotImplemented
+}
+
+func (s *Store) restore(ctx context.Context, projectID, id, kind string) (location string, resultErr error) {
+	record, err := s.GetBackup(ctx, projectID, id)
+	if err != nil {
+		return "", err
+	}
+	if record.Kind != kind {
+		return "", ErrBadInput
+	}
+	file, size, err := s.openBackup(record)
+	if err != nil {
+		return "", err
 	}
 	defer file.Close()
-	hasher := sha256.New()
-	if _, err := io.Copy(hasher, file); err != nil {
-		return err
+
+	if err := os.MkdirAll(filepath.Join(s.root, "restores"), 0700); err != nil {
+		return "", err
 	}
-	sum := "sha256:" + hex.EncodeToString(hasher.Sum(nil))
-	if sum != expected {
-		return fmt.Errorf("backup checksum mismatch: stored %s, computed %s", expected, sum)
+	root, err := os.OpenRoot(s.root)
+	if err != nil {
+		return "", err
 	}
-	return nil
+	defer root.Close()
+	dir := filepath.Join("restores", newID("restore"))
+	if err := root.Mkdir(dir, 0700); err != nil {
+		return "", err
+	}
+	defer func() {
+		if resultErr != nil {
+			resultErr = errors.Join(resultErr, root.RemoveAll(dir))
+		}
+	}()
+	stage := filepath.Join(dir, "pending")
+	if err := root.Mkdir(stage, 0700); err != nil {
+		return "", err
+	}
+	hash := sha256.New()
+	content := io.TeeReader(io.LimitReader(contextReader{ctx, file}, size), hash)
+	name := "data"
+	if kind == "metadata" {
+		dest, err := root.OpenFile(filepath.Join(stage, "kamui-core.sqlite"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		if err != nil {
+			return "", err
+		}
+		_, err = io.Copy(dest, content)
+		if err := errors.Join(err, dest.Close()); err != nil {
+			return "", err
+		}
+		name = "kamui-core.sqlite"
+	} else {
+		out, err := root.OpenRoot(stage)
+		if err != nil {
+			return "", err
+		}
+		err = extractTar(out, content)
+		if err := errors.Join(err, out.Close()); err != nil {
+			return "", err
+		}
+	}
+	if _, err := io.Copy(io.Discard, content); err != nil {
+		return "", err
+	}
+	if "sha256:"+hex.EncodeToString(hash.Sum(nil)) != record.Checksum {
+		return "", fmt.Errorf("%w: backup checksum mismatch", ErrBadInput)
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	published := filepath.Join(dir, "data")
+	if err := root.Rename(stage, published); err != nil {
+		return "", err
+	}
+	if kind == "metadata" {
+		published = filepath.Join(published, name)
+	}
+	return filepath.ToSlash(published), nil
+}
+
+func extractTar(root *os.Root, content io.Reader) error {
+	tr := tar.NewReader(content)
+	var total int64
+	entries := 0
+	dirs := map[string]bool{".": true}
+	mkdir := func(dir string) error {
+		for parent := dir; !dirs[parent]; parent = filepath.Dir(parent) {
+			if entries >= MaxRestoreEntries {
+				return ErrTooBig
+			}
+			dirs[parent] = true
+			entries++
+		}
+		return root.MkdirAll(dir, 0700)
+	}
+	for records := 0; ; records++ {
+		h, err := tr.Next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("%w: malformed backup archive", ErrBadInput)
+		}
+		if records >= MaxRestoreEntries || entries >= MaxRestoreEntries || h.Size < 0 || h.Size > MaxRestoreScan-total {
+			return ErrTooBig
+		}
+		total += h.Size
+
+		name := h.Name
+		if h.Typeflag == tar.TypeDir {
+			name = strings.TrimSuffix(name, "/")
+		}
+		if !fs.ValidPath(name) || name == "." || len(name) > 4096 || strings.Count(name, "/") > 64 || strings.ContainsAny(name, "\\:") {
+			return fmt.Errorf("%w: invalid archive entry name", ErrBadInput)
+		}
+		local, err := filepath.Localize(name)
+		if err != nil {
+			return fmt.Errorf("%w: invalid archive entry name", ErrBadInput)
+		}
+
+		switch h.Typeflag {
+		case tar.TypeDir:
+			if err := mkdir(local); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			entries++
+			if err := mkdir(filepath.Dir(local)); err != nil {
+				return err
+			}
+			dest, err := root.OpenFile(local, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
+			if err != nil {
+				return err
+			}
+			_, err = io.Copy(dest, tr)
+			if err := errors.Join(err, dest.Close()); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("%w: unsupported archive entry type", ErrBadInput)
+		}
+	}
 }
 
 func newID(prefix string) string {
-	var bytes [16]byte
-	_, _ = identity.NewSecretToken(prefix, 12)
-	return prefix + "-" + hex.EncodeToString(bytes[:])[:24]
+	var bytes [12]byte
+	rand.Read(bytes[:])
+	return prefix + "-" + hex.EncodeToString(bytes[:])
 }

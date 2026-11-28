@@ -293,68 +293,34 @@ func (a *app) storeCommand() *cobra.Command {
 
 func (a *app) backupCommand() *cobra.Command {
 	group := addProjectFlag(&cobra.Command{Use: "backup", Short: "Back up and restore Kamui state"})
-	group.AddCommand(&cobra.Command{
-		Use: "create metadata", Short: "Snapshot coordinator metadata (admin)", Args: usageArgs(cobra.ExactArgs(1)),
-		RunE: func(cmd *cobra.Command, args []string) error {
+	create := &cobra.Command{Use: "create", Short: "Create a backup"}
+	group.AddCommand(create)
+	create.AddCommand(&cobra.Command{
+		Use: "metadata", Short: "Snapshot coordinator metadata (admin)", Args: usageArgs(cobra.NoArgs),
+		RunE: func(cmd *cobra.Command, _ []string) error {
 			return a.serviceSend(cmd, "POST", "/v1/backups/metadata", map[string]any{})
 		},
-	})
-	group.AddCommand(&cobra.Command{
-		Use: "create objects", Short: "Bundle this project's stored objects", Args: usageArgs(cobra.ExactArgs(1)),
-		RunE: func(cmd *cobra.Command, args []string) error {
+	}, &cobra.Command{
+		Use: "objects", Short: "Bundle this project's stored objects", Args: usageArgs(cobra.NoArgs),
+		RunE: func(cmd *cobra.Command, _ []string) error {
 			return a.serviceSend(cmd, "POST", svcProjectPath("/backups/objects"), map[string]any{})
 		},
 	})
 	group.AddCommand(&cobra.Command{
-		Use: "create volume --volume NAME", Short: "Export a Docker volume backup",
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			volume, _ := cmd.Flags().GetString("volume")
-			if volume == "" {
-				return failure(2, "usage", "--volume is required")
-			}
-			return a.serviceSend(cmd, "POST", svcProjectPath("/backups/volume"), map[string]any{"volume": volume})
-		},
-	})
-	group.AddCommand(&cobra.Command{
-		Use: "list", Short: "List backups", Args: usageArgs(cobra.NoArgs),
+		Use: "list", Short: "List project backups, or coordinator metadata backups (admin)", Args: usageArgs(cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return a.serviceSend(cmd, "GET", "/v1/backups"+svcProjectSuffix(), nil)
 		},
-	})
-	group.AddCommand(&cobra.Command{
+	}, &cobra.Command{
 		Use: "inspect BACKUP", Short: "Show backup metadata", Args: usageArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return a.serviceSend(cmd, "GET", "/v1/backups/"+args[0], nil)
+			return a.serviceSend(cmd, "GET", "/v1/backups/"+url.PathEscape(args[0])+svcProjectSuffix(), nil)
 		},
-	})
-	group.AddCommand(&cobra.Command{
-		Use: "restore BACKUP --destination DIR", Short: "Restore into an isolated destination",
+	}, &cobra.Command{
+		Use: "restore BACKUP", Aliases: []string{"restore-objects"}, Short: "Restore into a server-generated isolated export",
+		Args: usageArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			destination, _ := cmd.Flags().GetString("destination")
-			if destination == "" {
-				return failure(2, "usage", "--destination is required and must be an isolated directory")
-			}
-			return a.serviceSend(cmd, "POST", "/v1/backups/"+args[0]+"/restore", map[string]any{"destination": destination})
-		},
-	})
-	group.AddCommand(&cobra.Command{
-		Use: "restore-objects BACKUP --destination DIR", Short: "Restore object backup into an isolated directory",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			destination, _ := cmd.Flags().GetString("destination")
-			if destination == "" {
-				return failure(2, "usage", "--destination is required and must be an isolated directory")
-			}
-			return a.serviceSend(cmd, "POST", "/v1/backups/"+args[0]+"/restore-objects", map[string]any{"destination": destination})
-		},
-	})
-	group.AddCommand(&cobra.Command{
-		Use: "restore-volume BACKUP --volume NAME", Short: "Restore volume backup into a new Docker volume",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			volume, _ := cmd.Flags().GetString("volume")
-			if volume == "" {
-				return failure(2, "usage", "--volume is required")
-			}
-			return a.serviceSend(cmd, "POST", "/v1/backups/"+args[0]+"/restore-volume", map[string]any{"volume": volume})
+			return a.serviceSend(cmd, "POST", "/v1/backups/"+url.PathEscape(args[0])+"/restore"+svcProjectSuffix(), nil)
 		},
 	})
 	return group
@@ -843,7 +809,7 @@ func svcProjectSuffix() string {
 	if svcProject() == "" {
 		return ""
 	}
-	return "&project_id=" + svcProject()
+	return "?project_id=" + url.QueryEscape(svcProject())
 }
 
 func svcProjectPath(suffix string) string {

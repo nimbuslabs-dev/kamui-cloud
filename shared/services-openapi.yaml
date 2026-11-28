@@ -131,35 +131,43 @@ paths:
       responses:
         '201': { description: Backup record, content: { application/json: { schema: { $ref: '#/components/schemas/Backup' } } } }
         default: { $ref: '#/components/responses/Error' }
+  /v1/backups:
+    get:
+      operationId: listBackups
+      parameters:
+        - { $ref: '#/components/parameters/BackupProject' }
+      responses:
+        '200': { description: Backups in the selected project or administrator-only coordinator metadata scope }
+        default: { $ref: '#/components/responses/Error' }
   /v1/backups/{bck}:
     parameters:
       - { name: bck, in: path, required: true, schema: { type: string } }
+      - { $ref: '#/components/parameters/BackupProject' }
     get:
       operationId: getBackup
       responses:
         '200': { description: Backup metadata, content: { application/json: { schema: { $ref: '#/components/schemas/Backup' } } } }
         default: { $ref: '#/components/responses/Error' }
+  /v1/backups/{bck}/content:
+    parameters:
+      - { name: bck, in: path, required: true, schema: { type: string } }
+      - { $ref: '#/components/parameters/BackupProject' }
+    get:
+      operationId: downloadBackup
+      responses:
+        '200': { description: Backup bytes, content: { application/octet-stream: { schema: { type: string, format: binary } } } }
+        default: { $ref: '#/components/responses/Error' }
   /v1/backups/{bck}/restore:
     parameters:
       - { name: bck, in: path, required: true, schema: { type: string } }
+      - { $ref: '#/components/parameters/BackupProject' }
     post:
       operationId: restoreBackup
-      description: >
-        Restores a backup based on its kind. For metadata backups, restores to an isolated
-        destination file. For object backups, extracts the tar bundle to an isolated directory.
-        For volume backups, extracts to a NEW Docker volume (requires volume name in request body).
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [destination]
-              properties:
-                destination: { type: string, description: "Required for metadata and object backups: isolated directory path" }
-                volume: { type: string, description: "Required for volume backups: name of the NEW Docker volume to create" }
+      description: Exports a verified metadata snapshot or object archive into a server-generated directory. The response location is relative to the coordinator storage root. Object-store import and Docker volume restore remain unsupported.
       responses:
-        '200': { description: Restored to the isolated destination or volume }
+        '200': { description: Isolated export published }
+        '404': { description: Backup does not exist in the authorized scope }
+        '501': { description: Managed volume restore is unavailable }
         default: { $ref: '#/components/responses/Error' }
   /v1/projects/{id}/deployments:
     parameters:
@@ -540,6 +548,12 @@ paths:
         '200': { description: Approved }
         default: { $ref: '#/components/responses/Error' }
 components:
+  parameters:
+    BackupProject:
+      name: project_id
+      in: query
+      description: Project ID for a project backup. Omit only for administrator access to coordinator metadata backups.
+      schema: { type: string }
   securitySchemes:
     bearerAuth: { type: http, scheme: bearer }
   responses:

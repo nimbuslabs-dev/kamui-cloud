@@ -25,7 +25,7 @@ the schema source of truth — this file covers discovery, states and gaps.
 | Workers | `node join/list/inspect/approve/revoke/drain/enable/share` CLI; REST under `/v1/workers` | admin | Enrollment token shown once |
 | Deploy | `/v1/projects/{id}/deployments` + builds, revisions, release, rollback, logs, webhooks | workload:read/write | `GET {dep}` returns `{deployment, revisions, builds, runtime}` — runtime is the live workload snapshot |
 | Store | `/v1/projects/{id}/buckets`, `.../objects/{key}` (PUT raw bytes, GET raw bytes, `?metadata=true`) | workload:read/write | Downloads are raw bytes with `X-Checksum-Sha256`; use streaming fetch, not JSON |
-| Backup | `/v1/backups*`, project object/volume backups, restore | admin for metadata; workload:write per project otherwise | Restore returns the isolated destination path |
+| Backup | `/v1/backups*`, project object backups, restore | Admin for metadata; project read or write permissions otherwise | Use `project_id` for project records. Restore returns a server-generated export path relative to storage. Object import and managed volume restore remain unavailable. |
 | Train | `/v1/projects/{id}/training`, `/collect`, `/metrics`; `/models` | workload:read/write | Metrics come only from the training process; empty until `POST /collect` |
 | Infer | `/v1/projects/{id}/inference`, `/stop`, `/proxy/*` | workload:read/write | Authenticated GET/POST via the current worker tunnel; separate-host acceptance pending |
 | Quotas/SRE | `/v1/projects/{id}/quotas` (PUT needs project:update), `/usage`, `/alerts`, `/v1/alerts/{alr}/events` | project:update for writes | Usage distinguishes allocated vs measured; measured may be null |
