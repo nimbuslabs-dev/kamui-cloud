@@ -144,7 +144,10 @@ paths:
       - { name: bck, in: path, required: true, schema: { type: string } }
     post:
       operationId: restoreBackup
-      description: Checksum-verified restore into an isolated destination; never overwrites live data.
+      description: >
+        Restores a backup based on its kind. For metadata backups, restores to an isolated
+        destination file. For object backups, extracts the tar bundle to an isolated directory.
+        For volume backups, extracts to a NEW Docker volume (requires volume name in request body).
       requestBody:
         required: true
         content:
@@ -153,9 +156,10 @@ paths:
               type: object
               required: [destination]
               properties:
-                destination: { type: string }
+                destination: { type: string, description: "Required for metadata and object backups: isolated directory path" }
+                volume: { type: string, description: "Required for volume backups: name of the NEW Docker volume to create" }
       responses:
-        '200': { description: Restored to the isolated path }
+        '200': { description: Restored to the isolated destination or volume }
         default: { $ref: '#/components/responses/Error' }
   /v1/projects/{id}/deployments:
     parameters:
@@ -393,6 +397,73 @@ paths:
       responses:
         '200': { description: Databases }
         default: { $ref: '#/components/responses/Error' }
+  /v1/projects/{id}/databases/{db}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: db, in: path, required: true, schema: { type: string } }
+    get:
+      operationId: getDatabase
+      responses:
+        '200': { description: Database with logs }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      operationId: stopDatabase
+      responses:
+        '202': { description: Stopping }
+        default: { $ref: '#/components/responses/Error' }
+    delete:
+      operationId: deleteDatabase
+      responses:
+        '200': { description: Deleted }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/projects/{id}/databases/{db}/stop:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: db, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: stopDatabase
+      responses:
+        '202': { description: Stopping }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/projects/{id}/databases/{db}/backup:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: db, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: backupDatabase
+      description: >
+        Creates a PostgreSQL custom-format dump (pg_dump -Fc) of the database.
+        Returns the dump as binary application/octet-stream.
+      responses:
+        '200':
+          description: Binary dump
+          content:
+            application/octet-stream: { schema: { type: string, format: binary } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/projects/{id}/databases/{db}/restore:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: db, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: restoreDatabase
+      description: >
+        Restores a PostgreSQL custom-format dump (pg_restore -Fc) into the database.
+        By default, restores to an ISOLATED new database named restore_<name>_<timestamp>
+        and verifies the restore. This is NON-DESTRUCTIVE and safe for production.
+        To overwrite the existing database (DESTRUCTIVE), pass ?force=true as a system administrator.
+      parameters:
+        - name: force
+          in: query
+          schema: { type: boolean, default: false }
+          description: "Overwrite the existing database (requires system admin)"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream: { schema: { type: string, format: binary } }
+      responses:
+        '200': { description: Restored successfully }
+        '403': { description: Force restore requires system admin }
+        default: { $ref: '#/components/responses/Error' }
   /v1/drop/transfers:
     post:
       operationId: createTransfer
@@ -467,3 +538,20 @@ components:
         size_bytes: { type: integer, format: int64 }
         checksum: { type: string }
         created_at: { type: string, format: date-time }
+    Database:
+      type: object
+      required: [id, project_id, name, engine, state, created_at]
+      properties:
+        id: { type: string }
+        project_id: { type: string }
+        name: { type: string }
+        engine: { type: string }
+        version: { type: string }
+        image: { type: string }
+        workload_id: { type: string }
+        volume: { type: string }
+        state: { type: string }
+        reason: { type: string }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }

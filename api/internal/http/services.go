@@ -1082,6 +1082,7 @@ func (h *servicesHandler) BackupDatabase(w http.ResponseWriter, r *http.Request)
 }
 
 // RestoreDatabase restores a PostgreSQL dump from the request body.
+// By default, restores to an isolated database. Use ?force=true to overwrite the existing database (requires explicit authorization).
 func (h *servicesHandler) RestoreDatabase(w http.ResponseWriter, r *http.Request) {
 	projectID := r.PathValue("id")
 	p, ok := h.authorize(w, r, projectID, identity.PermWorkloadWrite)
@@ -1089,14 +1090,24 @@ func (h *servicesHandler) RestoreDatabase(w http.ResponseWriter, r *http.Request
 		return
 	}
 	dbID := r.PathValue("db")
-	if err := h.ops.DatabaseRestore(r.Context(), projectID, dbID, r.Body); err != nil {
+	force := false
+	if r.URL.Query().Get("force") == "true" {
+		// Force restore requires explicit admin authorization
+		if p.User.IsSystemAdmin {
+			force = true
+		} else {
+			servicesError(w, fmt.Errorf("%w: force restore requires system administrator authorization", identity.ErrForbidden))
+			return
+		}
+	}
+	if err := h.ops.DatabaseRestore(r.Context(), projectID, dbID, r.Body, force); err != nil {
 		servicesError(w, err)
 		return
 	}
 	if h.ids != nil {
 		_ = h.ids.RecordAudit(r.Context(), p.User.ID, projectID, "database.restore", "database", dbID, "success", "")
 	}
-	apierr.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+	apierr.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "force": force})
 }
 
 // --- Backup restore handlers ----------------------------------------------------

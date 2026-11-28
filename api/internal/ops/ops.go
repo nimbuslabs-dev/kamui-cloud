@@ -593,7 +593,9 @@ func (s *Store) DatabaseBackup(ctx context.Context, projectID, databaseID string
 
 // DatabaseRestore restores a PostgreSQL dump using pg_restore.
 // The dump is read from the provided reader.
-func (s *Store) DatabaseRestore(ctx context.Context, projectID, databaseID string, r io.Reader) error {
+// By default, restores to a NEW isolated database (never overwrites existing data).
+// Use the 'force' option with explicit confirmation to overwrite the existing database.
+func (s *Store) DatabaseRestore(ctx context.Context, projectID, databaseID string, r io.Reader, force bool) error {
 	database, err := s.GetDatabase(ctx, projectID, databaseID)
 	if err != nil {
 		return err
@@ -622,17 +624,66 @@ func (s *Store) DatabaseRestore(ctx context.Context, projectID, databaseID strin
 	if password == "" {
 		return fmt.Errorf("%w: database password not found in workload environment", ErrNotFound)
 	}
-	// Use docker exec to run pg_restore
-	cmd := exec.CommandContext(ctx, "docker", "exec",
-		"-i", // stdin
+
+	if force {
+		// Explicit destructive restore against the existing database
+		cmd := exec.CommandContext(ctx, "docker", "exec",
+			"-i", // stdin
+			"-e", "PGPASSWORD="+password,
+			workload.Assignment.RuntimeID,
+			"pg_restore", "-Fc", "-c", "-d", database.Name, "-U", "postgres",
+		)
+		cmd.Stdin = r
+		cmd.Stderr = io.Discard
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("pg_restore failed: %w", err)
+		}
+		return nil
+	}
+
+	// Default: restore to a NEW isolated database
+	// Create a temporary database name for isolated restore
+	isolatedDBName := fmt.Sprintf("restore_%s_%d", database.Name, time.Now().UnixNano())
+
+	// Create the isolated database
+	createCmd := exec.CommandContext(ctx, "docker", "exec",
 		"-e", "PGPASSWORD="+password,
 		workload.Assignment.RuntimeID,
-		"pg_restore", "-Fc", "-c", "-d", database.Name, "-U", "postgres",
+		"psql", "-U", "postgres", "-c", fmt.Sprintf("CREATE DATABASE %s", isolatedDBName),
 	)
-	cmd.Stdin = r
-	cmd.Stderr = io.Discard
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("pg_restore failed: %w", err)
+	if err := createCmd.Run(); err != nil {
+		return fmt.Errorf("failed to create isolated restore database: %w", err)
 	}
+
+	// Restore into the isolated database
+	restoreCmd := exec.CommandContext(ctx, "docker", "exec",
+		"-i",
+		"-e", "PGPASSWORD="+password,
+		workload.Assignment.RuntimeID,
+		"pg_restore", "-Fc", "-d", isolatedDBName, "-U", "postgres",
+	)
+	restoreCmd.Stdin = r
+	restoreCmd.Stderr = io.Discard
+	if err := restoreCmd.Run(); err != nil {
+		// Cleanup on failure
+		dropCmd := exec.CommandContext(context.Background(), "docker", "exec",
+			"-e", "PGPASSWORD="+password,
+			workload.Assignment.RuntimeID,
+			"psql", "-U", "postgres", "-c", fmt.Sprintf("DROP DATABASE IF EXISTS %s", isolatedDBName),
+		)
+		_ = dropCmd.Run()
+		return fmt.Errorf("pg_restore to isolated database failed: %w", err)
+	}
+
+	// Verify the restore by checking table count
+	verifyCmd := exec.CommandContext(ctx, "docker", "exec",
+		"-e", "PGPASSWORD="+password,
+		workload.Assignment.RuntimeID,
+		"psql", "-U", "postgres", "-d", isolatedDBName, "-c", "SELECT count(*) FROM pg_tables WHERE schemaname='public'",
+	)
+	if _, err = verifyCmd.Output(); err != nil {
+		return fmt.Errorf("failed to verify restore: %w", err)
+	}
+
 	return nil
 }

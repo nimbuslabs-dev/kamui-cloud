@@ -585,10 +585,11 @@ func (a *app) databaseCommand() *cobra.Command {
 		},
 	})
 	group.AddCommand(&cobra.Command{
-		Use: "restore DB [--input FILE]", Short: "Restore a PostgreSQL dump into the database",
+		Use: "restore DB [--input FILE] [--force]", Short: "Restore a PostgreSQL dump into the database (defaults to isolated restore; --force overwrites existing)",
 		Args: usageArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			input, _ := cmd.Flags().GetString("input")
+			force, _ := cmd.Flags().GetBool("force")
 			var data []byte
 			var err error
 			if input != "" {
@@ -603,8 +604,11 @@ func (a *app) databaseCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			result, err := client.rawRequest(cmd.Context(), "POST",
-				svcProjectPath("/databases/"+args[0]+"/restore"), data)
+			path := svcProjectPath("/databases/" + args[0] + "/restore")
+			if force {
+				path += "?force=true"
+			}
+			result, err := client.rawRequest(cmd.Context(), "POST", path, data)
 			if err != nil {
 				return err
 			}
