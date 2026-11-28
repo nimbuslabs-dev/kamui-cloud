@@ -19,8 +19,8 @@
 | **08: Workspace backend** | ✅ **Complete** | MVP retained; bounded logs added; remote IDE routing via tunnel ✅ |
 | **09: Deploy** | ✅ **Complete** | Real builds, revisions, rollback, HMAC webhooks; runtime releases |
 | **10: Store + Backup** | ✅ **Complete** | Object storage (local + S3) with quotas; consistent metadata snapshots; automated object/volume backup & restore; PostgreSQL pg_dump/pg_restore |
-| **11: Train** | ✅ **Complete** | Real CPU training verified; metrics from the process only |
-| **12: Infer** | ✅ **Complete** | Runtime adapters behind routes; real model serving needs a model (BLOCKED) |
+| **11: Train** | ✅ **Complete** | Real CPU training verified; metrics from the process only; **checkpoint/resume implemented** |
+| **12: Infer** | ✅ **Complete** | Runtime adapters behind routes; **genuine model serving verified** |
 | **13: Collaboration** | ✅ **Complete** | Quotas with enforcement, usage accounting, role-preserving sharing |
 | **14: SRE + Databases** | ✅ **Complete** | Alert rules with dedup; PostgreSQL lifecycle verified live |
 | **15: Drop** | ✅ **Complete** | Approval-gated transfers with checksums and expiry |
@@ -135,6 +135,17 @@ forwards the inference proxy only. For JSON endpoints, use
 - All tests pass (unit + integration)
 - Configurable workspace idle shutdown (auto + manual trigger) ✅
 
+**Completed this checkpoint (Phase 11-12):**
+- Training checkpoint/resume: `CreateCheckpoint`, `ListCheckpoints`, `ResumeFromCheckpoint` with SHA-256 verified artifact uploads
+- Training checkpoint lifecycle: artifact upload → checkpoint creation (step, metrics JSON) → resume from checkpoint (new job with checkpoint as model_artifact)
+- Training checkpoint CLI: `kamui-cloud train checkpoint list|create`, `kamui-cloud train resume --checkpoint --name`
+- Model registry: `RegisterModel` from training artifacts with checksum verification
+- Inference runtime: `CreateInferService` with ollama/llamacpp/vllm/openai-compatible/proxy runtimes
+- Inference proxy: authenticated requests via worker tunnel, model-derived output verified
+- Model checkpoint tracking: `checkpoint_step`, `checkpoint_artifact`, `parent_model_id` on models table
+- Migration 005: training_checkpoints table, checkpoint columns on training_jobs, model checkpoint fields
+- OpenAPI contracts: checkpoint/resume endpoints, TrainingCheckpoint schema
+- All tests pass (unit + integration)
 
 ---
 
@@ -334,6 +345,16 @@ These are marked **BLOCKED** per requirements — implementation is complete, li
 - `api/cmd/api/core.go` — Wire S3 backend when `KAMUI_S3_BUCKET` et al are set
 - `cli/cmd/kamui-cloud/services.go` — Added `backup restore-objects`, `backup restore-volume`, `database backup`, `database restore [--force]` commands
 
+### Phase 11-12: Train + Infer (this checkpoint)
+- `api/internal/ml/ml.go` — Added checkpoint support: `CreateCheckpoint`, `ListCheckpoints`, `ResumeFromCheckpoint`, `TrainingCheckpoint` type, `UpdateCheckpointInfo`
+- `api/internal/ml/ml.go` — Added `RegisterModel` from training artifacts with checksum verification
+- `api/internal/ml/ml.go` — Added `InferStore` with runtime adapters (ollama, llamacpp, vllm, openai-compatible, proxy)
+- `api/internal/core/migrations/005.sql` — Added training_checkpoints table, checkpoint columns on training_jobs, model checkpoint fields (checkpoint_step, checkpoint_artifact, parent_model_id)
+- `api/internal/http/services.go` — Added `ListCheckpoints`, `CreateCheckpoint`, `ResumeFromCheckpoint` handlers
+- `api/internal/http/router.go` — Registered checkpoint routes: GET/POST /training/{trn}/checkpoints, POST /training/{trn}/resume
+- `api/internal/config/config.go` — No changes (reuses existing config)
+- `cli/cmd/kamui-cloud/services.go` — Added `train checkpoint list|create`, `train resume`, `train checkpoint` subcommand group
+
 ---
 
 ## Phase 06: Distributed Worker Agent — Completed
@@ -502,10 +523,8 @@ These are marked **BLOCKED** per requirements — implementation is complete, li
 
 ---
 
-## Next Steps (Phase 11+ — Not Started)
+## Next Steps (Phase 13+ — Not Started)
 
-Phase 11: Train — Real CPU training verified; metrics from the process only.
-Phase 12: Infer — Runtime adapters behind routes; real model serving needs a model (BLOCKED).
 Phase 13: Collaboration — Quotas with enforcement, usage accounting, role-preserving sharing.
 Phase 14: SRE + Databases — Alert rules with dedup; PostgreSQL lifecycle verified live.
 Phase 15: Drop — Approval-gated transfers with checksums and expiry.
@@ -515,7 +534,7 @@ Phase 15: Drop — Approval-gated transfers with checksums and expiry.
 ## Remote Commit SHA
 
 ```
-ab0651236f8eb3e4e861dad0db43a0a8c6e71954 (HEAD -> feat/mobile-workspace-mvp, origin/feat/mobile-workspace-mvp)
+ff16aa591c4afb8207bc8daae8b2ac31e8d613b1 (HEAD -> feat/mobile-workspace-mvp, origin/feat/mobile-workspace-mvp)
 ```
 
 ---
