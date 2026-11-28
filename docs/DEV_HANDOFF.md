@@ -312,6 +312,18 @@ These are marked **BLOCKED** per requirements — implementation is complete, li
 - `cli/cmd/kamui-cloud/services.go` — Added `deploy proxy` command with `--method --path --data` flags
 - `cli/cmd/kamui-cloud/workspaces.go` — Added `workspace ide open|request` and `workspace idle-shutdown` commands
 
+### Phase 09: Deploy — Completed
+
+- **Git-source builds**: `fetchGitArchive` fetches GitHub tarballs with commit/branch selection; `materialize` extracts safely with path traversal protection
+- **Build pipeline**: `Builder.BuildFromGit` / `BuildFromDockerfile` / `ResolveImage`; builds via Docker SDK with bounded context, digest-pinned images
+- **Revision registry**: `TriggerBuild` → `ReleaseRevision` schedules service workload through shared engine; healthy revision tracking
+- **Rollback**: `Rollback` releases previous healthy revision; refuses if no healthy revision exists
+- **HMAC webhooks**: `CreateWebhook` / `MatchWebhook` with HMAC-SHA256, timestamp replay protection, branch filter
+- **Service proxy**: `ProxyDeployment` routes via runtime routes; remote workers use authenticated tunnel
+- **Private routing**: `RouteLookup` with assignment fencing; `liveServiceRoute` validates fence, lease, attempt
+
+- **CLI**: `deploy create|list|inspect|start|stop|rollback|build|release|rollback|logs|proxy|webhook create|list|delete`
+
 ### Phase 10: Store + Backup (this checkpoint)
 - `api/internal/objectstore/s3.go` — New: S3-compatible backend using AWS SDK v2 (MinIO, AWS S3 compatible)
 - `api/internal/objectstore/store.go` — Added `NewS3BackendFromConfig`, `S3Config` types
@@ -490,23 +502,21 @@ These are marked **BLOCKED** per requirements — implementation is complete, li
 
 ---
 
-## Next Steps (Phase 08–10 — Not Started)
+## Next Steps (Phase 11+ — Not Started)
 
-Per instructions, **stop after Phase 07**.
-
-Phase 08 would cover: deployment service on the shared scheduling contracts, artifact handoff.
-Phase 09 would cover: object storage integration, GPU passthrough hardening on real NVIDIA hosts.
-Phase 10 would cover: production hardening, security audit (after December 21), stress testing.
+Phase 11: Train — Real CPU training verified; metrics from the process only.
+Phase 12: Infer — Runtime adapters behind routes; real model serving needs a model (BLOCKED).
+Phase 13: Collaboration — Quotas with enforcement, usage accounting, role-preserving sharing.
+Phase 14: SRE + Databases — Alert rules with dedup; PostgreSQL lifecycle verified live.
+Phase 15: Drop — Approval-gated transfers with checksums and expiry.
 
 ---
 
 ## Remote Commit SHA
 
 ```
-d172c1616c45b24be9dd2c9a05e2c6306ca06756 (HEAD -> feat/mobile-workspace-mvp, origin/feat/mobile-workspace-mvp)
+ab0651236f8eb3e4e861dad0db43a0a8c6e71954 (HEAD -> feat/mobile-workspace-mvp, origin/feat/mobile-workspace-mvp)
 ```
-
-No new commits pushed yet — all changes are staged/unstaged in working tree.
 
 ---
 
