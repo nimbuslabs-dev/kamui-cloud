@@ -494,7 +494,7 @@ func (h *servicesHandler) SubmitTraining(w http.ResponseWriter, r *http.Request)
 		retries = *input.MaxRetries
 	}
 	job, err := h.train.SubmitTraining(r.Context(), projectID, input.Name, input.Image, input.Args, input.ImageDigest,
-		input.Resources, input.DatasetArtifact, input.Placement, input.WorkerID, input.Env, input.TimeoutSeconds, retries, p.User.ID)
+		input.Resources, input.DatasetArtifact, "", "", input.Placement, input.WorkerID, input.Env, input.TimeoutSeconds, retries, p.User.ID)
 	if err != nil {
 		servicesError(w, err)
 		return

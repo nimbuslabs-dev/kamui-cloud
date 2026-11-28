@@ -38,21 +38,21 @@ func NewTrainStore(db *sql.DB, coreStore *core.Store) *TrainStore {
 }
 
 type TrainingJob struct {
-	ID               string    `json:"id"`
-	ProjectID        string    `json:"project_id"`
-	Name             string    `json:"name"`
-	WorkloadID       string    `json:"workload_id,omitempty"`
-	DatasetArtifact  string    `json:"dataset_artifact,omitempty"`
-	ModelArtifact    string    `json:"model_artifact,omitempty"`
-	State            string    `json:"state"`
-	Reason           string    `json:"reason,omitempty"`
-	CreatedBy        string    `json:"created_by"`
-	CreatedAt        time.Time `json:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at"`
-	CheckpointArtifact string  `json:"checkpoint_artifact,omitempty"`
-	CheckpointStep   int       `json:"checkpoint_step,omitempty"`
-	ResumeFrom       string    `json:"resume_from,omitempty"`
-	CheckpointPath   string    `json:"checkpoint_path,omitempty"`
+	ID                 string    `json:"id"`
+	ProjectID          string    `json:"project_id"`
+	Name               string    `json:"name"`
+	WorkloadID         string    `json:"workload_id,omitempty"`
+	DatasetArtifact    string    `json:"dataset_artifact,omitempty"`
+	ModelArtifact      string    `json:"model_artifact,omitempty"`
+	State              string    `json:"state"`
+	Reason             string    `json:"reason,omitempty"`
+	CreatedBy          string    `json:"created_by"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
+	CheckpointArtifact string    `json:"checkpoint_artifact,omitempty"`
+	CheckpointStep     int       `json:"checkpoint_step,omitempty"`
+	ResumeFrom         string    `json:"resume_from,omitempty"`
+	CheckpointPath     string    `json:"checkpoint_path,omitempty"`
 }
 
 const trainingColumns = "id,project_id,name,workload_id,dataset_artifact,model_artifact,state,reason,created_by,created_at,updated_at,checkpoint_artifact,checkpoint_step,resume_from,checkpoint_path"
@@ -78,7 +78,7 @@ func scanTraining(row interface{ Scan(...any) error }) (TrainingJob, error) {
 // SubmitTraining creates the training job and schedules its workload through
 // the shared engine. GPU requests flow through the normal eligibility filter,
 // so hosts without compatible GPUs queue the workload with an explanation.
-func (s *TrainStore) SubmitTraining(ctx context.Context, projectID, name, image string, args []string, imageDigest string, resources core.Resources, datasetArtifact string, placement, workerID string, env map[string]string, timeoutSeconds, maxRetries int, actor string) (TrainingJob, error) {
+func (s *TrainStore) SubmitTraining(ctx context.Context, projectID, name, image string, args []string, imageDigest string, resources core.Resources, datasetArtifact string, modelArtifact string, resumeFrom string, placement, workerID string, env map[string]string, timeoutSeconds, maxRetries int, actor string) (TrainingJob, error) {
 	if !nameRe.MatchString(name) {
 		return TrainingJob{}, fmt.Errorf("%w: training names must be lowercase letters, digits and dashes", ErrBadInput)
 	}
@@ -122,8 +122,8 @@ func (s *TrainStore) SubmitTraining(ctx context.Context, projectID, name, image 
 	now := time.Now().UTC().UnixNano()
 	id := "trn-" + strings.TrimPrefix(workload.ID, "wl-")
 	if _, err := s.db.ExecContext(ctx,
-		"INSERT INTO training_jobs(id,project_id,name,workload_id,dataset_artifact,state,created_by,created_at,updated_at) VALUES(?,?,?,?,?, 'running',?,?,?)",
-		id, projectID, name, workload.ID, datasetArtifact, actor, now, now); err != nil {
+		"INSERT INTO training_jobs(id,project_id,name,workload_id,dataset_artifact,model_artifact,resume_from,state,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?, 'running',?,?,?)",
+		id, projectID, name, workload.ID, datasetArtifact, modelArtifact, resumeFrom, actor, now, now); err != nil {
 		return TrainingJob{}, err
 	}
 	return s.GetTraining(ctx, projectID, id)
@@ -335,13 +335,13 @@ func (s *TrainStore) ListModels(ctx context.Context, projectID string) ([]Model,
 // --- Training Checkpoints -----------------------------------------------------
 
 type TrainingCheckpoint struct {
-	ID           string    `json:"id"`
-	TrainingID   string    `json:"training_id"`
-	ArtifactID   string    `json:"artifact_id"`
-	Step         int       `json:"step"`
-	Metrics      string    `json:"metrics"`
-	CreatedBy    string    `json:"created_by"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID         string    `json:"id"`
+	TrainingID string    `json:"training_id"`
+	ArtifactID string    `json:"artifact_id"`
+	Step       int       `json:"step"`
+	Metrics    string    `json:"metrics"`
+	CreatedBy  string    `json:"created_by"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 const checkpointColumns = "id,training_id,artifact_id,step,metrics,created_by,created_at"
@@ -422,10 +422,9 @@ func (s *TrainStore) ResumeFromCheckpoint(ctx context.Context, projectID, name, 
 	}
 	// Submit a new training job that resumes from the checkpoint
 	// The checkpoint artifact becomes the model_artifact for the new job
-	// We pass the checkpoint artifact as model_artifact via the model_artifact field
 	// The resume_from field tracks which checkpoint we're resuming from
 	return s.SubmitTraining(ctx, projectID, name, origWorkload.Submission.Image, nil, origWorkload.Submission.ImageDigest,
-		origWorkload.Submission.Resources, origJob.DatasetArtifact, "", "", nil, 0, 0, actor)
+		origWorkload.Submission.Resources, origJob.DatasetArtifact, chk.ArtifactID, chk.ID, "", "", nil, 0, 0, actor)
 }
 
 // UpdateCheckpointInfo updates the training job's checkpoint reference.
