@@ -33,3 +33,15 @@ The backup and ML tests use temporary local SQLite and filesystem fixtures. The 
 - S3 uses a pipe into `PutObject` in `api/internal/objectstore/s3.go`. Multipart support and cancellation-safe producer shutdown remain open.
 - Workspace idle checks skip absent activity timestamps in `api/internal/http/workspaces.go`. Active-editor tracking, shutdown reconciliation and tunnel resource behavior require review.
 - Training and inference submit workloads before writing service metadata. An atomic create path and reservation/restart reconciliation remain open.
+
+## Local binaries
+
+The tracked `api/workspace-manager` and `cli/kamui-cloud` files were compiled Mach-O executables. Build replacements from their respective module directories with the repository Go toolchain:
+
+```sh
+# From api/
+go build -mod=readonly -trimpath -o workspace-manager ./cmd/workspace-manager
+
+# From cli/
+go build -mod=readonly -trimpath -o kamui-cloud ./cmd/kamui-cloud
+```
