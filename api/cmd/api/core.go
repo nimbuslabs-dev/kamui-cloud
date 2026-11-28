@@ -116,7 +116,27 @@ func openCore(ctx context.Context, cfg *config.Config) (*core.Engine, *identity.
 	})
 
 	opsStore := ops.NewStore(store.DB(), store)
-	objects := objectstore.NewStore(store.DB(), &objectstore.LocalBackend{Root: storageRoot},
+
+	// Create object storage backend - use S3 if configured, otherwise local
+	var objBackend objectstore.Backend = &objectstore.LocalBackend{Root: storageRoot}
+	if cfg.S3Bucket != "" && cfg.S3AccessKeyID != "" && cfg.S3SecretAccessKey != "" {
+		s3Backend, err := objectstore.NewS3BackendFromConfig(ctx, objectstore.S3Config{
+			Region:          cfg.S3Region,
+			Endpoint:        cfg.S3Endpoint,
+			Bucket:          cfg.S3Bucket,
+			AccessKeyID:     cfg.S3AccessKeyID,
+			SecretAccessKey: cfg.S3SecretAccessKey,
+			UsePathStyle:    cfg.S3UsePathStyle,
+			RootPrefix:      cfg.S3RootPrefix,
+		})
+		if err != nil {
+			cleanup()
+			return nil, nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("failed to initialize S3 backend: %w", err)
+		}
+		objBackend = s3Backend
+	}
+
+	objects := objectstore.NewStore(store.DB(), objBackend,
 		func(ctx context.Context, projectID string) (int64, error) {
 			return objectstore.ProjectStorageBytes(store.DB(), projectID)
 		},

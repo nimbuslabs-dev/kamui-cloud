@@ -1,8 +1,10 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -66,7 +68,6 @@ func (h *servicesHandler) register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/backups", h.ListBackups)
 	mux.HandleFunc("GET /v1/backups/{bck}", h.GetBackup)
 	mux.HandleFunc("GET /v1/backups/{bck}/content", h.DownloadBackup)
-	mux.HandleFunc("POST /v1/backups/{bck}/restore", h.RestoreBackup)
 	// Train
 	mux.HandleFunc("POST /v1/projects/{id}/training", h.SubmitTraining)
 	mux.HandleFunc("GET /v1/projects/{id}/training", h.ListTrainings)
@@ -98,7 +99,11 @@ func (h *servicesHandler) register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/projects/{id}/databases", h.CreateDatabase)
 	mux.HandleFunc("GET /v1/projects/{id}/databases/{db}", h.GetDatabase)
 	mux.HandleFunc("POST /v1/projects/{id}/databases/{db}/stop", h.StopDatabase)
+	mux.HandleFunc("POST /v1/projects/{id}/databases/{db}/backup", h.BackupDatabase)
+	mux.HandleFunc("POST /v1/projects/{id}/databases/{db}/restore", h.RestoreDatabase)
 	mux.HandleFunc("DELETE /v1/projects/{id}/databases/{db}", h.DeleteDatabase)
+	// Backup restore
+	mux.HandleFunc("POST /v1/backups/{bck}/restore", h.RestoreBackup)
 	// Drop
 	mux.HandleFunc("POST /v1/drop/transfers", h.CreateTransfer)
 	mux.HandleFunc("GET /v1/drop/transfers", h.ListTransfers)
@@ -453,43 +458,6 @@ func (h *servicesHandler) DownloadBackup(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("X-Checksum-Sha256", backup.Checksum)
 	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 	_, _ = io.Copy(w, reader)
-}
-
-func (h *servicesHandler) RestoreBackup(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("bck")
-	backup, err := h.backups.GetBackup(r.Context(), id)
-	if err != nil {
-		servicesError(w, err)
-		return
-	}
-	p, ok := h.authorize(w, r, backup.ProjectID, identity.PermWorkloadWrite)
-	if !ok {
-		return
-	}
-	var input struct {
-		Destination string `json:"destination"`
-	}
-	if err := readJSON(w, r, 8<<10, &input); err != nil || input.Destination == "" {
-		apierr.WriteError(w, http.StatusBadRequest, "invalid_request", "an isolated destination directory is required")
-		return
-	}
-	// Restore targets live under the operator-provided directory and never
-	// overwrite an existing file without an explicit empty-target conflict.
-	switch backup.Kind {
-	case "metadata":
-		if h.ids != nil && !p.User.IsSystemAdmin {
-			apierr.WriteError(w, http.StatusForbidden, "forbidden", "administrator permission is required for metadata restore")
-			return
-		}
-		path, err := h.backups.RestoreMetadata(r.Context(), id, input.Destination)
-		if err != nil {
-			servicesError(w, err)
-			return
-		}
-		apierr.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "restored_to": path})
-	default:
-		apierr.WriteError(w, http.StatusUnprocessableEntity, "unsupported", "restore for this backup kind requires a documented manual procedure")
-	}
 }
 
 // --- Train -------------------------------------------------------------------------
@@ -1089,6 +1057,107 @@ func (h *servicesHandler) DeleteDatabase(w http.ResponseWriter, r *http.Request)
 		_ = h.ids.RecordAudit(r.Context(), p.User.ID, projectID, "database.delete", "database", r.PathValue("db"), "success", "")
 	}
 	apierr.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// BackupDatabase creates a PostgreSQL dump and returns it as binary data.
+func (h *servicesHandler) BackupDatabase(w http.ResponseWriter, r *http.Request) {
+	projectID := r.PathValue("id")
+	p, ok := h.authorize(w, r, projectID, identity.PermWorkloadRead)
+	if !ok {
+		return
+	}
+	dbID := r.PathValue("db")
+	var buf bytes.Buffer
+	if err := h.ops.DatabaseBackup(r.Context(), projectID, dbID, &buf); err != nil {
+		servicesError(w, err)
+		return
+	}
+	if h.ids != nil {
+		_ = h.ids.RecordAudit(r.Context(), p.User.ID, projectID, "database.backup", "database", dbID, "success", "")
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.dump\"", dbID))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(buf.Bytes())
+}
+
+// RestoreDatabase restores a PostgreSQL dump from the request body.
+func (h *servicesHandler) RestoreDatabase(w http.ResponseWriter, r *http.Request) {
+	projectID := r.PathValue("id")
+	p, ok := h.authorize(w, r, projectID, identity.PermWorkloadWrite)
+	if !ok {
+		return
+	}
+	dbID := r.PathValue("db")
+	if err := h.ops.DatabaseRestore(r.Context(), projectID, dbID, r.Body); err != nil {
+		servicesError(w, err)
+		return
+	}
+	if h.ids != nil {
+		_ = h.ids.RecordAudit(r.Context(), p.User.ID, projectID, "database.restore", "database", dbID, "success", "")
+	}
+	apierr.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// --- Backup restore handlers ----------------------------------------------------
+
+// RestoreBackup handles restore for all backup types based on the backup kind.
+func (h *servicesHandler) RestoreBackup(w http.ResponseWriter, r *http.Request) {
+	projectID := r.PathValue("id")
+	if _, ok := h.authorize(w, r, projectID, identity.PermWorkloadWrite); !ok {
+		return
+	}
+	backupID := r.PathValue("bck")
+	var input struct {
+		Destination string `json:"destination"`
+		Volume      string `json:"volume,omitempty"`
+	}
+	if err := readJSON(w, r, 4<<10, &input); err != nil {
+		apierr.WriteError(w, http.StatusBadRequest, "invalid_request", "invalid restore request")
+		return
+	}
+	// Get backup to determine kind
+	backup, err := h.backups.GetBackup(r.Context(), backupID)
+	if err != nil {
+		servicesError(w, err)
+		return
+	}
+	switch backup.Kind {
+	case "metadata":
+		if input.Destination == "" {
+			apierr.WriteError(w, http.StatusBadRequest, "invalid_request", "destination directory required for metadata restore")
+			return
+		}
+		path, err := h.backups.RestoreMetadata(r.Context(), backupID, input.Destination)
+		if err != nil {
+			servicesError(w, err)
+			return
+		}
+		apierr.WriteJSON(w, http.StatusOK, map[string]any{"restored_to": path})
+	case "objects":
+		if input.Destination == "" {
+			apierr.WriteError(w, http.StatusBadRequest, "invalid_request", "destination directory required for object restore")
+			return
+		}
+		path, err := h.backups.RestoreObjectBackup(r.Context(), backupID, input.Destination)
+		if err != nil {
+			servicesError(w, err)
+			return
+		}
+		apierr.WriteJSON(w, http.StatusOK, map[string]any{"restored_to": path})
+	case "volume":
+		if input.Volume == "" {
+			apierr.WriteError(w, http.StatusBadRequest, "invalid_request", "destination volume name required for volume restore")
+			return
+		}
+		if err := h.backups.RestoreVolumeBackup(r.Context(), backupID, input.Volume); err != nil {
+			servicesError(w, err)
+			return
+		}
+		apierr.WriteJSON(w, http.StatusOK, map[string]any{"volume": input.Volume})
+	default:
+		apierr.WriteError(w, http.StatusBadRequest, "invalid_request", "unknown backup kind")
+	}
 }
 
 // --- Drop -----------------------------------------------------------------------

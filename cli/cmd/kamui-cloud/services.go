@@ -306,6 +306,26 @@ func (a *app) backupCommand() *cobra.Command {
 			return a.serviceSend(cmd, "POST", "/v1/backups/"+args[0]+"/restore", map[string]any{"destination": destination})
 		},
 	})
+	group.AddCommand(&cobra.Command{
+		Use: "restore-objects BACKUP --destination DIR", Short: "Restore object backup into an isolated directory",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			destination, _ := cmd.Flags().GetString("destination")
+			if destination == "" {
+				return failure(2, "usage", "--destination is required and must be an isolated directory")
+			}
+			return a.serviceSend(cmd, "POST", "/v1/backups/"+args[0]+"/restore-objects", map[string]any{"destination": destination})
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "restore-volume BACKUP --volume NAME", Short: "Restore volume backup into a new Docker volume",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			volume, _ := cmd.Flags().GetString("volume")
+			if volume == "" {
+				return failure(2, "usage", "--volume is required")
+			}
+			return a.serviceSend(cmd, "POST", "/v1/backups/"+args[0]+"/restore-volume", map[string]any{"volume": volume})
+		},
+	})
 	return group
 }
 
@@ -543,16 +563,52 @@ func (a *app) databaseCommand() *cobra.Command {
 		},
 	})
 	group.AddCommand(&cobra.Command{
-		Use: "backup DB", Short: "Database backups run through the documented engine dump path",
-		Args: usageArgs(cobra.NoArgs),
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			return failure(4, "not_implemented", "engine-level database backup is not implemented yet; use volume backups")
+		Use: "backup DB [--output FILE]", Short: "Create a PostgreSQL dump of the database",
+		Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			output, _ := cmd.Flags().GetString("output")
+			client, err := a.client()
+			if err != nil {
+				return err
+			}
+			// Use raw request to get binary dump
+			data, err := client.rawRequest(cmd.Context(), "POST",
+				svcProjectPath("/databases/"+args[0]+"/backup"), nil)
+			if err != nil {
+				return err
+			}
+			if output != "" {
+				return os.WriteFile(output, data, 0600)
+			}
+			_, err = cmd.OutOrStdout().Write(data)
+			return err
 		},
 	})
 	group.AddCommand(&cobra.Command{
-		Use: "restore DB", Short: "Database restore is not implemented yet", Args: usageArgs(cobra.NoArgs),
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			return failure(4, "not_implemented", "engine-level database restore is not implemented yet")
+		Use: "restore DB [--input FILE]", Short: "Restore a PostgreSQL dump into the database",
+		Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			input, _ := cmd.Flags().GetString("input")
+			var data []byte
+			var err error
+			if input != "" {
+				data, err = os.ReadFile(input)
+			} else {
+				data, err = io.ReadAll(cmd.InOrStdin())
+			}
+			if err != nil {
+				return failure(1, "restore_failed", "cannot read the dump file")
+			}
+			client, err := a.client()
+			if err != nil {
+				return err
+			}
+			result, err := client.rawRequest(cmd.Context(), "POST",
+				svcProjectPath("/databases/"+args[0]+"/restore"), data)
+			if err != nil {
+				return err
+			}
+			return printJSON(cmd.OutOrStdout(), result, a.cloud.JSON)
 		},
 	})
 	group.AddCommand(&cobra.Command{

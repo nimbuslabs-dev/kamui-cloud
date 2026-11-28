@@ -397,3 +397,30 @@ func VerifyChecksum(reader io.ReadSeekCloser, object Object) error {
 	}
 	return nil
 }
+
+// S3Config holds the configuration needed to create an S3-compatible backend.
+type S3Config struct {
+	Region          string
+	Endpoint        string
+	Bucket          string
+	AccessKeyID     string
+	SecretAccessKey string
+	UsePathStyle    bool
+	RootPrefix      string // Optional prefix for all keys
+}
+
+// NewS3BackendFromConfig creates an S3-compatible backend from configuration.
+func NewS3BackendFromConfig(ctx context.Context, cfg S3Config) (Backend, error) {
+	if cfg.RootPrefix == "" {
+		cfg.RootPrefix = "kamui/objects/"
+	}
+	s3cfg := S3BackendConfig{
+		Region:          cfg.Region,
+		Endpoint:        cfg.Endpoint,
+		Bucket:          cfg.Bucket,
+		AccessKeyID:     cfg.AccessKeyID,
+		SecretAccessKey: cfg.SecretAccessKey,
+		UsePathStyle:    cfg.UsePathStyle,
+	}
+	return NewS3Backend(ctx, s3cfg)
+}

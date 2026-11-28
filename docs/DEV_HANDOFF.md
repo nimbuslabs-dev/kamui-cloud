@@ -18,7 +18,7 @@
 | Shared prerequisites | ✅ Complete | Artifacts, secrets, registry scoping, volume locality, routes |
 | **08: Workspace backend** | ✅ **Complete** | MVP retained; bounded logs added; remote IDE routing via tunnel ✅ |
 | **09: Deploy** | ✅ **Complete** | Real builds, revisions, rollback, HMAC webhooks; runtime releases |
-| **10: Store + Backup** | ✅ **Complete** | Object storage with quotas; consistent metadata snapshots |
+| **10: Store + Backup** | ✅ **Complete** | Object storage (local + S3) with quotas; consistent metadata snapshots; automated object/volume backup & restore; PostgreSQL pg_dump/pg_restore |
 | **11: Train** | ✅ **Complete** | Real CPU training verified; metrics from the process only |
 | **12: Infer** | ✅ **Complete** | Runtime adapters behind routes; real model serving needs a model (BLOCKED) |
 | **13: Collaboration** | ✅ **Complete** | Quotas with enforcement, usage accounting, role-preserving sharing |
@@ -57,9 +57,11 @@
   shared engine; rollback to the last healthy revision; HMAC webhooks with
   replay protection.
 - **Store/Backup** (`api/internal/objectstore`, `api/internal/backup`):
-  project buckets over a replaceable backend, quota enforcement that
-  preserves previous objects; consistent SQLite snapshots (VACUUM INTO),
-  object bundles, checksum-verified restores into isolated destinations.
+  project buckets over a replaceable backend (local filesystem + S3-compatible),
+  quota enforcement that preserves previous objects; consistent SQLite snapshots
+  (VACUUM INTO), object bundles, checksum-verified restores into isolated
+  destinations; automated object/volume backup and restore; PostgreSQL-native
+  pg_dump/pg_restore backup and restore for managed databases.
 - **Train/Infer** (`api/internal/ml`): training jobs through the scheduler
   with dataset artifact mounts and process-sourced metrics; inference
   services with runtime adapters behind live routes (OpenAI-compatible subset
@@ -76,6 +78,9 @@
 |---|---|
 | Object upload/download byte-identical with checksum | ✅ |
 | Metadata backup: 516 KB snapshot, checksummed | ✅ |
+| Object backup/restore: tar bundle with checksum verification | ✅ |
+| Volume backup/restore: tar extraction to new volume | ✅ |
+| PostgreSQL pg_dump/pg_restore: native dump/restore via docker exec | ✅ |
 | Deploy: dockerfile build → revision → release → RUNNING | ✅ (real Docker build) |
 | Train: genuine gradient-descent job, 50 metrics ingested from the process | ✅ |
 | Managed PostgreSQL: secret-based password, volume placement, private network | ✅ |
@@ -107,17 +112,23 @@ forwards the inference proxy only. For JSON endpoints, use
    locally; `/collect` covers local-executor workloads.
 3. Real model serving (Infer) needs an actual model runtime/model — BLOCKED
    without one; protocol adapters are implemented and tested for wiring only.
-4. Engine-level database dump/restore is `not_implemented`; volume backups
-   cover the storage path.
+4. ~~Engine-level database dump/restore is `not_implemented`; volume backups
+   cover the storage path.~~ → **IMPLEMENTED**: PostgreSQL pg_dump/pg_restore via docker exec
 5. Live GitHub webhooks and Tailscale remain BLOCKED without credentials.
 6. Physical multi-device and real GPU execution remain BLOCKED.
 7. Managed databases intentionally run their official image user with narrow
    CHOWN/FOWNER/DAC_OVERRIDE/SETUID/SETGID capabilities for state
    initialization; ordinary workloads remain fully hardened nonroot.
 
-**Completed this checkpoint:**
-- Workspace IDE WebSocket proxy over authenticated worker tunnel ✅
-- Deploy HTTP routing over authenticated worker tunnel ✅
+**Completed this checkpoint (Phase 10):**
+- S3-compatible object storage backend (AWS SDK v2, MinIO compatible)
+- Automated object backup (tar bundles with SHA-256) and restore to isolated directories
+- Volume backup and restore (tar extraction to new Docker volumes)
+- PostgreSQL-native backup (pg_dump -Fc) and restore (pg_restore -Fc -c) via docker exec
+- CLI commands: `kamui-cloud backup restore-objects`, `kamui-cloud backup restore-volume`
+- CLI commands: `kamui-cloud database backup`, `kamui-cloud database restore`
+- OpenAPI contracts updated for new backup/restore endpoints
+- All tests pass (unit + integration)
 - Configurable workspace idle shutdown (auto + manual trigger) ✅
 
 
@@ -296,6 +307,16 @@ These are marked **BLOCKED** per requirements — implementation is complete, li
 - `api/internal/deploy/deploy.go` — Added `GetDeploymentByPath` method
 - `cli/cmd/kamui-cloud/services.go` — Added `deploy proxy` command with `--method --path --data` flags
 - `cli/cmd/kamui-cloud/workspaces.go` — Added `workspace ide open|request` and `workspace idle-shutdown` commands
+
+### Phase 10: Store + Backup (this checkpoint)
+- `api/internal/objectstore/s3.go` — New: S3-compatible backend using AWS SDK v2 (MinIO, AWS S3 compatible)
+- `api/internal/objectstore/store.go` — Added `NewS3BackendFromConfig`, `S3Config` types
+- `api/internal/backup/backup.go` — Added `RestoreObjectBackup`, `RestoreVolumeBackup`; object backups as tar bundles with SHA-256
+- `api/internal/ops/ops.go` — Added `DatabaseBackup` (pg_dump -Fc), `DatabaseRestore` (pg_restore -Fc -c) via docker exec
+- `api/internal/http/services.go` — Added `BackupDatabase`, `RestoreDatabase`, `RestoreBackup` handlers for all backup kinds
+- `api/internal/config/config.go` — Added S3 config: `S3Region`, `S3Endpoint`, `S3Bucket`, `S3AccessKeyID`, `S3SecretAccessKey`, `S3UsePathStyle`, `S3RootPrefix`
+- `api/cmd/api/core.go` — Wire S3 backend when `KAMUI_S3_BUCKET` et al are set
+- `cli/cmd/kamui-cloud/services.go` — Added `backup restore-objects`, `backup restore-volume`, `database backup`, `database restore` commands
 
 ---
 

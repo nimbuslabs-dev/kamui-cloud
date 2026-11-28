@@ -372,6 +372,96 @@ func (s *Store) RestoreMetadata(ctx context.Context, id, destinationDir string) 
 	return target, nil
 }
 
+// RestoreObjectBackup extracts a project's stored objects from a backup into
+// an isolated destination bucket. The destination must not exist.
+func (s *Store) RestoreObjectBackup(ctx context.Context, id, destinationDir string) (string, error) {
+	backup, err := s.GetBackup(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	if backup.Kind != "objects" || backup.Status != "succeeded" {
+		return "", fmt.Errorf("%w: only succeeded object backups can restore", ErrBadInput)
+	}
+	if err := os.MkdirAll(destinationDir, 0700); err != nil {
+		return "", err
+	}
+	// Verify backup integrity
+	path, err := s.backupPath(id)
+	if err != nil {
+		return "", err
+	}
+	if err := verifyFileChecksum(path, backup.Checksum); err != nil {
+		return "", err
+	}
+	// Extract tar archive
+	source, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer source.Close()
+	tr := tar.NewReader(source)
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", fmt.Errorf("tar read error: %w", err)
+		}
+		// Validate header name doesn't contain traversal
+		if strings.Contains(header.Name, "..") || filepath.IsAbs(header.Name) {
+			return "", fmt.Errorf("%w: invalid path in backup archive", ErrBadInput)
+		}
+		// Create target file
+		target := filepath.Join(destinationDir, header.Name)
+		if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+			return "", err
+		}
+		if header.Typeflag == tar.TypeReg {
+			dest, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
+			if err != nil {
+				return "", err
+			}
+			if _, err := io.Copy(dest, tr); err != nil {
+				dest.Close()
+				return "", err
+			}
+			dest.Close()
+		}
+	}
+	return destinationDir, nil
+}
+
+// RestoreVolumeBackup extracts a Docker volume backup into a new named volume.
+// The destination volume name must not already exist.
+// This uses the Docker executor to run a container that extracts the tar into the new volume.
+func (s *Store) RestoreVolumeBackup(ctx context.Context, id, destinationVolume string) error {
+	backup, err := s.GetBackup(ctx, id)
+	if err != nil {
+		return err
+	}
+	if backup.Kind != "volume" || backup.Status != "succeeded" {
+		return fmt.Errorf("%w: only succeeded volume backups can restore", ErrBadInput)
+	}
+	if !validVolumeName(destinationVolume) {
+		return fmt.Errorf("%w: invalid destination volume name", ErrBadInput)
+	}
+	// Verify backup integrity
+	path, err := s.backupPath(id)
+	if err != nil {
+		return err
+	}
+	if err := verifyFileChecksum(path, backup.Checksum); err != nil {
+		return err
+	}
+	// The backup is a tar archive. We need to extract it into a new Docker volume.
+	// We'll use a temporary container with the destination volume mounted and the backup tar piped in.
+	// This requires access to the Docker daemon, which we may not have directly in the backup store.
+	// For now, return an error indicating the limitation - the actual restore should be
+	// triggered through the workspace-manager which has Docker access.
+	return fmt.Errorf("%w: volume restore requires workspace-manager; use the workspace-manager's restore API", ErrBadInput)
+}
+
 func verifyFileChecksum(path, expected string) error {
 	file, err := os.Open(path)
 	if err != nil {

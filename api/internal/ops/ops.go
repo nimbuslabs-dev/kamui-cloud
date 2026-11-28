@@ -9,6 +9,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -539,6 +541,98 @@ func (s *Store) DeleteDatabase(ctx context.Context, projectID, id string) error 
 	}
 	if count, _ := result.RowsAffected(); count == 0 {
 		return ErrNotFound
+	}
+	return nil
+}
+
+// DatabaseBackup creates a PostgreSQL dump using pg_dump.
+// The dump is written to the provided writer.
+func (s *Store) DatabaseBackup(ctx context.Context, projectID, databaseID string, w io.Writer) error {
+	database, err := s.GetDatabase(ctx, projectID, databaseID)
+	if err != nil {
+		return err
+	}
+	if database.Engine != "postgres" {
+		return fmt.Errorf("%w: only PostgreSQL databases support native backup", ErrBadInput)
+	}
+	if database.WorkloadID == "" {
+		return fmt.Errorf("%w: database workload not found", ErrNotFound)
+	}
+	// Get the workload to find the container
+	workload, err := s.core.Get(ctx, database.WorkloadID)
+	if err != nil {
+		return err
+	}
+	if workload.Assignment == nil || workload.Assignment.RuntimeID == "" {
+		return fmt.Errorf("%w: database container not running", ErrBadInput)
+	}
+	// Get the password from the workload's environment
+	var password string
+	for k, v := range workload.Submission.Env {
+		if k == "POSTGRES_PASSWORD" {
+			password = v
+			break
+		}
+	}
+	if password == "" {
+		return fmt.Errorf("%w: database password not found in workload environment", ErrNotFound)
+	}
+	// Use docker exec to run pg_dump
+	cmd := exec.CommandContext(ctx, "docker", "exec",
+		"-e", "PGPASSWORD="+password,
+		workload.Assignment.RuntimeID,
+		"pg_dump", "-Fc", "-d", database.Name, "-U", "postgres",
+	)
+	cmd.Stdout = w
+	cmd.Stderr = io.Discard
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("pg_dump failed: %w", err)
+	}
+	return nil
+}
+
+// DatabaseRestore restores a PostgreSQL dump using pg_restore.
+// The dump is read from the provided reader.
+func (s *Store) DatabaseRestore(ctx context.Context, projectID, databaseID string, r io.Reader) error {
+	database, err := s.GetDatabase(ctx, projectID, databaseID)
+	if err != nil {
+		return err
+	}
+	if database.Engine != "postgres" {
+		return fmt.Errorf("%w: only PostgreSQL databases support native restore", ErrBadInput)
+	}
+	if database.WorkloadID == "" {
+		return fmt.Errorf("%w: database workload not found", ErrNotFound)
+	}
+	workload, err := s.core.Get(ctx, database.WorkloadID)
+	if err != nil {
+		return err
+	}
+	if workload.Assignment == nil || workload.Assignment.RuntimeID == "" {
+		return fmt.Errorf("%w: database container not running", ErrBadInput)
+	}
+	// Get the password
+	var password string
+	for k, v := range workload.Submission.Env {
+		if k == "POSTGRES_PASSWORD" {
+			password = v
+			break
+		}
+	}
+	if password == "" {
+		return fmt.Errorf("%w: database password not found in workload environment", ErrNotFound)
+	}
+	// Use docker exec to run pg_restore
+	cmd := exec.CommandContext(ctx, "docker", "exec",
+		"-i", // stdin
+		"-e", "PGPASSWORD="+password,
+		workload.Assignment.RuntimeID,
+		"pg_restore", "-Fc", "-c", "-d", database.Name, "-U", "postgres",
+	)
+	cmd.Stdin = r
+	cmd.Stderr = io.Discard
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("pg_restore failed: %w", err)
 	}
 	return nil
 }

@@ -20,6 +20,14 @@ type Config struct {
 	WorkspaceManagerURL  string
 	WorkspaceDataFile    string
 	WorkspaceIdleTimeout time.Duration
+	// S3 Storage Configuration
+	S3Region          string
+	S3Endpoint        string
+	S3Bucket          string
+	S3AccessKeyID     string
+	S3SecretAccessKey string
+	S3UsePathStyle    bool
+	S3RootPrefix      string
 }
 
 func Load() (*Config, error) {
@@ -56,6 +64,13 @@ func Load() (*Config, error) {
 		WorkspaceDataFile:    getEnvOrDefault("KAMUI_WORKSPACE_DATA_FILE", "workspaces.json"),
 		WorkspaceManagerURL:  getEnvOrDefault("WORKSPACE_MANAGER_URL", "http://workspace-manager:8082"),
 		WorkspaceIdleTimeout: idleTimeout,
+		S3Region:             os.Getenv("KAMUI_S3_REGION"),
+		S3Endpoint:           os.Getenv("KAMUI_S3_ENDPOINT"),
+		S3Bucket:             os.Getenv("KAMUI_S3_BUCKET"),
+		S3AccessKeyID:        os.Getenv("KAMUI_S3_ACCESS_KEY_ID"),
+		S3SecretAccessKey:    os.Getenv("KAMUI_S3_SECRET_ACCESS_KEY"),
+		S3UsePathStyle:       os.Getenv("KAMUI_S3_USE_PATH_STYLE") == "true",
+		S3RootPrefix:         os.Getenv("KAMUI_S3_ROOT_PREFIX"),
 	}, nil
 }
 
