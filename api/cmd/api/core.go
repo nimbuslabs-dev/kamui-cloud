@@ -147,7 +147,7 @@ func openCore(ctx context.Context, cfg *config.Config) (*core.Engine, *identity.
 			}
 			return quota.MaxStorageBytes, quota.MaxStorageBytes > 0
 		})
-	trainStore := ml.NewTrainStore(store.DB(), store)
+	trainStore := ml.NewTrainStore(store.DB(), store, runtimeStore)
 	inferStore := ml.NewInferStore(store.DB(), store)
 	backupStore := backup.NewStore(store.DB(), idStore, storageRoot, nil)
 	dropStore := drop.NewStore(store.DB(), storageRoot)

@@ -63,7 +63,7 @@ the CLI).
    and metadata backups are available).
 4. Inference `restart` is stop + fresh deploy; no in-place restart.
 5. Live GitHub webhooks and Tailscale remain BLOCKED without credentials.
-6. Training checkpoint resume is CLI-advised as a resubmission, not automated.
+6. Checkpoint resume returns HTTP 501 after ownership and integrity validation. Runtime-specific model loading is unverified.
 
 ## Examples (illustrative values, not live data)
 

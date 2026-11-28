@@ -21,10 +21,10 @@ See [backend acceptance](BACKEND_ACCEPTANCE.md) for current results and the orde
 | 07: Intelligent Scheduler | ✅ Complete | Placement modes, explainable scoring, durable scheduling |
 | Shared prerequisites | ✅ Complete | Artifacts, secrets, registry scoping, volume locality, routes |
 | **08: Workspace backend** | ✅ **Complete** | MVP retained; bounded logs added; remote IDE routing via tunnel ✅ |
-| **09: Deploy** | ✅ **Complete** | Real builds, revisions, rollback, HMAC webhooks; runtime releases |
-| **10: Store + Backup** | ✅ **Complete** | Object storage (local + S3) with quotas; consistent metadata snapshots; automated object/volume backup & restore; PostgreSQL pg_dump/pg_restore |
-| **11: Train** | ✅ **Complete** | Real CPU training verified; metrics from the process only; **checkpoint/resume implemented** |
-| **12: Infer** | ✅ **Complete** | Runtime adapters behind routes; **genuine model serving verified** |
+| **09: Deploy** | PARTIAL | Build and release code exists. Candidate readiness, Git-source release and rollback remain under audit. |
+| **10: Store + Backup** | PARTIAL | Scoped, isolated backup exports. Managed volume restore, live object import and native database restore acceptance are pending. |
+| **11: Train** | PARTIAL | Artifact ownership and integrity verified. Checkpoint resume execution is unavailable. |
+| **12: Infer** | PARTIAL | Authenticated proxy transport exists. Runtime-specific model loading remains unverified. |
 | **13: Collaboration** | ✅ **Complete** | Quotas with enforcement, usage accounting, role-preserving sharing |
 | **14: SRE + Databases** | ✅ **Complete** | Alert rules with dedup; PostgreSQL lifecycle verified live |
 | **15: Drop** | ✅ **Complete** | Approval-gated transfers with checksums and expiry |
@@ -129,29 +129,17 @@ forwards the inference proxy only. For JSON endpoints, use
 **Completed this checkpoint (Phase 10):**
 - S3-compatible object storage backend (AWS SDK v2, MinIO compatible)
 - Automated object backup (tar bundles with SHA-256) and restore to isolated directories
-- Volume backup and restore (tar extraction to new Docker volumes)
+- Docker-volume backup has no coordinator adapter. Volume restore is unavailable.
 - PostgreSQL-native backup (pg_dump -Fc) and restore (pg_restore -Fc) via docker exec
 - **VERIFIED**: Database restore defaults to ISOLATED restore (creates restore_<name>_<timestamp>, runs pg_restore -Fc -d <isolated>, verifies table count)
 - **VERIFIED**: Force restore (?force=true) requires system admin authorization, runs pg_restore -Fc -c -d <existing>
-- CLI commands: `kamui-cloud backup restore-objects`, `kamui-cloud backup restore-volume`
+- CLI command: `kamui-cloud backup restore BACKUP --project PROJECT` exports a project archive.
 - CLI commands: `kamui-cloud database backup`, `kamui-cloud database restore [--force]`
 - OpenAPI contracts updated for new backup/restore endpoints with force parameter
 - All tests pass (unit + integration)
 - Configurable workspace idle shutdown (auto + manual trigger) ✅
 
-**Completed this checkpoint (Phase 11-12):**
-- Training checkpoint/resume: `CreateCheckpoint`, `ListCheckpoints`, `ResumeFromCheckpoint` with SHA-256 verified artifact uploads
-- Training checkpoint lifecycle: artifact upload → checkpoint creation (step, metrics JSON) → resume from checkpoint (new job with checkpoint as model_artifact)
-- Training checkpoint CLI: `kamui-cloud train checkpoint list|create`, `kamui-cloud train resume --checkpoint --name`
-- Model registry: `RegisterModel` from training artifacts with checksum verification
-- Inference runtime: `CreateInferService` with ollama/llamacpp/vllm/openai-compatible/proxy runtimes
-- Inference proxy: authenticated requests via worker tunnel, model-derived output verified
-- Model checkpoint tracking: `checkpoint_step`, `checkpoint_artifact`, `parent_model_id` on models table
-- Migration 005: training_checkpoints table, checkpoint columns on training_jobs, model checkpoint fields
-- OpenAPI contracts: checkpoint/resume endpoints, TrainingCheckpoint schema
-- All tests pass (unit + integration)
-
----
+**Current Train and Infer coverage.** Checkpoint list and registration, and model registration, use project-scoped, SHA-256-verified artifact records. Resume rejects unsupported execution with HTTP 501. Runtime names share generic configuration at the reviewed baseline. Actual model loading and model-derived output remain unverified.
 
 ## Phase 04: Identity — Completed
 
@@ -350,9 +338,9 @@ These are marked **BLOCKED** per requirements — implementation is complete, li
 - `cli/cmd/kamui-cloud/services.go` — Added `backup restore-objects`, `backup restore-volume`, `database backup`, `database restore [--force]` commands
 
 ### Phase 11-12: Train + Infer (this checkpoint)
-- `api/internal/ml/ml.go` — Added checkpoint support: `CreateCheckpoint`, `ListCheckpoints`, `ResumeFromCheckpoint`, `TrainingCheckpoint` type, `UpdateCheckpointInfo`
+- `api/internal/ml/ml.go` — Scoped checkpoint registration and lookup. Resume validates the requested relationship and returns HTTP 501.
 - `api/internal/ml/ml.go` — Added `RegisterModel` from training artifacts with checksum verification
-- `api/internal/ml/ml.go` — Added `InferStore` with runtime adapters (ollama, llamacpp, vllm, openai-compatible, proxy)
+- `api/internal/ml/ml.go` — Runtime names share a generic container configuration. Actual runtime support remains under audit.
 - `api/internal/core/migrations/005.sql` — Added training_checkpoints table, checkpoint columns on training_jobs, model checkpoint fields (checkpoint_step, checkpoint_artifact, parent_model_id)
 - `api/internal/http/services.go` — Added `ListCheckpoints`, `CreateCheckpoint`, `ResumeFromCheckpoint` handlers
 - `api/internal/http/router.go` — Registered checkpoint routes: GET/POST /training/{trn}/checkpoints, POST /training/{trn}/resume

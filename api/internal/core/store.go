@@ -33,7 +33,10 @@ var schema004 string
 //go:embed migrations/005.sql
 var schema005 string
 
-const LatestSchemaVersion = 5
+//go:embed migrations/006.sql
+var schema006 string
+
+const LatestSchemaVersion = 6
 
 type Repository interface {
 	EventReader
@@ -106,16 +109,39 @@ func (s *Store) DB() *sql.DB { return s.db }
 
 func (s *Store) Close() error { return errors.Join(s.db.Close(), s.lock.Close()) }
 
-func (s *Store) migrate(ctx context.Context) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+func (s *Store) migrate(ctx context.Context) (resultErr error) {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	var version int
+	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		return err
+	}
+	if version > LatestSchemaVersion {
+		return fmt.Errorf("database schema version %d is newer than this coordinator", version)
+	}
+	if version == LatestSchemaVersion {
+		return nil
+	}
+
+	// Migration 005 added a self-referencing column with a non-NULL default.
+	// Apply it and repair it in 006 within a single checked migration transaction.
+	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
+		return err
+	}
+	defer func() {
+		enforce, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := conn.ExecContext(enforce, "PRAGMA foreign_keys=ON")
+		resultErr = errors.Join(resultErr, err)
+	}()
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	var version int
-	if err := tx.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
-		return err
-	}
 	migrations := []struct {
 		version int
 		sql     string
@@ -125,6 +151,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		{3, schema003},
 		{4, schema004},
 		{5, schema005},
+		{6, schema006},
 	}
 	for _, migration := range migrations {
 		if version < migration.version {
@@ -136,8 +163,16 @@ func (s *Store) migrate(ctx context.Context) error {
 			}
 		}
 	}
-	if version > LatestSchemaVersion {
-		return fmt.Errorf("database schema version %d is newer than this coordinator", version)
+	rows, err := tx.QueryContext(ctx, "PRAGMA foreign_key_check")
+	if err != nil {
+		return err
+	}
+	broken := rows.Next()
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return err
+	}
+	if broken {
+		return errors.New("database migration failed foreign key validation")
 	}
 	return tx.Commit()
 }

@@ -417,7 +417,7 @@ func (a *app) trainCommand() *cobra.Command {
 	})
 	group.AddCommand(checkpoint)
 	group.AddCommand(&cobra.Command{
-		Use: "resume JOB --checkpoint CHECKPOINT_ID --name NAME", Short: "Resume training from a checkpoint", Args: usageArgs(cobra.ExactArgs(1)),
+		Use: "resume JOB --checkpoint CHECKPOINT_ID --name NAME", Short: "Validate checkpoint ownership (resume execution unavailable)", Args: usageArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			checkpointID, _ := cmd.Flags().GetString("checkpoint")
 			name, _ := cmd.Flags().GetString("name")

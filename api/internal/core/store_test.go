@@ -110,3 +110,59 @@ func TestMigrateV1ToLatestPreservesExistingData(t *testing.T) {
 		t.Fatalf("preserved workload = %+v (%v)", w, err)
 	}
 }
+
+func TestUpgradeModelsFromV4AndV5(t *testing.T) {
+	for _, version := range []string{"4", "5"} {
+		t.Run(version, func(t *testing.T) {
+			ctx := context.Background()
+			path := filepath.Join(t.TempDir(), "core.sqlite")
+			old, err := openDB(path, "_pragma=foreign_keys(1)")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, schema := range []string{schema001, schema002, schema003, schema004} {
+				if _, err := old.Exec(schema); err != nil {
+					old.Close()
+					t.Fatal(err)
+				}
+			}
+			if version == "5" {
+				if _, err := old.Exec(schema005); err != nil {
+					old.Close()
+					t.Fatal(err)
+				}
+				// Preserve a row written by an older installation without FK enforcement.
+				if _, err := old.Exec("PRAGMA foreign_keys=OFF"); err != nil {
+					old.Close()
+					t.Fatal(err)
+				}
+			}
+			if _, err := old.Exec("INSERT INTO models(id, project_id, name, artifact_id, created_by, created_at) VALUES('mdl-before','default','before','art-fixture','local-admin',0)"); err != nil {
+				old.Close()
+				t.Fatal(err)
+			}
+			if _, err := old.Exec("PRAGMA user_version=" + version); err != nil {
+				old.Close()
+				t.Fatal(err)
+			}
+			if err := old.Close(); err != nil {
+				t.Fatal(err)
+			}
+			current, err := Open(ctx, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer current.Close()
+			var parentIsNull, fk int
+			if err := current.db.QueryRow("SELECT parent_model_id IS NULL FROM models WHERE id='mdl-before'").Scan(&parentIsNull); err != nil || parentIsNull != 1 {
+				t.Fatalf("legacy row parent was not normalized: %d, %v", parentIsNull, err)
+			}
+			if err := current.db.QueryRow("PRAGMA foreign_keys").Scan(&fk); err != nil || fk != 1 {
+				t.Fatalf("foreign_keys = %d, %v", fk, err)
+			}
+			if _, err := current.db.Exec("UPDATE models SET parent_model_id='missing-parent' WHERE id='mdl-before'"); err == nil {
+				t.Fatal("foreign key enforcement was not restored")
+			}
+		})
+	}
+}

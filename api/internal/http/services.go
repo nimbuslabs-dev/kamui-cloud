@@ -143,7 +143,7 @@ func servicesError(w http.ResponseWriter, err error) {
 		apierr.WriteError(w, http.StatusConflict, "conflict", err.Error())
 	case errors.Is(err, objectstore.ErrTooLarge), errors.Is(err, drop.ErrTooLarge), errors.Is(err, backup.ErrTooBig):
 		apierr.WriteError(w, http.StatusRequestEntityTooLarge, "too_large", err.Error())
-	case errors.Is(err, backup.ErrNotImplemented):
+	case errors.Is(err, backup.ErrNotImplemented), errors.Is(err, ml.ErrResumeUnsupported):
 		apierr.WriteError(w, http.StatusNotImplemented, "not_implemented", err.Error())
 	case errors.Is(err, objectstore.ErrQuota):
 		apierr.WriteError(w, http.StatusInsufficientStorage, "quota_exceeded", err.Error())
@@ -673,7 +673,7 @@ func (h *servicesHandler) ListCheckpoints(w http.ResponseWriter, r *http.Request
 	if _, ok := h.authorize(w, r, projectID, identity.PermWorkloadRead); !ok {
 		return
 	}
-	items, err := h.train.ListCheckpoints(r.Context(), r.PathValue("trn"))
+	items, err := h.train.ListCheckpoints(r.Context(), projectID, r.PathValue("trn"))
 	if err != nil {
 		servicesError(w, err)
 		return
@@ -701,7 +701,7 @@ func (h *servicesHandler) CreateCheckpoint(w http.ResponseWriter, r *http.Reques
 		apierr.WriteError(w, http.StatusBadRequest, "invalid_request", "artifact_id and step are required")
 		return
 	}
-	chk, err := h.train.CreateCheckpoint(r.Context(), r.PathValue("trn"), input.ArtifactID, input.Step, input.Metrics, p.User.ID)
+	chk, err := h.train.CreateCheckpoint(r.Context(), projectID, r.PathValue("trn"), input.ArtifactID, input.Step, input.Metrics, p.User.ID)
 	if err != nil {
 		servicesError(w, err)
 		return
@@ -728,7 +728,7 @@ func (h *servicesHandler) ResumeFromCheckpoint(w http.ResponseWriter, r *http.Re
 		apierr.WriteError(w, http.StatusBadRequest, "invalid_request", "checkpoint_id and name are required")
 		return
 	}
-	job, err := h.train.ResumeFromCheckpoint(r.Context(), projectID, input.Name, input.CheckpointID, p.User.ID)
+	job, err := h.train.ResumeFromCheckpoint(r.Context(), projectID, r.PathValue("trn"), input.Name, input.CheckpointID, p.User.ID)
 	if err != nil {
 		servicesError(w, err)
 		return

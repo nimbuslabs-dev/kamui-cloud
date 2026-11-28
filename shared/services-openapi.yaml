@@ -313,6 +313,7 @@ paths:
         default: { $ref: '#/components/responses/Error' }
     post:
       operationId: createCheckpoint
+      description: Registers a nonempty checksum-verified checkpoint artifact from the project. The step must be positive.
       requestBody:
         required: true
         content:
@@ -333,6 +334,7 @@ paths:
       - { name: trn, in: path, required: true, schema: { type: string } }
     post:
       operationId: resumeFromCheckpoint
+      description: Validates the project, training job and checkpoint association. Execution remains unavailable.
       requestBody:
         required: true
         content:
@@ -344,7 +346,8 @@ paths:
                 checkpoint_id: { type: string }
                 name: { type: string }
       responses:
-        '202': { description: Training job resumed from checkpoint }
+        '404': { description: Checkpoint does not belong to the selected training job and project }
+        '501': { description: Checkpoint execution is unavailable }
         default: { $ref: '#/components/responses/Error' }
   /v1/projects/{id}/inference:
     parameters:

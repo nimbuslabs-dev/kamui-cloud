@@ -224,20 +224,43 @@ func (s *Store) ListArtifacts(ctx context.Context, projectID string, limit int) 
 	return items, rows.Err()
 }
 
-// OpenArtifact returns a checksum-verified reader for the stored blob.
+// OpenArtifact opens a regular blob whose size matches its stored metadata.
 func (s *Store) OpenArtifact(ctx context.Context, artifact Artifact) (io.ReadCloser, int64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
 	dir, err := s.blobPath(artifact.ProjectID, artifact.ID)
 	if err != nil {
 		return nil, 0, err
 	}
-	file, err := os.Open(filepath.Join(dir, "blob"))
+	root, err := os.OpenRoot(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, 0, ErrNotFound
 	}
 	if err != nil {
 		return nil, 0, err
 	}
-	return file, artifact.SizeBytes, nil
+	defer root.Close()
+	info, err := root.Lstat("blob")
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, 0, ErrNotFound
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	if !info.Mode().IsRegular() || info.Size() != artifact.SizeBytes || info.Size() > s.maxBlob {
+		return nil, 0, fmt.Errorf("%w: artifact blob has an invalid type or size", ErrBadInput)
+	}
+	file, err := root.Open("blob")
+	if err != nil {
+		return nil, 0, err
+	}
+	opened, err := file.Stat()
+	if err != nil || !os.SameFile(info, opened) || opened.Size() != info.Size() {
+		file.Close()
+		return nil, 0, fmt.Errorf("%w: artifact blob changed", ErrBadInput)
+	}
+	return file, info.Size(), nil
 }
 
 func (s *Store) MarkArtifactDownloaded(ctx context.Context, id string) {
@@ -260,21 +283,34 @@ func (s *Store) DeleteArtifact(ctx context.Context, projectID, id string) error 
 }
 
 // VerifyChecksum streams a blob and compares it to the recorded digest.
-func (s *Store) VerifyChecksum(artifact Artifact) error {
-	reader, _, err := s.OpenArtifact(context.Background(), artifact)
+func (s *Store) VerifyChecksum(ctx context.Context, artifact Artifact) error {
+	reader, size, err := s.OpenArtifact(ctx, artifact)
 	if err != nil {
 		return err
 	}
 	defer reader.Close()
-	hasher := sha256.New()
-	if _, err := io.Copy(hasher, reader); err != nil {
+	hash := sha256.New()
+	n, err := io.Copy(hash, io.LimitReader(artifactContextReader{ctx, reader}, size+1))
+	if err != nil {
 		return err
 	}
-	sum := "sha256:" + hex.EncodeToString(hasher.Sum(nil))
-	if !hmac.Equal([]byte(sum), []byte(artifact.Checksum)) {
-		return fmt.Errorf("checksum mismatch for artifact %s", artifact.ID)
+	sum := "sha256:" + hex.EncodeToString(hash.Sum(nil))
+	if n != size || !hmac.Equal([]byte(sum), []byte(artifact.Checksum)) {
+		return fmt.Errorf("%w: artifact integrity verification failed", ErrBadInput)
 	}
 	return nil
+}
+
+type artifactContextReader struct {
+	ctx context.Context
+	io.Reader
+}
+
+func (r artifactContextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.Reader.Read(p)
 }
 
 // --- Registry credentials ----------------------------------------------------
@@ -664,7 +700,7 @@ func (s *Store) BuildEnvelope(ctx context.Context, projectID string, submission 
 		if err != nil {
 			return envelope, problems, err
 		}
-		if err := s.VerifyChecksum(artifact); err != nil {
+		if err := s.VerifyChecksum(ctx, artifact); err != nil {
 			problems = append(problems, err.Error())
 			continue
 		}

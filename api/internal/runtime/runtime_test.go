@@ -75,7 +75,7 @@ func TestArtifactLifecycleAndChecksums(t *testing.T) {
 	if err != nil || size != int64(len(content)) || !bytes.Equal(data, content) {
 		t.Fatalf("round trip = %d bytes, %v", len(data), err)
 	}
-	if err := store.VerifyChecksum(artifact); err != nil {
+	if err := store.VerifyChecksum(ctx, artifact); err != nil {
 		t.Fatalf("verify: %v", err)
 	}
 
@@ -109,7 +109,7 @@ func TestArtifactUploadIsAtomicOnTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.VerifyChecksum(artifact); err != nil {
+	if err := store.VerifyChecksum(ctx, artifact); err != nil {
 		t.Fatalf("partial upload must still verify: %v", err)
 	}
 	dir, err := store.blobPath("default", artifact.ID)

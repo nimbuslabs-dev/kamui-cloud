@@ -18,23 +18,26 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/core"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/runtime"
 )
 
 var (
-	ErrNotFound = errors.New("not found")
-	ErrConflict = errors.New("conflict")
-	ErrBadInput = errors.New("invalid input")
+	ErrNotFound          = errors.New("not found")
+	ErrConflict          = errors.New("conflict")
+	ErrBadInput          = errors.New("invalid input")
+	ErrResumeUnsupported = errors.New("training resume requires a supported checkpoint execution contract")
 
 	nameRe = regexp.MustCompile(`^[a-z][a-z0-9-]{1,62}$`)
 )
 
 type TrainStore struct {
-	db   *sql.DB
-	core *core.Store
+	db        *sql.DB
+	core      *core.Store
+	artifacts *runtime.Store
 }
 
-func NewTrainStore(db *sql.DB, coreStore *core.Store) *TrainStore {
-	return &TrainStore{db: db, core: coreStore}
+func NewTrainStore(db *sql.DB, coreStore *core.Store, artifacts *runtime.Store) *TrainStore {
+	return &TrainStore{db: db, core: coreStore, artifacts: artifacts}
 }
 
 type TrainingJob struct {
@@ -275,22 +278,53 @@ type Model struct {
 	CreatedAt      time.Time `json:"created_at"`
 }
 
+func (s *TrainStore) verifiedArtifact(ctx context.Context, projectID, id, kind string) (runtime.Artifact, error) {
+	if projectID == "" || s.artifacts == nil {
+		return runtime.Artifact{}, ErrNotFound
+	}
+	item, err := s.artifacts.GetArtifact(ctx, projectID, id)
+	if errors.Is(err, runtime.ErrNotFound) {
+		return runtime.Artifact{}, ErrNotFound
+	}
+	if err != nil {
+		return runtime.Artifact{}, err
+	}
+	if item.Kind != kind || item.SizeBytes <= 0 {
+		return runtime.Artifact{}, fmt.Errorf("%w: a nonempty %s artifact is required", ErrBadInput, kind)
+	}
+	if err := s.artifacts.VerifyChecksum(ctx, item); err != nil {
+		if errors.Is(err, runtime.ErrNotFound) {
+			return runtime.Artifact{}, ErrNotFound
+		}
+		if errors.Is(err, runtime.ErrBadInput) {
+			return runtime.Artifact{}, fmt.Errorf("%w: artifact integrity verification failed", ErrBadInput)
+		}
+		return runtime.Artifact{}, err
+	}
+	return item, nil
+}
+
 func (s *TrainStore) RegisterModel(ctx context.Context, projectID, name, artifactID, format, sourceTraining, checksum string, size int64, actor string) (Model, error) {
 	if !nameRe.MatchString(name) {
 		return Model{}, fmt.Errorf("%w: model names must be lowercase letters, digits and dashes", ErrBadInput)
 	}
-	if !strings.HasPrefix(artifactID, "art-") {
-		return Model{}, fmt.Errorf("%w: model registration requires a project artifact", ErrBadInput)
+	artifact, err := s.verifiedArtifact(ctx, projectID, artifactID, "model")
+	if err != nil {
+		return Model{}, err
 	}
-	base := strings.ReplaceAll(strings.ToLower(name), "-", "")
-	if len(base) > 8 {
-		base = base[:8]
+	if sourceTraining != "" {
+		if _, err := s.GetTraining(ctx, projectID, sourceTraining); err != nil {
+			return Model{}, err
+		}
 	}
-	id := fmt.Sprintf("mdl-%s-%06d", base, time.Now().UTC().UnixNano()%1000000)
+	if (checksum != "" && checksum != artifact.Checksum) || (size != 0 && size != artifact.SizeBytes) {
+		return Model{}, fmt.Errorf("%w: model checksum or size does not match the artifact", ErrBadInput)
+	}
+	id := "mdl-" + uuid.NewString()
 	now := time.Now().UTC().UnixNano()
 	if _, err := s.db.ExecContext(ctx,
 		"INSERT INTO models(id,project_id,name,artifact_id,format,source_training,checksum,size_bytes,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-		id, projectID, name, artifactID, format, sourceTraining, checksum, size, actor, now); err != nil {
+		id, projectID, name, artifact.ID, format, sourceTraining, artifact.Checksum, artifact.SizeBytes, actor, now); err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			return Model{}, fmt.Errorf("%w: model name already exists", ErrConflict)
 		}
@@ -335,34 +369,57 @@ func (s *TrainStore) ListModels(ctx context.Context, projectID string) ([]Model,
 // --- Training Checkpoints -----------------------------------------------------
 
 type TrainingCheckpoint struct {
-	ID         string    `json:"id"`
-	TrainingID string    `json:"training_id"`
-	ArtifactID string    `json:"artifact_id"`
-	Step       int       `json:"step"`
-	Metrics    string    `json:"metrics"`
-	CreatedBy  string    `json:"created_by"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID         string          `json:"id"`
+	TrainingID string          `json:"training_id"`
+	ArtifactID string          `json:"artifact_id"`
+	Step       int             `json:"step"`
+	Metrics    json.RawMessage `json:"metrics"`
+	CreatedBy  string          `json:"created_by"`
+	CreatedAt  time.Time       `json:"created_at"`
 }
 
 const checkpointColumns = "id,training_id,artifact_id,step,metrics,created_by,created_at"
 
 func scanCheckpoint(row interface{ Scan(...any) error }) (TrainingCheckpoint, error) {
 	var c TrainingCheckpoint
+	var metrics string
 	var createdAt int64
-	if err := row.Scan(&c.ID, &c.TrainingID, &c.ArtifactID, &c.Step, &c.Metrics, &c.CreatedBy, &createdAt); err != nil {
+	if err := row.Scan(&c.ID, &c.TrainingID, &c.ArtifactID, &c.Step, &metrics, &c.CreatedBy, &createdAt); err != nil {
 		return c, err
 	}
+	if metrics == "null" {
+		metrics = "{}"
+	}
+	if !json.Valid([]byte(metrics)) || !strings.HasPrefix(strings.TrimSpace(metrics), "{") {
+		return c, errors.New("invalid stored checkpoint metrics")
+	}
+	c.Metrics = json.RawMessage(metrics)
 	c.CreatedAt = time.Unix(0, createdAt).UTC()
 	return c, nil
 }
 
 // CreateCheckpoint records a checkpoint artifact for a training job.
 // The artifact must already exist in the artifact store.
-func (s *TrainStore) CreateCheckpoint(ctx context.Context, trainingID, artifactID string, step int, metrics map[string]float64, actor string) (TrainingCheckpoint, error) {
-	metricsJSON, _ := json.Marshal(metrics)
-	id := "chk-" + strings.TrimPrefix(uuid.New().String(), "uuid-")
+func (s *TrainStore) CreateCheckpoint(ctx context.Context, projectID, trainingID, artifactID string, step int, metrics map[string]float64, actor string) (TrainingCheckpoint, error) {
+	if step <= 0 || len(metrics) > 128 {
+		return TrainingCheckpoint{}, ErrBadInput
+	}
+	if _, err := s.GetTraining(ctx, projectID, trainingID); err != nil {
+		return TrainingCheckpoint{}, err
+	}
+	if _, err := s.verifiedArtifact(ctx, projectID, artifactID, "checkpoint"); err != nil {
+		return TrainingCheckpoint{}, err
+	}
+	if metrics == nil {
+		metrics = map[string]float64{}
+	}
+	metricsJSON, err := json.Marshal(metrics)
+	if err != nil || len(metricsJSON) > 16<<10 {
+		return TrainingCheckpoint{}, ErrBadInput
+	}
+	id := "chk-" + uuid.NewString()
 	now := time.Now().UTC().UnixNano()
-	_, err := s.db.ExecContext(ctx,
+	_, err = s.db.ExecContext(ctx,
 		"INSERT INTO training_checkpoints(id,training_id,artifact_id,step,metrics,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
 		id, trainingID, artifactID, step, string(metricsJSON), actor, now)
 	if err != nil {
@@ -371,12 +428,12 @@ func (s *TrainStore) CreateCheckpoint(ctx context.Context, trainingID, artifactI
 		}
 		return TrainingCheckpoint{}, err
 	}
-	return s.GetCheckpoint(ctx, trainingID, id)
+	return s.GetCheckpoint(ctx, projectID, trainingID, id)
 }
 
 // GetCheckpoint retrieves a specific checkpoint.
-func (s *TrainStore) GetCheckpoint(ctx context.Context, trainingID, id string) (TrainingCheckpoint, error) {
-	row := s.db.QueryRowContext(ctx, "SELECT "+checkpointColumns+" FROM training_checkpoints WHERE id=? AND training_id=?", id, trainingID)
+func (s *TrainStore) GetCheckpoint(ctx context.Context, projectID, trainingID, id string) (TrainingCheckpoint, error) {
+	row := s.db.QueryRowContext(ctx, "SELECT "+checkpointColumns+" FROM training_checkpoints WHERE id=? AND training_id IN (SELECT id FROM training_jobs WHERE id=? AND project_id=?) AND artifact_id IN (SELECT id FROM artifacts WHERE project_id=? AND kind='checkpoint')", id, trainingID, projectID, projectID)
 	c, err := scanCheckpoint(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return TrainingCheckpoint{}, ErrNotFound
@@ -385,9 +442,12 @@ func (s *TrainStore) GetCheckpoint(ctx context.Context, trainingID, id string) (
 }
 
 // ListCheckpoints lists all checkpoints for a training job.
-func (s *TrainStore) ListCheckpoints(ctx context.Context, trainingID string) ([]TrainingCheckpoint, error) {
+func (s *TrainStore) ListCheckpoints(ctx context.Context, projectID, trainingID string) ([]TrainingCheckpoint, error) {
+	if _, err := s.GetTraining(ctx, projectID, trainingID); err != nil {
+		return nil, err
+	}
 	rows, err := s.db.QueryContext(ctx,
-		"SELECT "+checkpointColumns+" FROM training_checkpoints WHERE training_id=? ORDER BY created_at DESC LIMIT 100", trainingID)
+		"SELECT "+checkpointColumns+" FROM training_checkpoints WHERE training_id IN (SELECT id FROM training_jobs WHERE id=? AND project_id=?) AND artifact_id IN (SELECT id FROM artifacts WHERE project_id=? AND kind='checkpoint') ORDER BY created_at DESC LIMIT 100", trainingID, projectID, projectID)
 	if err != nil {
 		return nil, err
 	}
@@ -403,37 +463,20 @@ func (s *TrainStore) ListCheckpoints(ctx context.Context, trainingID string) ([]
 	return items, rows.Err()
 }
 
-// ResumeFromCheckpoint creates a new training job that resumes from a checkpoint.
-// The new job will have the checkpoint artifact as its model_artifact and resume_from set to the checkpoint ID.
-func (s *TrainStore) ResumeFromCheckpoint(ctx context.Context, projectID, name, checkpointID string, actor string) (TrainingJob, error) {
-	chk, err := s.GetCheckpoint(ctx, "", checkpointID)
+// ResumeFromCheckpoint validates the requested relationship before refusing
+// execution until the training image can explicitly opt into checkpoint input.
+func (s *TrainStore) ResumeFromCheckpoint(ctx context.Context, projectID, trainingID, name, checkpointID string, actor string) (TrainingJob, error) {
+	if !nameRe.MatchString(name) {
+		return TrainingJob{}, ErrBadInput
+	}
+	checkpoint, err := s.GetCheckpoint(ctx, projectID, trainingID, checkpointID)
 	if err != nil {
 		return TrainingJob{}, err
 	}
-	// Get the original training job to get its config
-	origJob, err := s.GetTraining(ctx, projectID, chk.TrainingID)
-	if err != nil {
+	if _, err := s.verifiedArtifact(ctx, projectID, checkpoint.ArtifactID, "checkpoint"); err != nil {
 		return TrainingJob{}, err
 	}
-	// Get the original workload to get image and resources
-	origWorkload, err := s.core.Get(ctx, origJob.WorkloadID)
-	if err != nil {
-		return TrainingJob{}, err
-	}
-	// Submit a new training job that resumes from the checkpoint
-	// The checkpoint artifact becomes the model_artifact for the new job
-	// The resume_from field tracks which checkpoint we're resuming from
-	return s.SubmitTraining(ctx, projectID, name, origWorkload.Submission.Image, nil, origWorkload.Submission.ImageDigest,
-		origWorkload.Submission.Resources, origJob.DatasetArtifact, chk.ArtifactID, chk.ID, "", "", nil, 0, 0, actor)
-}
-
-// UpdateCheckpointInfo updates the training job's checkpoint reference.
-func (s *TrainStore) UpdateCheckpointInfo(ctx context.Context, trainingID, checkpointArtifact string, checkpointStep int, checkpointPath string) error {
-	now := time.Now().UTC().UnixNano()
-	_, err := s.db.ExecContext(ctx,
-		"UPDATE training_jobs SET checkpoint_artifact=?, checkpoint_step=?, checkpoint_path=?, updated_at=? WHERE id=?",
-		checkpointArtifact, checkpointStep, checkpointPath, now, trainingID)
-	return err
+	return TrainingJob{}, ErrResumeUnsupported
 }
 
 // --- Infer --------------------------------------------------------------------
