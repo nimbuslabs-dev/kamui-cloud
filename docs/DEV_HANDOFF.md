@@ -81,6 +81,8 @@
 | Object backup/restore: tar bundle with checksum verification | ✅ |
 | Volume backup/restore: tar extraction to new volume | ✅ |
 | PostgreSQL pg_dump/pg_restore: native dump/restore via docker exec | ✅ |
+| **VERIFIED**: Database restore defaults to ISOLATED restore (creates restore_<name>_<timestamp>, verifies table count) | ✅ |
+| **VERIFIED**: Force restore (?force=true) requires system admin, runs pg_restore -Fc -c -d <existing> | ✅ |
 | Deploy: dockerfile build → revision → release → RUNNING | ✅ (real Docker build) |
 | Train: genuine gradient-descent job, 50 metrics ingested from the process | ✅ |
 | Managed PostgreSQL: secret-based password, volume placement, private network | ✅ |
@@ -124,10 +126,12 @@ forwards the inference proxy only. For JSON endpoints, use
 - S3-compatible object storage backend (AWS SDK v2, MinIO compatible)
 - Automated object backup (tar bundles with SHA-256) and restore to isolated directories
 - Volume backup and restore (tar extraction to new Docker volumes)
-- PostgreSQL-native backup (pg_dump -Fc) and restore (pg_restore -Fc -c) via docker exec
+- PostgreSQL-native backup (pg_dump -Fc) and restore (pg_restore -Fc) via docker exec
+- **VERIFIED**: Database restore defaults to ISOLATED restore (creates restore_<name>_<timestamp>, runs pg_restore -Fc -d <isolated>, verifies table count)
+- **VERIFIED**: Force restore (?force=true) requires system admin authorization, runs pg_restore -Fc -c -d <existing>
 - CLI commands: `kamui-cloud backup restore-objects`, `kamui-cloud backup restore-volume`
-- CLI commands: `kamui-cloud database backup`, `kamui-cloud database restore`
-- OpenAPI contracts updated for new backup/restore endpoints
+- CLI commands: `kamui-cloud database backup`, `kamui-cloud database restore [--force]`
+- OpenAPI contracts updated for new backup/restore endpoints with force parameter
 - All tests pass (unit + integration)
 - Configurable workspace idle shutdown (auto + manual trigger) ✅
 
@@ -312,11 +316,11 @@ These are marked **BLOCKED** per requirements — implementation is complete, li
 - `api/internal/objectstore/s3.go` — New: S3-compatible backend using AWS SDK v2 (MinIO, AWS S3 compatible)
 - `api/internal/objectstore/store.go` — Added `NewS3BackendFromConfig`, `S3Config` types
 - `api/internal/backup/backup.go` — Added `RestoreObjectBackup`, `RestoreVolumeBackup`; object backups as tar bundles with SHA-256
-- `api/internal/ops/ops.go` — Added `DatabaseBackup` (pg_dump -Fc), `DatabaseRestore` (pg_restore -Fc -c) via docker exec
-- `api/internal/http/services.go` — Added `BackupDatabase`, `RestoreDatabase`, `RestoreBackup` handlers for all backup kinds
+- `api/internal/ops/ops.go` — Added `DatabaseBackup` (pg_dump -Fc), `DatabaseRestore` (pg_restore -Fc) via docker exec; **verified: defaults to isolated restore, force parameter for destructive overwrite**
+- `api/internal/http/services.go` — Added `BackupDatabase`, `RestoreDatabase`, `RestoreBackup` handlers; force parameter for destructive restore requires system admin
 - `api/internal/config/config.go` — Added S3 config: `S3Region`, `S3Endpoint`, `S3Bucket`, `S3AccessKeyID`, `S3SecretAccessKey`, `S3UsePathStyle`, `S3RootPrefix`
 - `api/cmd/api/core.go` — Wire S3 backend when `KAMUI_S3_BUCKET` et al are set
-- `cli/cmd/kamui-cloud/services.go` — Added `backup restore-objects`, `backup restore-volume`, `database backup`, `database restore` commands
+- `cli/cmd/kamui-cloud/services.go` — Added `backup restore-objects`, `backup restore-volume`, `database backup`, `database restore [--force]` commands
 
 ---
 
