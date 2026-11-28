@@ -211,6 +211,15 @@ func (s *Store) FindDeployment(ctx context.Context, projectID, name string) (Dep
 	return deployment, err
 }
 
+func (s *Store) GetDeploymentByPath(ctx context.Context, projectID, id string) (Deployment, error) {
+	row := s.db.QueryRowContext(ctx, "SELECT "+deployColumns+" FROM deployments WHERE id=? AND project_id=?", id, projectID)
+	deployment, err := scanDeployment(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Deployment{}, ErrNotFound
+	}
+	return deployment, err
+}
+
 func (s *Store) ListDeployments(ctx context.Context, projectID string) ([]Deployment, error) {
 	rows, err := s.db.QueryContext(ctx, "SELECT "+deployColumns+" FROM deployments WHERE project_id=? ORDER BY created_at DESC LIMIT 100", projectID)
 	if err != nil {

@@ -124,12 +124,60 @@ func (a *app) deployCommand() *cobra.Command {
 		},
 	})
 	group.AddCommand(&cobra.Command{
+		Use:   "proxy DEPLOYMENT [--method GET --path /path --data JSON]",
+		Short: "Send an authenticated request through the deployment service proxy",
+		Args:  usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			method, _ := cmd.Flags().GetString("method")
+			path, _ := cmd.Flags().GetString("path")
+			data, _ := cmd.Flags().GetString("data")
+			if method == "" {
+				method = "GET"
+			}
+			if method != "GET" && method != "POST" && method != "PUT" && method != "DELETE" && method != "PATCH" && method != "HEAD" && method != "OPTIONS" {
+				return failure(2, "usage", "--method must be a valid HTTP method")
+			}
+			if !validDeployProxyPath(path) {
+				return failure(2, "usage", "--path must be an absolute service-relative path without traversal")
+			}
+			client, err := a.client()
+			if err != nil {
+				return err
+			}
+			var body any
+			if data != "" {
+				body = json.RawMessage(data)
+			}
+			result, err := client.request(cmd.Context(), method, svcProjectPath("/deployments/"+args[0]+"/proxy"+path), body, "")
+			if err != nil {
+				return err
+			}
+			return printJSON(cmd.OutOrStdout(), result, a.cloud.JSON)
+		},
+	})
+	group.AddCommand(&cobra.Command{
 		Use: "delete DEPLOYMENT", Short: "Stop and delete a deployment", Args: usageArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return a.serviceSend(cmd, "DELETE", svcProjectPath("/deployments/"+args[0]), nil)
 		},
 	})
 	return group
+}
+
+func validDeployProxyPath(path string) bool {
+	if path == "" {
+		return true // root path is valid
+	}
+	u, err := url.ParseRequestURI(path)
+	if err != nil || !strings.HasPrefix(u.Path, "/") || strings.HasPrefix(u.Path, "//") || strings.Contains(u.Path, "\\") {
+		return false
+	}
+	for _, segment := range strings.Split(u.Path, "/") {
+		if segment == "." || segment == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 // --- Store -----------------------------------------------------------------

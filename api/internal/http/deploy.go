@@ -1,18 +1,23 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/apierr"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/auth"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/core"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/deploy"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/identity"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/routing"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/runtime"
 )
 
 // deployHandler implements the Kamui Deploy API.
@@ -20,10 +25,12 @@ type deployHandler struct {
 	store  *deploy.Store
 	ids    *identity.Store
 	engine *core.Engine
+	hub    *routing.Hub
+	routes *runtime.Store
 }
 
-func newDeployHandler(store *deploy.Store, ids *identity.Store, engine *core.Engine) *deployHandler {
-	return &deployHandler{store: store, ids: ids, engine: engine}
+func newDeployHandler(store *deploy.Store, ids *identity.Store, engine *core.Engine, hub *routing.Hub, routes *runtime.Store) *deployHandler {
+	return &deployHandler{store: store, ids: ids, engine: engine, hub: hub, routes: routes}
 }
 
 func (h *deployHandler) authorize(w http.ResponseWriter, r *http.Request, projectID string, perm identity.Permission) (identity.Principal, bool) {
@@ -60,6 +67,11 @@ func (h *deployHandler) register(mux *http.ServeMux, publicMux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/projects/{id}/deployments/{dep}/webhooks", h.CreateWebhook)
 	mux.HandleFunc("GET /v1/projects/{id}/deployments/{dep}/webhooks", h.ListWebhooks)
 	mux.HandleFunc("DELETE /v1/projects/{id}/webhooks/{webhook}", h.DeleteWebhook)
+	// Deploy service proxy (for remote worker services)
+	for _, method := range []string{"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"} {
+		mux.HandleFunc(method+" /v1/projects/{id}/deployments/{dep}/proxy/{path...}", h.ProxyDeployment)
+		mux.HandleFunc(method+" /v1/projects/{id}/deployments/{dep}/proxy", h.ProxyDeployment)
+	}
 	publicMux.HandleFunc("POST /v1/webhooks/{webhook}", h.WebhookTrigger)
 }
 
@@ -351,6 +363,69 @@ func (h *deployHandler) RuntimeLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	apierr.WriteJSON(w, http.StatusOK, logs)
+}
+
+// ProxyDeployment forwards authorized project requests to the deployment
+// service's route. Upstream destinations come from the route registry, never
+// from client-supplied URLs, which prevents arbitrary internal proxying.
+// Supports WebSocket upgrades for remote worker services.
+func (h *deployHandler) ProxyDeployment(w http.ResponseWriter, r *http.Request) {
+	projectID := r.PathValue("id")
+	if _, ok := h.authorize(w, r, projectID, identity.PermWorkloadRead); !ok {
+		return
+	}
+	deployment, err := h.store.GetDeploymentByPath(r.Context(), projectID, r.PathValue("dep"))
+	if err != nil {
+		deployError(w, err)
+		return
+	}
+	if h.engine == nil || h.routes == nil {
+		apierr.WriteError(w, http.StatusServiceUnavailable, "proxy_unavailable", "service routing is unavailable")
+		return
+	}
+	rev, err := h.store.GetRevision(r.Context(), deployment.ID, deployment.CurrentRevision)
+	if err != nil || rev.WorkloadID == "" {
+		apierr.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "no runtime workload for this revision")
+		return
+	}
+	route, err := h.routes.RouteLookup(r.Context(), rev.WorkloadID)
+	if err != nil || route.ProjectID != projectID {
+		apierr.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "the deployment service has no live route")
+		return
+	}
+	item, err := h.engine.Repo.Get(r.Context(), rev.WorkloadID)
+	if err != nil || !liveServiceRoute(route, item, time.Now()) {
+		apierr.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "the service assignment is no longer live")
+		return
+	}
+	transport := &http.Transport{DisableKeepAlives: true, ResponseHeaderTimeout: 60 * time.Second}
+	host := "kamui-service"
+	if route.WorkerID == core.LocalWorker {
+		resolver, ok := h.engine.Executor.(ContainerResolver)
+		if !ok {
+			apierr.WriteError(w, http.StatusServiceUnavailable, "proxy_unavailable", "local service resolver is unavailable")
+			return
+		}
+		addr, err := resolver.ContainerServiceAddress(r.Context(), route.WorkloadID, route.Attempt)
+		if err != nil {
+			apierr.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "local service is unreachable")
+			return
+		}
+		host = net.JoinHostPort(addr, strconv.Itoa(route.Port))
+	} else {
+		if h.hub == nil || h.hub.Get(route.WorkerID) == nil {
+			apierr.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "the assigned worker has no live tunnel")
+			return
+		}
+		transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			tunnel := h.hub.Get(route.WorkerID)
+			if tunnel == nil {
+				return nil, routing.ErrTunnelClosed
+			}
+			return tunnel.DialContext(ctx, route.WorkloadID, route.Fence, route.Port)
+		}
+	}
+	proxyService(w, r, host, transport)
 }
 
 func (h *deployHandler) CreateWebhook(w http.ResponseWriter, r *http.Request) {

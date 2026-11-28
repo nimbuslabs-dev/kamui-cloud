@@ -1,7 +1,11 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
+	"net/url"
 	"regexp"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -43,7 +47,79 @@ func (a *app) workspaceCommand() *cobra.Command {
 		})
 	}
 	group.AddCommand(a.workspaceGitCommand())
+	group.AddCommand(a.workspaceIDECommand())
+	group.AddCommand(&cobra.Command{
+		Use: "idle-shutdown", Short: "Manually trigger idle workspace shutdown check", Args: usageArgs(cobra.NoArgs),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return a.send(cmd, "POST", "/v1/workspaces/idle-shutdown", nil, "")
+		},
+	})
 	return group
+}
+
+func (a *app) workspaceIDECommand() *cobra.Command {
+	group := &cobra.Command{Use: "ide", Short: "Workspace IDE access via authenticated proxy"}
+	group.AddCommand(&cobra.Command{
+		Use: "open ID", Short: "Open the IDE proxy URL (prints the URL for remote access)", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !workspaceID.MatchString(args[0]) {
+				return failure(2, "invalid_id", "provide a valid workspace ID")
+			}
+			// Just print the proxy URL; the actual WebSocket upgrade happens on connect
+			url := a.url + "/v1/workspaces/" + args[0] + "/ide"
+			if a.cloud.JSON {
+				return printJSON(cmd.OutOrStdout(), map[string]string{"url": url}, true)
+			}
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), url)
+			return nil
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use:   "request ID --method GET --path /path [--data JSON]",
+		Short: "Send an authenticated HTTP request through the IDE proxy",
+		Args:  usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			method, _ := cmd.Flags().GetString("method")
+			path, _ := cmd.Flags().GetString("path")
+			data, _ := cmd.Flags().GetString("data")
+			if method == "" {
+				method = "GET"
+			}
+			if !validIDEProxyPath(path) {
+				return failure(2, "usage", "--path must be an absolute IDE-relative path without traversal")
+			}
+			client, err := a.client()
+			if err != nil {
+				return err
+			}
+			var body any
+			if data != "" {
+				body = json.RawMessage(data)
+			}
+			result, err := client.request(cmd.Context(), method, "/v1/workspaces/"+args[0]+"/ide"+path, body, "")
+			if err != nil {
+				return err
+			}
+			return printJSON(cmd.OutOrStdout(), result, a.cloud.JSON)
+		},
+	})
+	return group
+}
+
+func validIDEProxyPath(path string) bool {
+	if path == "" {
+		return true
+	}
+	u, err := url.ParseRequestURI(path)
+	if err != nil || !strings.HasPrefix(u.Path, "/") || strings.HasPrefix(u.Path, "//") || strings.Contains(u.Path, "\\") {
+		return false
+	}
+	for _, segment := range strings.Split(u.Path, "/") {
+		if segment == "." || segment == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 func (a *app) workspaceAction(cmd *cobra.Command, id, method, suffix string, input any) error {

@@ -99,7 +99,10 @@ func NewRouterWithServices(
 	mux.HandleFunc("GET /v1/jobs/{id}", adminOnly(jobHandler.Get))
 	mux.HandleFunc("POST /v1/jobs/{id}/finish", adminOnly(jobHandler.Finish))
 
-	workspaceHandler, err := newWorkspaceHandlerWithIdentity(cfg.WorkspaceDataFile, cfg.WorkspaceManagerURL, cfg.Token, idStore)
+	var hub *routing.Hub
+	hub = routing.NewHub()
+
+	workspaceHandler, err := newWorkspaceHandlerWithIdentity(cfg.WorkspaceDataFile, cfg.WorkspaceManagerURL, cfg.Token, idStore, hub, runtimeStore, engine, cfg.WorkspaceIdleTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -116,6 +119,10 @@ func NewRouterWithServices(
 	mux.HandleFunc("POST /v1/workspaces/{id}/git/commit", workspaceHandler.GitCommit)
 	mux.HandleFunc("POST /v1/workspaces/{id}/git/push", workspaceHandler.GitPush)
 	mux.HandleFunc("POST /v1/workspaces/{id}/git/pull", workspaceHandler.GitPull)
+	// Workspace IDE proxy (for remote worker workspaces)
+	mux.HandleFunc("GET /v1/workspaces/{id}/ide", workspaceHandler.ProxyIDE)
+	// Workspace idle shutdown
+	mux.HandleFunc("POST /v1/workspaces/idle-shutdown", workspaceHandler.IdleShutdown)
 
 	publicMux := http.NewServeMux()
 	publicMux.HandleFunc("GET /healthz", HandleHealthz)
@@ -174,7 +181,6 @@ func NewRouterWithServices(
 		mux.HandleFunc("DELETE /v1/connect/remote", ch.DisableRemoteConfig)
 	}
 
-	var hub *routing.Hub
 	if workerStore != nil {
 		if engine != nil {
 			// Service routes for terminal workloads are revoked promptly.
@@ -184,7 +190,6 @@ func NewRouterWithServices(
 				}
 			}
 		}
-		hub = routing.NewHub()
 		newWorkerHandler(workerStore, engine, idStore, runtimeStore, hub).registerWorkerProtocol(publicMux, mux, adminOnly)
 		if runtimeStore != nil {
 			newRuntimeHandler(runtimeStore, engine, idStore).register(mux)
@@ -192,7 +197,7 @@ func NewRouterWithServices(
 	}
 
 	if deployStore != nil {
-		newDeployHandler(deployStore, idStore, engine).register(mux, publicMux)
+		newDeployHandler(deployStore, idStore, engine, hub, runtimeStore).register(mux, publicMux)
 	}
 	if serviceStores != nil {
 		newServicesHandler(serviceStores.Objects, serviceStores.Backups, serviceStores.Train,

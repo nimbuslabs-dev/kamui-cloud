@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"strings"
 	"time"
@@ -14,38 +16,109 @@ import (
 
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/apierr"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/auth"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/core"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/identity"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/routing"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/runtime"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/workspaceinput"
 )
 
 type WorkspaceHandler struct {
-	store      *workspaceStore
-	identity   *identity.Store
-	managerURL string
-	token      string
-	client     *http.Client
-	operations chan struct{}
+	store           *workspaceStore
+	identity        *identity.Store
+	managerURL      string
+	token           string
+	client          *http.Client
+	operations      chan struct{}
+	hub             *routing.Hub
+	routes          *runtime.Store
+	engine          *core.Engine
+	idleTimeout     time.Duration
+	idleCheckTicker *time.Ticker
+	idleStopCh      chan struct{}
 }
 
 func newWorkspaceHandler(dataPath, managerURL, token string) (*WorkspaceHandler, error) {
-	return newWorkspaceHandlerWithIdentity(dataPath, managerURL, token, nil)
+	return newWorkspaceHandlerWithIdentity(dataPath, managerURL, token, nil, nil, nil, nil, 0)
 }
 
-func newWorkspaceHandlerWithIdentity(dataPath, managerURL, token string, id *identity.Store) (*WorkspaceHandler, error) {
+func newWorkspaceHandlerWithIdentity(dataPath, managerURL, token string, id *identity.Store, hub *routing.Hub, routes *runtime.Store, engine *core.Engine, idleTimeout time.Duration) (*WorkspaceHandler, error) {
 	store, err := openWorkspaceStore(dataPath)
 	if err != nil {
 		return nil, err
 	}
-	return &WorkspaceHandler{
-		store: store, identity: id, managerURL: strings.TrimRight(managerURL, "/"), token: token,
+	h := &WorkspaceHandler{
+		store:      store,
+		identity:   id,
+		managerURL: strings.TrimRight(managerURL, "/"),
+		token:      token,
 		client: &http.Client{
 			Timeout: 75 * time.Second,
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
 		},
-		operations: make(chan struct{}, 1),
-	}, nil
+		operations:  make(chan struct{}, 1),
+		hub:         hub,
+		routes:      routes,
+		engine:      engine,
+		idleTimeout: idleTimeout,
+		idleStopCh:  make(chan struct{}),
+	}
+	if idleTimeout > 0 {
+		h.startIdleChecker()
+	}
+	return h, nil
+}
+
+func (h *WorkspaceHandler) startIdleChecker() {
+	h.idleCheckTicker = time.NewTicker(5 * time.Minute)
+	go func() {
+		for {
+			select {
+			case <-h.idleCheckTicker.C:
+				h.checkIdleWorkspaces()
+			case <-h.idleStopCh:
+				return
+			}
+		}
+	}()
+}
+
+func (h *WorkspaceHandler) checkIdleWorkspaces() {
+	if h.idleTimeout <= 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	workspaces := h.store.list()
+	now := time.Now().UTC()
+	for _, ws := range workspaces {
+		if ws.Status != "running" {
+			continue
+		}
+		if ws.LastActiveAt == nil {
+			continue
+		}
+		idle := now.Sub(*ws.LastActiveAt)
+		if idle >= h.idleTimeout {
+			// Stop the workspace but keep the volume
+			h.lifecycleInternal(ctx, ws, "stop")
+		}
+	}
+}
+
+func (h *WorkspaceHandler) lifecycleInternal(ctx context.Context, ws Workspace, operation string) {
+	input := any(ws.ID)
+	if operation == "start" {
+		payload := map[string]string{
+			"id": ws.ID, "name": ws.Name,
+			"repository_url": ws.RepositoryURL, "branch": ws.Branch,
+		}
+		input = payload
+	}
+	_ = h.manager(ctx, http.MethodPost, "/workspace/"+operation, input, nil)
+	// Note: we don't update the store here; the next status check will reflect the change
 }
 
 func validateWorkspaceCreate(input WorkspaceCreate) string {
@@ -516,4 +589,94 @@ func (h *WorkspaceHandler) gitTransfer(w http.ResponseWriter, r *http.Request, c
 	if h.git(w, r, command, []string{input.Remote, input.Branch}, nil) {
 		w.WriteHeader(http.StatusNoContent)
 	}
+}
+
+// ProxyIDE forwards authorized project requests to the workspace IDE
+// (code-server) WebSocket. For remote workers, it uses the authenticated
+// worker tunnel. The WebSocket upgrade is forwarded through the tunnel.
+func (h *WorkspaceHandler) ProxyIDE(w http.ResponseWriter, r *http.Request) {
+	workspace, _, ok := h.workspace(w, r, identity.PermWorkspaceRead)
+	if !ok {
+		return
+	}
+	if h.engine == nil || h.routes == nil {
+		apierr.WriteError(w, http.StatusServiceUnavailable, "proxy_unavailable", "IDE routing is unavailable")
+		return
+	}
+	// Get the workload ID for this workspace. Workspaces run as service workloads.
+	// We need to find the service workload associated with this workspace.
+	workloadID := "ws-" + workspace.ID
+	route, err := h.routes.RouteLookup(r.Context(), workloadID)
+	if err != nil {
+		// Try to get the container address from the manager for local workspaces
+		if h.hub == nil || h.hub.Get(core.LocalWorker) == nil {
+			apierr.WriteError(w, http.StatusServiceUnavailable, "ide_unavailable", "no live route or tunnel for workspace")
+			return
+		}
+	}
+	transport := &http.Transport{DisableKeepAlives: false, ResponseHeaderTimeout: 60 * time.Second}
+	host := "kamui-workspace-" + workspace.ID + ":8080"
+	if route.WorkerID == core.LocalWorker {
+		resolver, ok := h.engine.Executor.(ContainerResolver)
+		if !ok {
+			apierr.WriteError(w, http.StatusServiceUnavailable, "proxy_unavailable", "local IDE resolver is unavailable")
+			return
+		}
+		addr, err := resolver.ContainerServiceAddress(r.Context(), route.WorkloadID, route.Attempt)
+		if err != nil {
+			apierr.WriteError(w, http.StatusServiceUnavailable, "ide_unavailable", "local workspace is unreachable")
+			return
+		}
+		host = net.JoinHostPort(addr, "8080")
+	} else {
+		if h.hub == nil || h.hub.Get(route.WorkerID) == nil {
+			apierr.WriteError(w, http.StatusServiceUnavailable, "ide_unavailable", "the assigned worker has no live tunnel")
+			return
+		}
+		transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			tunnel := h.hub.Get(route.WorkerID)
+			if tunnel == nil {
+				return nil, routing.ErrTunnelClosed
+			}
+			return tunnel.DialContext(ctx, route.WorkloadID, route.Fence, 8080)
+		}
+	}
+	proxy := &httputil.ReverseProxy{
+		Transport:     transport,
+		FlushInterval: -1,
+		Rewrite: func(req *httputil.ProxyRequest) {
+			req.Out.URL.Scheme = "http"
+			req.Out.URL.Host = host
+			req.Out.URL.Path = strings.TrimPrefix(req.In.URL.Path, "/v1/workspaces/"+workspace.ID+"/ide")
+			req.Out.URL.RawPath = ""
+			req.Out.Header.Del("Authorization")
+			req.Out.Header.Del("Cookie")
+			req.Out.Header.Del("X-Kamui-Token")
+		},
+		ModifyResponse: func(response *http.Response) error {
+			response.Header.Del("Set-Cookie")
+			response.Header.Set("Cache-Control", "no-store")
+			return nil
+		},
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
+			apierr.WriteError(w, http.StatusBadGateway, "ide_unavailable", "the workspace IDE could not complete the request")
+		},
+	}
+	if r.Header.Get("Upgrade") != "" {
+		// WebSocket upgrade - pass through
+		proxy.ServeHTTP(w, r)
+		return
+	}
+	// Regular HTTP request
+	proxy.ServeHTTP(w, r)
+}
+
+// IdleShutdown manually triggers the idle workspace check.
+// POST /v1/workspaces/idle-shutdown
+func (h *WorkspaceHandler) IdleShutdown(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.authorizeProject(w, r, "", identity.PermWorkspaceWrite); !ok {
+		return
+	}
+	h.checkIdleWorkspaces()
+	apierr.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 }

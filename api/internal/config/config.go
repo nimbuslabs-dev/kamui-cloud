@@ -6,18 +6,20 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 )
 
 type Config struct {
-	Token               string
-	AdminPassword       string
-	Port                string
-	CLIGatewayPort      int
-	CAPath              string
-	MDNSEnabled         bool
-	WorkspaceManagerURL string
-	WorkspaceDataFile   string
+	Token                string
+	AdminPassword        string
+	Port                 string
+	CLIGatewayPort       int
+	CAPath               string
+	MDNSEnabled          bool
+	WorkspaceManagerURL  string
+	WorkspaceDataFile    string
+	WorkspaceIdleTimeout time.Duration
 }
 
 func Load() (*Config, error) {
@@ -38,15 +40,22 @@ func Load() (*Config, error) {
 		}
 	}
 	mdnsEnabled := os.Getenv("KAMUI_MDNS_ENABLED") == "true" || os.Getenv("KAMUI_CORE_EXECUTOR") == "" || os.Getenv("KAMUI_CORE_EXECUTOR") == "local"
+	idleTimeout := 30 * time.Minute
+	if raw := os.Getenv("KAMUI_WORKSPACE_IDLE_TIMEOUT"); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil && parsed >= 0 {
+			idleTimeout = parsed
+		}
+	}
 	return &Config{
-		Token:               token,
-		AdminPassword:       os.Getenv("KAMUI_ADMIN_PASSWORD"),
-		Port:                "8080",
-		CLIGatewayPort:      cliPort,
-		CAPath:              caPath,
-		MDNSEnabled:         mdnsEnabled,
-		WorkspaceDataFile:   getEnvOrDefault("KAMUI_WORKSPACE_DATA_FILE", "workspaces.json"),
-		WorkspaceManagerURL: getEnvOrDefault("WORKSPACE_MANAGER_URL", "http://workspace-manager:8082"),
+		Token:                token,
+		AdminPassword:        os.Getenv("KAMUI_ADMIN_PASSWORD"),
+		Port:                 "8080",
+		CLIGatewayPort:       cliPort,
+		CAPath:               caPath,
+		MDNSEnabled:          mdnsEnabled,
+		WorkspaceDataFile:    getEnvOrDefault("KAMUI_WORKSPACE_DATA_FILE", "workspaces.json"),
+		WorkspaceManagerURL:  getEnvOrDefault("WORKSPACE_MANAGER_URL", "http://workspace-manager:8082"),
+		WorkspaceIdleTimeout: idleTimeout,
 	}, nil
 }
 
