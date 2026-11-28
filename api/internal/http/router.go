@@ -196,7 +196,7 @@ func NewRouterWithServices(
 	}
 	if serviceStores != nil {
 		newServicesHandler(serviceStores.Objects, serviceStores.Backups, serviceStores.Train,
-			serviceStores.Infer, serviceStores.Ops, serviceStores.Drop, idStore, engine, hub).register(mux)
+			serviceStores.Infer, serviceStores.Ops, serviceStores.Drop, idStore, engine, hub, runtimeStore).register(mux)
 	}
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

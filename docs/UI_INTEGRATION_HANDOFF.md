@@ -27,7 +27,7 @@ the schema source of truth — this file covers discovery, states and gaps.
 | Store | `/v1/projects/{id}/buckets`, `.../objects/{key}` (PUT raw bytes, GET raw bytes, `?metadata=true`) | workload:read/write | Downloads are raw bytes with `X-Checksum-Sha256`; use streaming fetch, not JSON |
 | Backup | `/v1/backups*`, project object/volume backups, restore | admin for metadata; workload:write per project otherwise | Restore returns the isolated destination path |
 | Train | `/v1/projects/{id}/training`, `/collect`, `/metrics`; `/models` | workload:read/write | Metrics come only from the training process; empty until `POST /collect` |
-| Infer | `/v1/projects/{id}/inference`, `/stop`, `/proxy/*` | workload:read/write | Proxy is same-daemon only today; remote worker routing is BLOCKED |
+| Infer | `/v1/projects/{id}/inference`, `/stop`, `/proxy/*` | workload:read/write | Authenticated GET/POST via the current worker tunnel; separate-host acceptance pending |
 | Quotas/SRE | `/v1/projects/{id}/quotas` (PUT needs project:update), `/usage`, `/alerts`, `/v1/alerts/{alr}/events` | project:update for writes | Usage distinguishes allocated vs measured; measured may be null |
 | Databases | `/v1/projects/{id}/databases` (create/list/inspect/stop/delete) | workload:read/write | Password secret `db-{name}-password` must exist before create; credentials are never returned by the API |
 | Drop | `/v1/drop/transfers` (+ approve/reject/cancel/content) | any authenticated user | Uploads/downloads are raw bytes; approval gates download |
@@ -56,7 +56,7 @@ the CLI).
 
 ## Known gaps (do not build UI for these yet)
 
-1. Remote worker service routing (proxy) is same-daemon only — BLOCKED.
+1. Inference worker transport is implemented and covered by protocol tests. Separate-host TLS/Docker acceptance, Workspace IDE routing, and Deploy HTTP routing remain open.
 2. Remote worker output registration is PARTIAL: the agent stages outputs
    locally; `/collect` works for local-executor workloads.
 3. Engine-level database backup/restore is `not_implemented` (volume backups

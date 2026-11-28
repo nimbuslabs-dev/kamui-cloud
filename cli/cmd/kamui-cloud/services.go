@@ -393,7 +393,7 @@ func (a *app) inferCommand() *cobra.Command {
 		},
 	})
 	group.AddCommand(&cobra.Command{
-		Use: "endpoint SERVICE", Short: "Show the authenticated local endpoint", Args: usageArgs(cobra.ExactArgs(1)),
+		Use: "endpoint SERVICE", Short: "Request the service root through the authenticated proxy", Args: usageArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return a.serviceSend(cmd, "GET", svcProjectPath("/inference/"+args[0]+"/proxy"), nil)
 		},
@@ -401,13 +401,17 @@ func (a *app) inferCommand() *cobra.Command {
 	group.AddCommand(&cobra.Command{
 		Use:   "request SERVICE --method GET --path /v1/models [--data JSON]",
 		Short: "Send an authenticated request through the service proxy",
+		Args:  usageArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			svc := args[0]
 			method, _ := cmd.Flags().GetString("method")
 			path, _ := cmd.Flags().GetString("path")
 			data, _ := cmd.Flags().GetString("data")
-			if !strings.HasPrefix(path, "/") {
-				return failure(2, "usage", "--path must start with /")
+			if method != "GET" && method != "POST" {
+				return failure(2, "usage", "--method must be GET or POST")
+			}
+			if !validInferencePath(path) {
+				return failure(2, "usage", "--path must be an absolute service-relative path without traversal")
 			}
 			client, err := a.client()
 			if err != nil {
@@ -684,4 +688,17 @@ func svcProjectPath(suffix string) string {
 		return "/v1/projects/UNSET" + suffix
 	}
 	return "/v1/projects/" + svcProject() + suffix
+}
+
+func validInferencePath(path string) bool {
+	u, err := url.ParseRequestURI(path)
+	if err != nil || !strings.HasPrefix(u.Path, "/") || strings.HasPrefix(u.Path, "//") || strings.Contains(u.Path, "\\") {
+		return false
+	}
+	for _, segment := range strings.Split(u.Path, "/") {
+		if segment == "." || segment == ".." {
+			return false
+		}
+	}
+	return true
 }

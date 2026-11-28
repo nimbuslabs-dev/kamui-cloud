@@ -529,6 +529,7 @@ type ServiceRoute struct {
 	ProjectID    string    `json:"project_id"`
 	WorkerID     string    `json:"worker_id"`
 	Attempt      int       `json:"attempt"`
+	Fence        string    `json:"-"`
 	Port         int       `json:"port"`
 	Kind         string    `json:"kind"`
 	RegisteredAt time.Time `json:"registered_at"`
@@ -559,8 +560,8 @@ func (s *Store) GetRoute(ctx context.Context, workloadID string) (ServiceRoute, 
 	var route ServiceRoute
 	var registered, expires int64
 	err := s.db.QueryRowContext(ctx,
-		"SELECT workload_id,project_id,worker_id,attempt,port,kind,registered_at,expires_at FROM service_routes WHERE workload_id=?", workloadID).
-		Scan(&route.WorkloadID, &route.ProjectID, &route.WorkerID, &route.Attempt, &route.Port, &route.Kind, &registered, &expires)
+		"SELECT workload_id,project_id,worker_id,attempt,fence,port,kind,registered_at,expires_at FROM service_routes WHERE workload_id=?", workloadID).
+		Scan(&route.WorkloadID, &route.ProjectID, &route.WorkerID, &route.Attempt, &route.Fence, &route.Port, &route.Kind, &registered, &expires)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ServiceRoute{}, ErrNotFound
 	}
@@ -579,7 +580,11 @@ func (s *Store) PruneRoutes(ctx context.Context) {
 
 // RouteLookup resolves the live route for a workload, for the service proxy.
 func (s *Store) RouteLookup(ctx context.Context, workloadID string) (ServiceRoute, error) {
-	return s.GetRoute(ctx, workloadID)
+	route, err := s.GetRoute(ctx, workloadID)
+	if err == nil && !route.ExpiresAt.After(s.now()) {
+		return ServiceRoute{}, ErrNotFound
+	}
+	return route, err
 }
 
 // --- Assignment payload assembly -------------------------------------------------

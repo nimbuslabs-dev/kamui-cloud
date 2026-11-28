@@ -316,6 +316,31 @@ paths:
       responses:
         '200': { description: Inference services }
         default: { $ref: '#/components/responses/Error' }
+  /v1/projects/{id}/inference/{svc}/proxy/{path}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: svc, in: path, required: true, schema: { type: string } }
+      - name: path
+        in: path
+        required: true
+        description: Relative service path, such as v1/models. The /proxy root is also accepted.
+        schema: { type: string }
+    get:
+      operationId: getInferenceUpstream
+      description: Requires project workload read permission and a live, fenced service assignment.
+      responses:
+        '200': { description: Upstream response }
+        '502': { description: Upstream transport failed }
+        '503': { description: No current reachable service route }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      operationId: postInferenceUpstream
+      description: Forwards the request body and streams the upstream response through the authenticated proxy.
+      responses:
+        '200': { description: Upstream response }
+        '502': { description: Upstream transport failed }
+        '503': { description: No current reachable service route }
+        default: { $ref: '#/components/responses/Error' }
   /v1/projects/{id}/quotas:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }

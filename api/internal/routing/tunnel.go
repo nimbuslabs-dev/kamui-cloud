@@ -5,6 +5,7 @@
 package routing
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -57,14 +58,9 @@ type Tunnel struct {
 	writeMu sync.Mutex
 	streams sync.Map // streamID -> *streamPump
 	nextID  uint32
-	idMu    sync.Mutex
-
-	lastPing time.Time
 
 	closed   bool
 	closedMu sync.Mutex
-	lastPong time.Time
-	pongMu   sync.Mutex
 	onRemove func()
 }
 
@@ -104,43 +100,44 @@ func (t *Tunnel) streamCount() int {
 // raw connection. The worker validates the assignment before dialing, so the
 // coordinator can never direct a stream at an unauthorized destination.
 func (t *Tunnel) OpenStream(workloadID, fence string, port int) (net.Conn, error) {
-	if t.isClosed() {
+	return t.DialContext(context.Background(), workloadID, fence, port)
+}
+
+func (t *Tunnel) DialContext(ctx context.Context, workloadID, fence string, port int) (net.Conn, error) {
+	t.closedMu.Lock()
+	if t.closed {
+		t.closedMu.Unlock()
 		return nil, ErrTunnelClosed
 	}
 	if t.streamCount() >= MaxStreams {
+		t.closedMu.Unlock()
 		return nil, errors.New("tunnel is at its concurrent stream limit")
 	}
-	t.idMu.Lock()
 	t.nextID++
 	id := t.nextID
-	t.idMu.Unlock()
-	payload, err := json.Marshal(OpenFrame{
-		StreamID: id, WorkloadID: workloadID, Fence: fence, Port: port,
-	})
-	if err != nil {
-		return nil, err
-	}
 	pump := newPump(id)
 	t.streams.Store(id, pump)
+	t.closedMu.Unlock()
+	payload, _ := json.Marshal(OpenFrame{StreamID: id, WorkloadID: workloadID, Fence: fence, Port: port})
 	if err := t.writeFrame(FrameOpen, id, payload); err != nil {
 		t.streams.Delete(id)
+		t.remove()
 		return nil, fmt.Errorf("tunnel dial: %w", err)
 	}
-	// The worker answers the dial with data (connected) or CLOSE (rejected).
+	ctx, cancel := context.WithTimeout(ctx, DialTimeout)
+	defer cancel()
 	select {
-	case first := <-pump.ch:
-		pump.buffered = append(pump.buffered, first...)
-		return &tunnelConn{pump: pump, tunnel: t}, nil
-	case err := <-pump.errCh:
-		t.streams.Delete(id)
-		if err != nil {
-			return nil, fmt.Errorf("tunnel dial rejected: %w", err)
+	case first, ok := <-pump.ch:
+		if ok {
+			return &tunnelConn{pump: pump, tunnel: t, buffered: first}, nil
 		}
-		return nil, errors.New("tunnel dial rejected by worker")
-	case <-time.After(DialTimeout):
 		t.streams.Delete(id)
-		t.sendClose(id, "dial timeout")
-		return nil, errors.New("tunnel dial timed out")
+		return nil, errors.New("tunnel dial rejected by worker")
+	case <-ctx.Done():
+		t.streams.Delete(id)
+		pump.shutdown(ctx.Err())
+		t.sendClose(id, "dial cancelled")
+		return nil, ctx.Err()
 	}
 }
 
@@ -153,7 +150,23 @@ func (t *Tunnel) sendClose(id uint32, reason string) {
 func (t *Tunnel) Serve() {
 	defer t.remove()
 	header := make([]byte, headerSize)
-	lastPingSent := time.Now()
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		ticker := time.NewTicker(PingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if t.writeFrame(FramePing, 0, nil) != nil {
+					t.remove()
+					return
+				}
+			}
+		}
+	}()
 	for {
 		t.conn.SetReadDeadline(time.Now().Add(PongTimeout))
 		if _, err := io.ReadFull(t.conn, header); err != nil {
@@ -172,17 +185,17 @@ func (t *Tunnel) Serve() {
 				return
 			}
 		}
-		t.pongMu.Lock()
-		t.lastPong = time.Now()
-		t.pongMu.Unlock()
 		switch kind {
 		case FrameData:
 			if pump, ok := t.streams.Load(streamID); ok {
-				pump.(*streamPump).deliver(payload)
+				if !pump.(*streamPump).deliver(payload) {
+					t.streams.Delete(streamID)
+					t.sendClose(streamID, "receiver buffer full")
+				}
 			}
 		case FrameEOF:
 			if pump, ok := t.streams.Load(streamID); ok {
-				pump.(*streamPump).closeWrite()
+				pump.(*streamPump).shutdown(io.EOF)
 			}
 		case FrameClose:
 			if pump, ok := t.streams.Load(streamID); ok {
@@ -196,10 +209,7 @@ func (t *Tunnel) Serve() {
 		default:
 			return // protocol violation
 		}
-		if time.Since(lastPingSent) >= PingInterval {
-			lastPingSent = time.Now()
-			_ = t.writeFrame(FramePing, 0, nil)
-		}
+
 	}
 }
 
@@ -224,88 +234,69 @@ func (t *Tunnel) remove() {
 
 // streamPump moves bytes between the tunnel and one local pipe.
 type streamPump struct {
-	id       uint32
-	ch       chan []byte
-	errCh    chan error
-	buffered []byte
-	eofRead  bool
-	readMu   sync.Mutex
-	once     sync.Once
+	id  uint32
+	ch  chan []byte
+	mu  sync.Mutex
+	err error
 }
 
 func newPump(id uint32) *streamPump {
-	return &streamPump{
-		id:    id,
-		ch:    make(chan []byte, 32),
-		errCh: make(chan error, 2),
-	}
+	return &streamPump{id: id, ch: make(chan []byte, 32)}
 }
 
-func (p *streamPump) deliver(payload []byte) {
+func (p *streamPump) deliver(payload []byte) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.err != nil {
+		return false
+	}
 	select {
 	case p.ch <- payload:
+		return true
 	default:
-		// Backpressure: the reader is slower than the worker; drop the
-		// stream rather than buffering unbounded.
-		p.shutdown(errors.New("stream buffer overflow"))
+		p.err = errors.New("stream buffer overflow")
+		close(p.ch)
+		return false
 	}
-}
-
-func (p *streamPump) closeWrite() {
-	p.readMu.Lock()
-	p.eofRead = true
-	p.readMu.Unlock()
 }
 
 func (p *streamPump) shutdown(err error) {
-	p.once.Do(func() {
-		if err != nil {
-			select {
-			case p.errCh <- err:
-			default:
-			}
-		}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.err == nil {
+		p.err = err
 		close(p.ch)
-	})
+	}
 }
 
 // tunnelConn adapts one tunnel stream to net.Conn for http.Transport.
 type tunnelConn struct {
-	pump   *streamPump
-	tunnel *Tunnel
-	readMu sync.Mutex
-	closed bool
+	pump     *streamPump
+	tunnel   *Tunnel
+	readMu   sync.Mutex
+	closed   bool
+	buffered []byte
+	bufferMu sync.Mutex
 }
 
 func (c *tunnelConn) Read(buf []byte) (int, error) {
-	c.readMu.Lock()
-	closed := c.closed
-	c.readMu.Unlock()
-	if closed {
-		return 0, ErrTunnelClosed
+	if len(buf) == 0 {
+		return 0, nil
 	}
-	if len(c.pump.buffered) > 0 {
-		n := copy(buf, c.pump.buffered)
-		c.pump.buffered = c.pump.buffered[n:]
-		return n, nil
-	}
-	p := c.pump
-	select {
-	case payload, ok := <-p.ch:
+	c.bufferMu.Lock()
+	defer c.bufferMu.Unlock()
+	for len(c.buffered) == 0 {
+		payload, ok := <-c.pump.ch
 		if !ok {
-			p.readMu.Lock()
-			eof := p.eofRead
-			p.readMu.Unlock()
-			if eof {
-				return 0, io.EOF
-			}
-			return 0, ErrTunnelClosed
+			c.pump.mu.Lock()
+			defer c.pump.mu.Unlock()
+			return 0, c.pump.err
 		}
-		n := copy(buf, payload)
-		return n, nil
-	case err := <-p.errCh:
-		return 0, err
+		c.buffered = payload
 	}
+	n := copy(buf, c.buffered)
+	c.buffered = c.buffered[n:]
+	return n, nil
 }
 
 func (c *tunnelConn) Write(buf []byte) (int, error) {
@@ -315,16 +306,17 @@ func (c *tunnelConn) Write(buf []byte) (int, error) {
 	if closed {
 		return 0, ErrTunnelClosed
 	}
-	for len(buf) > MaxFrameBytes {
-		if err := c.tunnel.writeFrame(FrameData, c.pump.id, buf[:MaxFrameBytes]); err != nil {
-			return 0, err
+	total := 0
+	for len(buf) > 0 {
+		size := min(len(buf), MaxFrameBytes)
+		if err := c.tunnel.writeFrame(FrameData, c.pump.id, buf[:size]); err != nil {
+			c.tunnel.remove()
+			return total, err
 		}
-		buf = buf[MaxFrameBytes:]
+		total += size
+		buf = buf[size:]
 	}
-	if err := c.tunnel.writeFrame(FrameData, c.pump.id, buf); err != nil {
-		return 0, err
-	}
-	return len(buf), nil
+	return total, nil
 }
 
 func (c *tunnelConn) Close() error {
@@ -337,18 +329,17 @@ func (c *tunnelConn) Close() error {
 	c.readMu.Unlock()
 	c.tunnel.streams.Delete(c.pump.id)
 	c.tunnel.sendClose(c.pump.id, "closed by coordinator")
-	c.pump.shutdown(nil)
+	c.pump.shutdown(ErrTunnelClosed)
 	return nil
 }
 
 func (c *tunnelConn) LocalAddr() net.Addr  { return pipeAddr("tunnel-local") }
 func (c *tunnelConn) RemoteAddr() net.Addr { return pipeAddr("tunnel-worker:" + c.tunnel.WorkerID) }
 func (c *tunnelConn) SetDeadline(t time.Time) error {
-	c.tunnel.conn.SetWriteDeadline(t)
-	return nil
+	return errors.ErrUnsupported
 }
-func (c *tunnelConn) SetReadDeadline(t time.Time) error  { return nil }
-func (c *tunnelConn) SetWriteDeadline(t time.Time) error { return nil }
+func (c *tunnelConn) SetReadDeadline(t time.Time) error  { return errors.ErrUnsupported }
+func (c *tunnelConn) SetWriteDeadline(t time.Time) error { return errors.ErrUnsupported }
 
 type pipeAddr string
 
@@ -360,7 +351,6 @@ func NewTunnel(workerID string, conn net.Conn, onRemove func()) *Tunnel {
 	return &Tunnel{
 		WorkerID: workerID,
 		conn:     conn,
-		lastPong: time.Now(),
 		onRemove: onRemove,
 	}
 }
@@ -403,4 +393,11 @@ func (h *Hub) Get(workerID string) *Tunnel {
 		return nil
 	}
 	return tunnel
+}
+
+// Disconnect closes the current tunnel and all of its streams.
+func (h *Hub) Disconnect(workerID string) {
+	if tunnel := h.Get(workerID); tunnel != nil {
+		tunnel.remove()
+	}
 }

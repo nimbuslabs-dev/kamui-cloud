@@ -39,13 +39,14 @@ type servicesHandler struct {
 	ids     *identity.Store
 	engine  *core.Engine
 	hub     *routing.Hub
+	routes  *runtime.Store
 }
 
 func newServicesHandler(objects *objectstore.Store, backups *backup.Store, train *ml.TrainStore,
-	infer *ml.InferStore, opsStore *ops.Store, dropStore *drop.Store, ids *identity.Store, engine *core.Engine, hub *routing.Hub) *servicesHandler {
+	infer *ml.InferStore, opsStore *ops.Store, dropStore *drop.Store, ids *identity.Store, engine *core.Engine, hub *routing.Hub, routes *runtime.Store) *servicesHandler {
 	return &servicesHandler{
 		objects: objects, backups: backups, train: train, infer: infer,
-		ops: opsStore, drop: dropStore, ids: ids, engine: engine, hub: hub,
+		ops: opsStore, drop: dropStore, ids: ids, engine: engine, hub: hub, routes: routes,
 	}
 }
 
@@ -81,8 +82,10 @@ func (h *servicesHandler) register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/projects/{id}/inference", h.ListInferServices)
 	mux.HandleFunc("GET /v1/projects/{id}/inference/{svc}", h.GetInferService)
 	mux.HandleFunc("POST /v1/projects/{id}/inference/{svc}/stop", h.StopInferService)
-	mux.HandleFunc("POST /v1/projects/{id}/inference/{svc}/proxy/", h.ProxyInference)
-	mux.HandleFunc("POST /v1/projects/{id}/inference/{svc}/proxy", h.ProxyInference)
+	for _, method := range []string{"GET", "POST"} {
+		mux.HandleFunc(method+" /v1/projects/{id}/inference/{svc}/proxy/{path...}", h.ProxyInference)
+		mux.HandleFunc(method+" /v1/projects/{id}/inference/{svc}/proxy", h.ProxyInference)
+	}
 	// SRE / collaboration
 	mux.HandleFunc("PUT /v1/projects/{id}/quotas", h.SetQuota)
 	mux.HandleFunc("GET /v1/projects/{id}/quotas", h.GetQuota)
@@ -819,31 +822,49 @@ func (h *servicesHandler) ProxyInference(w http.ResponseWriter, r *http.Request)
 		servicesError(w, err)
 		return
 	}
-	if h.engine == nil {
-		apierr.WriteError(w, http.StatusServiceUnavailable, "proxy_unavailable", "inference proxy requires the core executor")
+	if h.engine == nil || h.routes == nil {
+		apierr.WriteError(w, http.StatusServiceUnavailable, "proxy_unavailable", "service routing is unavailable")
 		return
 	}
-	routeStore, ok := h.engine.Executor.(routeStoreGetter)
-	if !ok {
-		apierr.WriteError(w, http.StatusServiceUnavailable, "proxy_unavailable", "inference routing requires the runtime route registry")
+	route, err := h.routes.RouteLookup(r.Context(), svc.WorkloadID)
+	if err != nil || route.ProjectID != projectID {
+		apierr.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "the inference service has no live route")
 		return
 	}
-	route, err := routeStore.RouteLookup(r.Context(), svc.WorkloadID)
-	if err != nil {
-		apierr.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "the inference service has no live route yet")
+	item, err := h.engine.Repo.Get(r.Context(), svc.WorkloadID)
+	if err != nil || !liveServiceRoute(route, item, time.Now()) {
+		apierr.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "the service assignment is no longer live")
 		return
 	}
-	resolver, ok := h.engine.Executor.(ContainerResolver)
-	if !ok {
-		apierr.WriteError(w, http.StatusServiceUnavailable, "proxy_unavailable", "service routing requires a shared local Docker daemon")
-		return
+	transport := &http.Transport{DisableKeepAlives: true, ResponseHeaderTimeout: 60 * time.Second}
+	host := "kamui-service"
+	if route.WorkerID == core.LocalWorker {
+		resolver, ok := h.engine.Executor.(ContainerResolver)
+		if !ok {
+			apierr.WriteError(w, http.StatusServiceUnavailable, "proxy_unavailable", "local service resolver is unavailable")
+			return
+		}
+		addr, err := resolver.ContainerServiceAddress(r.Context(), route.WorkloadID, route.Attempt)
+		if err != nil {
+			apierr.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "local service is unreachable")
+			return
+		}
+		host = net.JoinHostPort(addr, strconv.Itoa(route.Port))
+	} else {
+		if h.hub == nil || h.hub.Get(route.WorkerID) == nil {
+			apierr.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "the assigned worker has no live tunnel")
+			return
+		}
+		transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			tunnel := h.hub.Get(route.WorkerID)
+			if tunnel == nil {
+				return nil, routing.ErrTunnelClosed
+			}
+			return tunnel.DialContext(ctx, route.WorkloadID, route.Fence, route.Port)
+		}
 	}
-	addr, err := resolver.ContainerServiceAddress(r.Context(), route.WorkloadID, route.Attempt)
-	if err != nil {
-		apierr.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "the inference service container is not reachable from the coordinator")
-		return
-	}
-	proxyInference(w, r, addr, route.Port)
+	proxyService(w, r, host, transport)
+
 }
 
 // --- SRE / collaboration --------------------------------------------------------------
@@ -1096,19 +1117,40 @@ func timeFromSeconds(seconds int) time.Duration {
 // strings_ToKey reassembles a wildcard path parameter into an object key.
 func strings_ToKey(raw string) string { return raw }
 
-// proxyInference streams a request to an inference service container.
-func proxyInference(w http.ResponseWriter, r *http.Request, addr string, port int) {
-	target := &url.URL{Scheme: "http", Host: net.JoinHostPort(addr, strconv.Itoa(port))}
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	proxy.FlushInterval = -1
+func liveServiceRoute(route runtime.ServiceRoute, item core.Workload, now time.Time) bool {
+	a := item.Assignment
+	return item.State == core.Running && item.ProjectID == route.ProjectID && item.ID == route.WorkloadID &&
+		a != nil && a.WorkerID == route.WorkerID && item.Attempt == route.Attempt && a.Fence == route.Fence &&
+		a.LeaseUntil.After(now) && route.ExpiresAt.After(now)
+}
+
+func proxyService(w http.ResponseWriter, r *http.Request, host string, transport http.RoundTripper) {
+	proxy := &httputil.ReverseProxy{
+		Transport:     transport,
+		FlushInterval: -1,
+		Rewrite: func(req *httputil.ProxyRequest) {
+			req.SetURL(&url.URL{Scheme: "http", Host: host})
+			req.Out.URL.Path = "/" + req.In.PathValue("path")
+			req.Out.URL.RawPath = ""
+			req.Out.Header.Del("Authorization")
+			req.Out.Header.Del("Cookie")
+			req.Out.Header.Del("X-Kamui-Token")
+		},
+		ModifyResponse: func(res *http.Response) error {
+			res.Header.Del("Set-Cookie")
+			res.Header.Set("Cache-Control", "no-store")
+			return nil
+		},
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
+			apierr.WriteError(w, http.StatusBadGateway, "service_unavailable", "the service upstream could not complete the request")
+		},
+	}
+	if r.Header.Get("Upgrade") != "" {
+		apierr.WriteError(w, http.StatusBadRequest, "invalid_request", "this service route does not support upgrades")
+		return
+	}
 	proxy.ServeHTTP(w, r)
 }
-
-// routeStoreGetter is implemented by the runtime store to resolve live routes.
-type routeStoreGetter interface {
-	RouteLookup(ctx context.Context, workloadID string) (runtime.ServiceRoute, error)
-}
-
 func (h *servicesHandler) requirePrincipal(w http.ResponseWriter, r *http.Request) (identity.Principal, bool) {
 	if h.ids == nil {
 		return auth.OperatorPrincipal(), true

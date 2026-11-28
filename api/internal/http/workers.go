@@ -178,7 +178,11 @@ func (h *workerHandler) tunnel(w http.ResponseWriter, r *http.Request) {
 	}
 	// Complete the HTTP upgrade on the raw connection.
 	rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: kamui-tunnel\r\nConnection: Upgrade\r\n\r\n")
-	rw.Flush()
+	if err := rw.Flush(); err != nil {
+		_ = conn.Close()
+		return
+	}
+	_ = conn.SetDeadline(time.Time{})
 	var tunnel *routing.Tunnel
 	tunnel = routing.NewTunnel(workerID, conn, func() { h.hub.Remove(workerID, tunnel) })
 	h.hub.Register(tunnel)
@@ -361,10 +365,15 @@ func (h *workerHandler) report(w http.ResponseWriter, r *http.Request) {
 			coreError(w, err)
 			return
 		}
-		if item.Assignment == nil || item.Assignment.WorkerID != workerID ||
+		if item.Assignment == nil || item.Assignment.WorkerID != workerID || !item.Assignment.LeaseUntil.After(time.Now()) ||
 			item.Assignment.Fence == "" || item.Assignment.Fence != input.Fence ||
 			item.State.Terminal() || item.State == core.Stopping {
 			apierr.WriteError(w, http.StatusConflict, "stale_assignment", "this assignment is no longer current")
+			return
+		}
+		check := item.Submission.HealthCheck
+		if item.Submission.Kind != "service" || check == nil || check.Port != input.Port {
+			apierr.WriteError(w, http.StatusBadRequest, "invalid_request", "route port must match the service readiness port")
 			return
 		}
 		kind := "http"
@@ -601,6 +610,9 @@ func (h *workerHandler) setWorkerStatus(status string) http.HandlerFunc {
 			slog.Warn("set worker status", "error", err)
 			apierr.WriteError(w, http.StatusServiceUnavailable, "workers_unavailable", "workers are temporarily unavailable")
 			return
+		}
+		if (status == core.WorkerStateRevoked || status == core.WorkerStateDisabled) && h.hub != nil {
+			h.hub.Disconnect(info.ID)
 		}
 		if h.ids != nil {
 			_ = h.ids.RecordAudit(r.Context(), p.User.ID, "", "worker."+status, "worker", info.ID, "success", info.Name)

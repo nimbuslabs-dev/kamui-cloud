@@ -83,9 +83,25 @@
 | Drop transfer: approval-gated download with checksum match | ✅ |
 | Quota set + usage snapshot | ✅ |
 
+## Remote inference routing checkpoint
+
+The agent opens the worker protocol HTTP/1.1 upgrade over verified HTTPS,
+using the same `--ca-file` as enrollment. The worker-access proxy must forward
+`Connection: Upgrade` and `Upgrade: kamui-tunnel` on the authenticated
+`/v1/workers/{id}/tunnel` endpoint and permit persistent connections. The
+public Console ingress stays unchanged. The worker must be able to reach
+the container IP on its own Docker daemon's project network.
+
+The coordinator authorizes the project and matches the route to the
+running attempt, fence and lease. The agent dials only its active healthy
+assignment's readiness port. Routes expire unless refreshed by readiness
+probes. Requests omit coordinator credentials. The loopback CLI ingress
+forwards the inference proxy only. For JSON endpoints, use
+`kamui-cloud infer request SERVICE --method GET --path /v1/models`.
+
 ## Known limitations and BLOCKED items
 
-1. Remote-worker service routing (proxy) is same-daemon only — BLOCKED.
+1. Inference GET/POST proxying now uses the outbound worker service tunnel. Tests cover framed HTTP and fence rejection. A separate-host Docker run over TLS remains BLOCKED pending a reachable worker test deployment. Workspace IDE and Deploy HTTP routes and Workspace idle shutdown remain open.
 2. Remote worker output registration is PARTIAL: the agent stages outputs
    locally; `/collect` covers local-executor workloads.
 3. Real model serving (Infer) needs an actual model runtime/model — BLOCKED

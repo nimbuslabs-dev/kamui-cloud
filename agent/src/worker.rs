@@ -4,7 +4,7 @@
 use crate::capabilities;
 use crate::client::{AssignmentEnvelope, Coordinator, HealthCheck, Heartbeat, ReportBody, Telemetry};
 use crate::docker::{self, RunSpec};
-use crate::tunnel::{TunnelClient, TrackedSnapshot};
+use crate::tunnel;
 use crate::state::{self, WorkerState};
 use crate::telemetry::Sampler;
 use serde_json::json;
@@ -75,7 +75,7 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
     };
     let coordinator = Coordinator::new(&state.coordinator, &state.worker_token, ca_file.as_deref())?;
     println!("worker {} started; coordinator {}", state.worker_id, state.coordinator);
-    WorkerLoop::new(state, coordinator)?.run()
+    WorkerLoop::new(state, coordinator)?.run(ca_file)
 }
 
 impl WorkerLoop {
@@ -92,7 +92,7 @@ impl WorkerLoop {
         })
     }
 
-    fn run(mut self) -> Result<(), String> {
+    fn run(mut self, ca_file: Option<PathBuf>) -> Result<(), String> {
         let running = Arc::clone(&self.running);
         let _ = ctrlc::set_handler(move || {
             running.store(false, Ordering::SeqCst);
@@ -105,21 +105,21 @@ impl WorkerLoop {
 
         // Remote service routing: an outbound authenticated tunnel that the
         // coordinator uses to reach this worker's live service routes.
-        let tunnel_client = TunnelClient::new(
-            self.state.clone(),
-            Arc::clone(&self.running),
-            Arc::clone(&self.tracked_snapshot()),
-        );
-        {
-            let tracked = self.tracked.lock().expect("tracked assignments");
-            let snapshot: std::collections::HashMap<String, (i64, String)> = tracked
-                .iter()
-                .map(|(id, t)| (id.clone(), (t.attempt, t.fence.clone())))
-                .collect();
-            drop(tracked);
-            tunnel_client.update_assignments(&snapshot);
-        }
-        thread::spawn(move || tunnel_client.run());
+        let tracked = Arc::clone(&self.tracked);
+        let state = self.state.clone();
+        let running = Arc::clone(&self.running);
+        thread::spawn(move || {
+            let assignment: tunnel::Assignment = Arc::new(move |id, fence, port| {
+                let active = tracked.lock().ok()?;
+                let item = active.get(id)?;
+                let check = item.envelope.as_ref()?.health_check.as_ref()?;
+                (item.fence == fence && item.ready_reported && check.port == i64::from(port))
+                    .then_some(item.attempt)
+            });
+            if let Err(error) = tunnel::run(state, ca_file.as_deref(), running, assignment) {
+                eprintln!("service tunnel unavailable: {error}");
+            }
+        });
 
         let mut backoff = POLL_INTERVAL;
         while self.running.load(Ordering::SeqCst) {
@@ -376,7 +376,6 @@ impl WorkerLoop {
             String,
             bool,
             Instant,
-            bool,
             Instant,
             Option<AssignmentEnvelope>,
         );
@@ -391,14 +390,13 @@ impl WorkerLoop {
                         t.fence.clone(),
                         t.running_reported,
                         t.last_renew,
-                        t.ready_reported,
                         t.last_health_probe,
                         t.envelope.clone(),
                     )
                 })
                 .collect()
         };
-        for (workload_id, attempt, fence, running_reported, last_renew, ready_reported, last_health_probe, tracked_envelope) in snapshot {
+        for (workload_id, attempt, fence, running_reported, last_renew, last_health_probe, tracked_envelope) in snapshot {
             match docker::inspect(&workload_id, attempt) {
                 Some(state) if state.status == "running" || state.status == "created" => {
                     let now = Instant::now();
@@ -434,10 +432,11 @@ impl WorkerLoop {
                                 if let Some(t) = self.tracked.lock().expect("tracked assignments").get_mut(&workload_id) {
                                     t.last_health_probe = now;
                                 }
-                                if !ready_reported && docker::probe_readiness(&workload_id, attempt, check) {
-                                    if let Some(t) = self.tracked.lock().expect("tracked assignments").get_mut(&workload_id) {
-                                        t.ready_reported = true;
-                                    }
+                                let ready = docker::probe_readiness(&workload_id, attempt, check);
+                                if let Some(t) = self.tracked.lock().expect("tracked assignments").get_mut(&workload_id) {
+                                    t.ready_reported = ready;
+                                }
+                                if ready {
                                     self.queue_report(QueuedReport {
                                         workload_id: workload_id.clone(),
                                         fence: fence.clone(),
@@ -536,9 +535,6 @@ impl WorkerLoop {
         }
     }
 
-    fn tracked_snapshot(&self) -> Arc<Mutex<HashMap<String, TrackedSnapshot>>> {
-        Arc::new(Mutex::new(HashMap::new()))
-    }
 
     fn mark_renewed(&self, workload_id: &str) {
         if let Some(tracked) = self
