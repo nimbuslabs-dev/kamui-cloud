@@ -169,7 +169,11 @@ func (s *Store) CreateBucket(ctx context.Context, projectID, name, actor string)
 }
 
 func (s *Store) ListBuckets(ctx context.Context, projectID string) ([]Bucket, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT id,project_id,name,created_at FROM buckets WHERE project_id=? ORDER BY name", projectID)
+	return s.ListBucketsLimit(ctx, projectID, -1)
+}
+
+func (s *Store) ListBucketsLimit(ctx context.Context, projectID string, limit int) ([]Bucket, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT id,project_id,name,created_at FROM buckets WHERE project_id=? ORDER BY name LIMIT ?", projectID, limit)
 	if err != nil {
 		return nil, err
 	}

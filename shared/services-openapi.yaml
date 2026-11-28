@@ -95,6 +95,18 @@ paths:
       responses:
         '200': { description: Project buckets }
         default: { $ref: '#/components/responses/Error' }
+  /v1/projects/{id}/buckets/{bucket}/objects:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: bucket, in: path, required: true, description: Bucket name, schema: { type: string } }
+    get:
+      operationId: listObjects
+      parameters:
+        - { name: after, in: query, description: Return keys after this key, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer } }
+      responses:
+        '200': { description: Object metadata ordered by key }
+        default: { $ref: '#/components/responses/Error' }
   /v1/projects/{id}/buckets/{bucket}/objects/{key}:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }
@@ -131,6 +143,40 @@ paths:
       responses:
         '201': { description: Backup record, content: { application/json: { schema: { $ref: '#/components/schemas/Backup' } } } }
         default: { $ref: '#/components/responses/Error' }
+  /v1/projects/{id}/backups/objects:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: createObjectBackup
+      description: Creates a checksum-verified archive of the project's stored objects. Requires project workload write permission.
+      responses:
+        '201': { description: Backup record, content: { application/json: { schema: { $ref: '#/components/schemas/Backup' } } } }
+        '429': { description: Another project backup or restore is in progress }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/projects/{id}/backups/volume:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      operationId: createVolumeBackup
+      description: >-
+        Backs up a project-scoped managed volume on its registered local Docker engine.
+        Stop workloads using the volume before the backup. Requires project workload write permission.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [volume]
+              properties:
+                volume: { type: string, description: Logical name of the managed volume }
+      responses:
+        '201': { description: Backup record, content: { application/json: { schema: { $ref: '#/components/schemas/Backup' } } } }
+        '404': { description: Managed volume does not exist in the project }
+        '409': { description: Volume is in use or the recorded storage locality is unavailable }
+        '429': { description: Another project backup or restore is in progress }
+        '501': { description: No managed-volume adapter is configured }
+        default: { $ref: '#/components/responses/Error' }
   /v1/backups:
     get:
       operationId: listBackups
@@ -163,11 +209,61 @@ paths:
       - { $ref: '#/components/parameters/BackupProject' }
     post:
       operationId: restoreBackup
-      description: Exports a verified metadata snapshot or object archive into a server-generated directory. The response location is relative to the coordinator storage root. Object-store import and Docker volume restore remain unsupported.
+      description: >-
+        Coordinator metadata produces a verified export for system administrators.
+        For a project backup, the default publishes new buckets on the local object backend or
+        a new managed volume on its recorded local Docker engine. The coordinator generates all
+        destination identifiers, verifies restored bytes and preserves existing project storage.
+        Project restores require workload write permission. Object archives also support isolated
+        filesystem export. Export paths are relative to the coordinator storage root.
+      parameters:
+        - name: mode
+          in: query
+          description: Export an object archive into coordinator storage without importing into project buckets.
+          schema: { type: string, enum: [export] }
       responses:
-        '200': { description: Isolated export published }
+        '200':
+          description: Verified export or completed project restore
+          headers:
+            X-Kamui-Restore-ID:
+              description: Durable operation ID when a project import or volume restore was started. The server also returns it if that operation fails.
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/BackupExport'
+                  - $ref: '#/components/schemas/BackupRestore'
         '404': { description: Backup does not exist in the authorized scope }
-        '501': { description: Managed volume restore is unavailable }
+        '409': { description: Recorded storage locality is unavailable or destination conflicts }
+        '429': { description: Another project backup or restore is in progress }
+        '501': { description: Restore adapter is unavailable for the configured backend }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/backups/{bck}/restores:
+    parameters:
+      - { name: bck, in: path, required: true, schema: { type: string } }
+      - { name: project_id, in: query, required: true, schema: { type: string } }
+    get:
+      operationId: listBackupRestores
+      description: Lists the latest 50 durable restore operations, newest first. Requires project workload read permission.
+      responses:
+        '200':
+          description: Project restore operations for the backup
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/BackupRestore' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/backup-restores/{restore}:
+    parameters:
+      - { name: restore, in: path, required: true, schema: { type: string } }
+      - { name: project_id, in: query, required: true, schema: { type: string } }
+    get:
+      operationId: getBackupRestore
+      description: Inspects a durable restore operation. Requires project workload read permission.
+      responses:
+        '200': { description: Restore operation, content: { application/json: { schema: { $ref: '#/components/schemas/BackupRestore' } } } }
         default: { $ref: '#/components/responses/Error' }
   /v1/projects/{id}/deployments:
     parameters:
@@ -599,6 +695,38 @@ components:
         size_bytes: { type: integer, format: int64 }
         checksum: { type: string }
         created_at: { type: string, format: date-time }
+    BackupExport:
+      type: object
+      required: [restored_to]
+      properties:
+        restored_to: { type: string, description: Path relative to the coordinator storage root }
+    BackupRestore:
+      type: object
+      required: [id, backup_id, project_id, kind, status]
+      properties:
+        id: { type: string }
+        backup_id: { type: string }
+        project_id: { type: string }
+        kind: { type: string, enum: [objects, volume] }
+        status: { type: string, enum: [in_progress, succeeded, failed] }
+        reason: { type: string }
+        result:
+          description: Published destination when the operation succeeds
+          oneOf:
+            - type: array
+              items:
+                type: object
+                required: [source_bucket, name, id, object_count]
+                properties:
+                  source_bucket: { type: string }
+                  name: { type: string }
+                  id: { type: string }
+                  object_count: { type: integer, minimum: 0 }
+            - type: object
+              required: [volume, worker_id]
+              properties:
+                volume: { type: string, description: Logical name attachable by workloads in the project }
+                worker_id: { type: string }
     Database:
       type: object
       required: [id, project_id, name, engine, state, created_at]

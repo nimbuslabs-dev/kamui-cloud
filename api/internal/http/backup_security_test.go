@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/backup"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/core"
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/identity"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/objectstore"
 )
 
 func TestBackupProjectIsolation(t *testing.T) {
@@ -36,6 +38,7 @@ func TestBackupProjectIsolation(t *testing.T) {
 	alice, aliceProject := makeUser("alice")
 	bob, bobProject := makeUser("bob")
 	backups := backup.NewStore(coreStore.DB(), ids, root, nil)
+	backups.UseObjectStore(objectstore.NewStore(coreStore.DB(), &objectstore.LocalBackend{Root: root}, nil, nil))
 	bobBackup, err := backups.CreateObjectBackup(ctx, bobProject, bob.User.ID, nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -72,5 +75,32 @@ func TestBackupProjectIsolation(t *testing.T) {
 	list := call(alice, "GET", "/v1/backups?project_id="+aliceProject, "", handler.ListBackups)
 	if list.Code != http.StatusOK || strings.TrimSpace(list.Body.String()) != "[]" {
 		t.Errorf("project list = %d: %s", list.Code, list.Body.String())
+	}
+	restore := call(bob, "POST", "/v1/backups/"+bobBackup.ID+"/restore?project_id="+bobProject, bobBackup.ID, handler.RestoreBackup)
+	var op backup.Restore
+	if err := json.Unmarshal(restore.Body.Bytes(), &op); err != nil || restore.Code != http.StatusOK || op.Status != "succeeded" || restore.Header().Get("X-Kamui-Restore-ID") != op.ID {
+		t.Fatalf("owner restore = %d: %s, %v", restore.Code, restore.Body.String(), err)
+	}
+	mux := http.NewServeMux()
+	handler.register(mux)
+	for _, tc := range []struct {
+		principal identity.Principal
+		project   string
+		want      int
+	}{
+		{bob, bobProject, http.StatusOK},
+		{alice, aliceProject, http.StatusNotFound},
+		{alice, bobProject, http.StatusForbidden},
+	} {
+		for _, path := range []string{"/v1/backup-restores/" + op.ID, "/v1/backups/" + bobBackup.ID + "/restores"} {
+			got := call(tc.principal, "GET", path+"?project_id="+tc.project, "", mux.ServeHTTP)
+			if got.Code != tc.want {
+				t.Errorf("%s as %s = %d, want %d", path, tc.principal.User.ID, got.Code, tc.want)
+			}
+		}
+	}
+	export := call(bob, "POST", "/v1/backups/"+bobBackup.ID+"/restore?mode=export&project_id="+bobProject, bobBackup.ID, handler.RestoreBackup)
+	if export.Code != http.StatusOK || !strings.Contains(export.Body.String(), `"restored_to":"restores/restore-`) {
+		t.Fatalf("owner export = %d: %s", export.Code, export.Body.String())
 	}
 }

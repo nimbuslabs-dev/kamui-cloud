@@ -53,6 +53,9 @@ func openCore(ctx context.Context, cfg *config.Config) (*core.Engine, *identity.
 			return nil, nil, nil, nil, nil, nil, nil, nil, err
 		}
 		local.SetOutputRoot(storageRootFor(path))
+		if image := os.Getenv("KAMUI_BACKUP_HELPER_IMAGE"); image != "" {
+			local.SetBackupHelperImage(image)
+		}
 		executor = local
 		probe = hostProbe(path)
 	case "manager":
@@ -149,7 +152,13 @@ func openCore(ctx context.Context, cfg *config.Config) (*core.Engine, *identity.
 		})
 	trainStore := ml.NewTrainStore(store.DB(), store, runtimeStore)
 	inferStore := ml.NewInferStore(store.DB(), store)
-	backupStore := backup.NewStore(store.DB(), idStore, storageRoot, nil)
+	volumeBackend, _ := executor.(backup.VolumeBackend)
+	backupStore := backup.NewStore(store.DB(), idStore, storageRoot, volumeBackend)
+	backupStore.UseObjectStore(objects)
+	if err := backupStore.RecoverInterrupted(ctx); err != nil {
+		cleanup()
+		return nil, nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("recover interrupted restores: %w", err)
+	}
 	dropStore := drop.NewStore(store.DB(), storageRoot)
 	services := &httpapi.ServiceStores{
 		Objects: objects, Backups: backupStore, Train: trainStore, Infer: inferStore,

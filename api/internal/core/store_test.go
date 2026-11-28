@@ -2,10 +2,61 @@ package core
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
 )
+
+func TestUpgradeV6RemembersUnverifiedVolumeNames(t *testing.T) {
+	ctx := t.Context()
+	path := filepath.Join(t.TempDir(), "core.sqlite")
+	old, err := openDB(path, "_pragma=foreign_keys(0)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer old.Close()
+	for _, schema := range []string{schema001, schema002, schema003, schema004, schema005, schema006, "PRAGMA user_version=6"} {
+		if _, err := old.Exec(schema); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err = old.Exec(`INSERT INTO workloads(id,project_id,idempotency_key,fingerprint,state,created_at,revision,snapshot)
+		VALUES ('old-running','default','r','fp','RUNNING',1,1,'{"id":"old-running","state":"RUNNING","attempt":1,"assignment":{"worker_id":"local","runtime_id":"historic-engine"},"submission":{"volumes":[{"name":"established","size_bytes":64},{"name":"pinned","size_bytes":128}]}}'),
+		       ('old-pending','default','p','fp','PENDING',1,1,'{"id":"old-pending","state":"PENDING","attempt":0,"submission":{"volumes":[{"name":"new-volume"}]}}');
+		INSERT INTO volume_placements(project_id,name,worker_id,size_bytes,created_at)
+		VALUES ('default','pinned','old-worker',32,1)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatal(err)
+	}
+	current, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer current.Close()
+	for _, expected := range []struct {
+		name, owner string
+		size        int64
+	}{{"established", "legacy-unverified", 64}, {"pinned", "old-worker", 32}} {
+		var owner, engine string
+		var size int64
+		err := current.db.QueryRow(`SELECT worker_id,engine_id,size_bytes FROM volume_placements WHERE project_id='default' AND name=?`, expected.name).Scan(&owner, &engine, &size)
+		if err != nil || owner != expected.owner || engine != "" || size != expected.size {
+			t.Errorf("placement for %s = %s/%s (%d bytes), err = %v", expected.name, owner, engine, size, err)
+		}
+	}
+	err = current.db.QueryRow(`SELECT worker_id FROM volume_placements WHERE name='new-volume'`).Scan(new(string))
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("unattempted volume acquired a placement, err = %v", err)
+	}
+	w, err := current.Get(ctx, "old-running")
+	if err != nil || w.State != Running || w.Assignment == nil || w.Assignment.RuntimeID != "historic-engine" {
+		t.Fatalf("legacy workload changed during upgrade: %+v, err = %v", w, err)
+	}
+}
 
 func TestStoreReopenPreservesIdempotencyAndEvents(t *testing.T) {
 	ctx := context.Background()

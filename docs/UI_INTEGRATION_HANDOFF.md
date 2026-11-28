@@ -1,6 +1,6 @@
 # Kamui Cloud — Frontend Integration Handoff (Phase 16)
 
-**Audience:** the UI agent. Backend-only checkpoint `df82f4d` on
+**Audience:** the UI agent. Backend remediation on
 `feat/mobile-workspace-mvp`. This document maps every implemented service to
 its endpoints, permissions and lifecycle states. Contracts live in
 `shared/core-openapi.yaml` and `shared/services-openapi.yaml`; use those as
@@ -25,7 +25,7 @@ the schema source of truth — this file covers discovery, states and gaps.
 | Workers | `node join/list/inspect/approve/revoke/drain/enable/share` CLI; REST under `/v1/workers` | admin | Enrollment token shown once |
 | Deploy | `/v1/projects/{id}/deployments` + builds, revisions, release, rollback, logs, webhooks | workload:read/write | `GET {dep}` returns `{deployment, revisions, builds, runtime}` — runtime is the live workload snapshot |
 | Store | `/v1/projects/{id}/buckets`, `.../objects/{key}` (PUT raw bytes, GET raw bytes, `?metadata=true`) | workload:read/write | Downloads are raw bytes with `X-Checksum-Sha256`; use streaming fetch, not JSON |
-| Backup | `/v1/backups*`, project object backups, restore | Admin for metadata; project read or write permissions otherwise | Use `project_id` for project records. Restore returns a server-generated export path relative to storage. Object import and managed volume restore remain unavailable. |
+| Backup | `/v1/backups*`, `/v1/backup-restores/{restore}`, project backup creation | Admin for metadata and project read or write permissions otherwise | Send `project_id` for project records. Project restore publishes fresh buckets or a new volume and returns a durable operation. Metadata restore and object `mode=export` return `restored_to` relative to coordinator storage. |
 | Train | `/v1/projects/{id}/training`, `/collect`, `/metrics`; `/models` | workload:read/write | Metrics come only from the training process; empty until `POST /collect` |
 | Infer | `/v1/projects/{id}/inference`, `/stop`, `/proxy/*` | workload:read/write | Authenticated GET/POST via the current worker tunnel; separate-host acceptance pending |
 | Quotas/SRE | `/v1/projects/{id}/quotas` (PUT needs project:update), `/usage`, `/alerts`, `/v1/alerts/{alr}/events` | project:update for writes | Usage distinguishes allocated vs measured; measured may be null |
@@ -41,6 +41,7 @@ the schema source of truth — this file covers discovery, states and gaps.
 - Training: created → queued → running → succeeded / failed / cancelled.
 - Database: starting → running / unhealthy / failed / stopped.
 - Transfer: pending → approved → completed / rejected / cancelled / expired.
+- Project restore goes from `in_progress` to `succeeded` or `failed`. Inspection and list require project read access. If the restore call returns an error with `X-Kamui-Restore-ID`, use that ID to inspect the result. The list endpoint can recover the ID after a connection loss.
 
 ## Error handling
 
@@ -64,6 +65,7 @@ the CLI).
 4. Inference `restart` is stop + fresh deploy; no in-place restart.
 5. Live GitHub webhooks and Tailscale remain BLOCKED without credentials.
 6. Checkpoint resume returns HTTP 501 after ownership and integrity validation. Runtime-specific model loading is unverified.
+7. Object import requires the local backend. Managed volume backup requires an offline source on the original coordinator Docker engine and supports regular files and directories. Legacy raw volumes require operator migration.
 
 ## Examples (illustrative values, not live data)
 

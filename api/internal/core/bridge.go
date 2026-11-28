@@ -24,6 +24,9 @@ type bridgeInput struct {
 // BridgeHandler runs on the private Workspace Manager network, behind its bearer middleware.
 func BridgeHandler(executor Executor) http.Handler {
 	mux := http.NewServeMux()
+	if volumeBackend, ok := executor.(bridgeVolumeBackend); ok {
+		registerVolumeBridge(mux, volumeBackend)
+	}
 	mux.HandleFunc("POST /internal/core/docker/{operation}", func(w http.ResponseWriter, r *http.Request) {
 		d := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
 		d.DisallowUnknownFields()

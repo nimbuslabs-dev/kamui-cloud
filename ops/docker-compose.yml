@@ -38,8 +38,14 @@ services:
       DOCKER_HOST: unix:///var/run/docker.sock
       DOCKER_NETWORK_NAME: ${COMPOSE_PROJECT_NAME}-ide
       WORKSPACE_IMAGE: ${COMPOSE_PROJECT_NAME}-workspace:local
+      TMPDIR: /var/lib/kamui-backup-scratch
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      - type: volume
+        source: kamui-backup-scratch
+        target: /var/lib/kamui-backup-scratch
+        volume:
+          nocopy: true
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8082/healthz"]
       interval: 5s
@@ -169,6 +175,7 @@ services:
 
 volumes:
   kamui-api-data:
+  kamui-backup-scratch:
 
 networks:
   control:

@@ -57,7 +57,8 @@ type Engine struct {
 // the coordinator never recreates an empty volume on another worker.
 type VolumeDirectory interface {
 	VolumeOwner(ctx context.Context, projectID, name string) (string, error)
-	RecordVolumePlacement(ctx context.Context, projectID, name, workerID string, sizeBytes int64) error
+	RecordLocalVolumePlacement(ctx context.Context, projectID, name, engineID string, sizeBytes int64) error
+	VolumeEngine(ctx context.Context, projectID, name string) (string, error)
 }
 
 func newID() string {
@@ -240,6 +241,11 @@ func (e *Engine) reconcileCluster(ctx context.Context) {
 				holder, err := e.Volumes.VolumeOwner(ctx, w.ProjectID, volume.Name)
 				if err != nil {
 					e.Logger.Warn("read volume placement", "workload_id", w.ID, "error", err)
+					conflict = true
+					break
+				}
+				if holder == "" && restoreVolumeRE.MatchString(volume.Name) {
+					conflict = true
 					break
 				}
 				if holder != "" && owner != "" && holder != owner {
@@ -252,7 +258,7 @@ func (e *Engine) reconcileCluster(ctx context.Context) {
 			}
 			switch {
 			case conflict:
-				choice, reason, decision = "", "persistent volumes are pinned to different workers; manual recovery required", PlacementDecision{Mode: submission.Placement, At: now, Candidates: []DecisionCandidate{}}
+				choice, reason, decision = "", "persistent volumes are unavailable, unpublished, or pinned to different workers", PlacementDecision{Mode: submission.Placement, At: now, Candidates: []DecisionCandidate{}}
 			case owner != "":
 				// Stateful workloads run only where their volumes live.
 				if submission.Placement == PlacementManual && submission.WorkerID != owner {
@@ -709,16 +715,48 @@ func (e *Engine) advance(ctx context.Context, w Workload, worker Worker, reserve
 			}
 			return e.Repo.Save(ctx, w, false)
 		case status.Exists:
+			if e.Volumes != nil && status.ManagedVolumes {
+				for _, volume := range w.Submission.Volumes {
+					holder, err := e.Volumes.VolumeOwner(ctx, w.ProjectID, volume.Name)
+					if err != nil {
+						return err
+					}
+					if holder != "" && holder != LocalWorker {
+						return errors.New("volume belongs to another worker")
+					}
+					if err := e.Volumes.RecordLocalVolumePlacement(ctx, w.ProjectID, volume.Name, w.Assignment.RuntimeID, volume.SizeBytes); err != nil {
+						return err
+					}
+				}
+			}
 			return e.Executor.Start(ctx, ref)
 		default:
 			r := w.Submission.Resources
 			bindings := make([]VolumeBinding, 0, len(w.Submission.Volumes))
 			for _, volume := range w.Submission.Volumes {
+				requireExisting := false
+				if e.Volumes != nil {
+					holder, err := e.Volumes.VolumeOwner(ctx, w.ProjectID, volume.Name)
+					if err != nil {
+						return err
+					}
+					if (holder != "" && holder != LocalWorker) || (holder == "" && restoreVolumeRE.MatchString(volume.Name)) {
+						return e.finish(ctx, w, Failed, "managed volume not available on the assigned worker", nil, "", false, false)
+					}
+					engineID, err := e.Volumes.VolumeEngine(ctx, w.ProjectID, volume.Name)
+					if err != nil {
+						return err
+					}
+					if holder == LocalWorker && engineID != w.Assignment.RuntimeID {
+						return e.finish(ctx, w, Failed, "managed volume Docker engine does not match the assignment or is unverified", nil, "", false, false)
+					}
+					requireExisting = holder == LocalWorker
+				}
 				target := volume.Target
 				if target == "" {
 					target = "/kamui/volumes/" + volume.Name
 				}
-				bindings = append(bindings, VolumeBinding{Name: volume.Name, Target: target})
+				bindings = append(bindings, VolumeBinding{Name: volume.Name, Target: target, RequireExisting: requireExisting})
 			}
 			networkName := ""
 			if !w.Submission.NetworkIsolated() && w.Submission.Network == "private" {
@@ -734,7 +772,7 @@ func (e *Engine) advance(ctx context.Context, w Workload, worker Worker, reserve
 			}
 			err := e.Executor.Create(ctx, ref, ContainerSpec{
 				Image: w.Submission.Image, Args: w.Submission.Args, CPUMillis: r.CPUMillis, MemoryBytes: r.MemoryBytes,
-				Env: env, Outputs: w.Submission.Outputs, Volumes: bindings,
+				Env: env, Outputs: w.Submission.Outputs, Volumes: bindings, ProjectID: w.ProjectID,
 				Network:   networkName,
 				RunAsUser: w.Submission.ManagedInfraUser(), ExtraTmpfs: w.Submission.ExtraTmpfs,
 				CapAdd: w.Submission.ManagedCaps,

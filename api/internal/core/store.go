@@ -36,7 +36,10 @@ var schema005 string
 //go:embed migrations/006.sql
 var schema006 string
 
-const LatestSchemaVersion = 6
+//go:embed migrations/007.sql
+var schema007 string
+
+const LatestSchemaVersion = 7
 
 type Repository interface {
 	EventReader
@@ -152,6 +155,7 @@ func (s *Store) migrate(ctx context.Context) (resultErr error) {
 		{4, schema004},
 		{5, schema005},
 		{6, schema006},
+		{7, schema007},
 	}
 	for _, migration := range migrations {
 		if version < migration.version {

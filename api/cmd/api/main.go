@@ -75,6 +75,9 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
+	cleanupDone := make(chan struct{})
+	go func() { defer close(cleanupDone); services.Backups.RunCleanup(ctx) }()
+	defer func() { stop(); <-cleanupDone }()
 	engineDone := make(chan struct{})
 	go func() { defer close(engineDone); engine.Run(ctx) }()
 	defer func() { stop(); <-engineDone }()

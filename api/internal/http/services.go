@@ -108,6 +108,8 @@ func (h *servicesHandler) register(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /v1/projects/{id}/databases/{db}", h.DeleteDatabase)
 	// Backup restore
 	mux.HandleFunc("POST /v1/backups/{bck}/restore", h.RestoreBackup)
+	mux.HandleFunc("GET /v1/backup-restores/{restore}", h.GetBackupRestore)
+	mux.HandleFunc("GET /v1/backups/{bck}/restores", h.ListBackupRestores)
 	// Drop
 	mux.HandleFunc("POST /v1/drop/transfers", h.CreateTransfer)
 	mux.HandleFunc("GET /v1/drop/transfers", h.ListTransfers)
@@ -136,20 +138,22 @@ func (h *servicesHandler) authorize(w http.ResponseWriter, r *http.Request, proj
 
 func servicesError(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, objectstore.ErrNotFound), errors.Is(err, backup.ErrNotFound),
+	case errors.Is(err, backup.ErrBusy):
+		apierr.WriteError(w, http.StatusTooManyRequests, "backup_busy", err.Error())
+	case errors.Is(err, core.ErrBackupVolumeNotFound), errors.Is(err, objectstore.ErrNotFound), errors.Is(err, backup.ErrNotFound),
 		errors.Is(err, ml.ErrNotFound), errors.Is(err, ops.ErrNotFound), errors.Is(err, drop.ErrNotFound):
 		apierr.WriteError(w, http.StatusNotFound, "not_found", "resource not found")
-	case errors.Is(err, objectstore.ErrConflict), errors.Is(err, ml.ErrConflict), errors.Is(err, drop.ErrConflict):
+	case errors.Is(err, backup.ErrConflict), errors.Is(err, core.ErrBackupVolumeConflict), errors.Is(err, core.ErrBackupVolumeLocality), errors.Is(err, objectstore.ErrConflict), errors.Is(err, ml.ErrConflict), errors.Is(err, drop.ErrConflict):
 		apierr.WriteError(w, http.StatusConflict, "conflict", err.Error())
 	case errors.Is(err, objectstore.ErrTooLarge), errors.Is(err, drop.ErrTooLarge), errors.Is(err, backup.ErrTooBig):
 		apierr.WriteError(w, http.StatusRequestEntityTooLarge, "too_large", err.Error())
-	case errors.Is(err, backup.ErrNotImplemented), errors.Is(err, ml.ErrResumeUnsupported):
+	case errors.Is(err, backup.ErrNotImplemented), errors.Is(err, objectstore.ErrBackupImportUnavailable), errors.Is(err, ml.ErrResumeUnsupported):
 		apierr.WriteError(w, http.StatusNotImplemented, "not_implemented", err.Error())
 	case errors.Is(err, objectstore.ErrQuota):
 		apierr.WriteError(w, http.StatusInsufficientStorage, "quota_exceeded", err.Error())
 	case errors.Is(err, backup.ErrForbidden), errors.Is(err, drop.ErrForbidden):
 		apierr.WriteError(w, http.StatusForbidden, "forbidden", err.Error())
-	case errors.Is(err, objectstore.ErrBadInput), errors.Is(err, backup.ErrBadInput),
+	case errors.Is(err, core.ErrBackupVolumeArchive), errors.Is(err, objectstore.ErrBadInput), errors.Is(err, backup.ErrBadInput),
 		errors.Is(err, ml.ErrBadInput), errors.Is(err, ops.ErrBadInput), errors.Is(err, drop.ErrBadInput):
 		apierr.WriteError(w, http.StatusBadRequest, "invalid_request", err.Error())
 	default:
@@ -355,38 +359,7 @@ func (h *servicesHandler) CreateObjectBackup(w http.ResponseWriter, r *http.Requ
 	if !ok {
 		return
 	}
-	buckets, err := h.objects.ListBuckets(r.Context(), projectID)
-	if err != nil {
-		servicesError(w, err)
-		return
-	}
-	var refs []backup.ObjectRef
-	bucketByName := make(map[string]objectstore.Bucket, len(buckets))
-	for _, bucket := range buckets {
-		bucketByName[bucket.Name] = bucket
-		for after := ""; ; {
-			objects, err := h.objects.ListObjects(r.Context(), bucket, after, 1000)
-			if err != nil {
-				servicesError(w, err)
-				return
-			}
-			if len(refs)+len(objects) > backup.MaxRestoreEntries {
-				servicesError(w, backup.ErrTooBig)
-				return
-			}
-			for _, object := range objects {
-				refs = append(refs, backup.ObjectRef{Bucket: bucket.Name, Key: object.Key, Size: object.SizeBytes})
-			}
-			if len(objects) < 1000 {
-				break
-			}
-			after = objects[len(objects)-1].Key
-		}
-	}
-	result, err := h.backups.CreateObjectBackup(r.Context(), projectID, p.User.ID, refs, func(ctx context.Context, ref backup.ObjectRef) (io.ReadCloser, error) {
-		reader, _, err := h.objects.OpenObject(ctx, bucketByName[ref.Bucket], ref.Key)
-		return reader, err
-	})
+	result, err := h.backups.CreateProjectObjectBackup(r.Context(), projectID, p.User.ID)
 	if err != nil {
 		servicesError(w, err)
 		return
@@ -1222,22 +1195,72 @@ func (h *servicesHandler) RestoreBackup(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 	}
-	var location string
-	switch record.Kind {
-	case "metadata":
-		location, err = h.backups.RestoreMetadata(r.Context(), p, id)
-	case "objects":
-		location, err = h.backups.RestoreObjectBackup(r.Context(), projectID, id)
-	case "volume":
-		err = h.backups.RestoreVolumeBackup(r.Context(), projectID, id)
-	default:
-		err = backup.ErrBadInput
+	mode := r.URL.Query().Get("mode")
+	if mode != "" && (mode != "export" || record.Kind == "volume") {
+		servicesError(w, backup.ErrBadInput)
+		return
+	}
+	if record.Kind == "objects" && mode == "export" {
+		location, err := h.backups.ExportObjectBackup(r.Context(), projectID, id)
+		if err != nil {
+			servicesError(w, err)
+			return
+		}
+		apierr.WriteJSON(w, http.StatusOK, map[string]string{"restored_to": location})
+		return
+	}
+	if record.Kind == "metadata" {
+		location, err := h.backups.RestoreMetadata(r.Context(), p, id)
+		if err != nil {
+			servicesError(w, err)
+			return
+		}
+		apierr.WriteJSON(w, http.StatusOK, map[string]string{"restored_to": location})
+		return
+	}
+	op, err := h.backups.RestoreProjectBackup(r.Context(), projectID, id, p.User.ID)
+	if op.ID != "" {
+		w.Header().Set("X-Kamui-Restore-ID", op.ID)
 	}
 	if err != nil {
 		servicesError(w, err)
 		return
 	}
-	apierr.WriteJSON(w, http.StatusOK, map[string]string{"restored_to": location})
+	apierr.WriteJSON(w, http.StatusOK, op)
+}
+
+func (h *servicesHandler) GetBackupRestore(w http.ResponseWriter, r *http.Request) {
+	projectID := r.URL.Query().Get("project_id")
+	if projectID == "" {
+		apierr.WriteError(w, http.StatusBadRequest, "invalid_request", "project_id is required")
+		return
+	}
+	if _, ok := h.authorize(w, r, projectID, identity.PermWorkloadRead); !ok {
+		return
+	}
+	op, err := h.backups.GetRestore(r.Context(), projectID, r.PathValue("restore"))
+	if err != nil {
+		servicesError(w, err)
+		return
+	}
+	apierr.WriteJSON(w, http.StatusOK, op)
+}
+
+func (h *servicesHandler) ListBackupRestores(w http.ResponseWriter, r *http.Request) {
+	projectID := r.URL.Query().Get("project_id")
+	if projectID == "" {
+		apierr.WriteError(w, http.StatusBadRequest, "invalid_request", "project_id is required")
+		return
+	}
+	if _, ok := h.authorize(w, r, projectID, identity.PermWorkloadRead); !ok {
+		return
+	}
+	result, err := h.backups.ListRestores(r.Context(), projectID, r.PathValue("bck"))
+	if err != nil {
+		servicesError(w, err)
+		return
+	}
+	apierr.WriteJSON(w, http.StatusOK, result)
 }
 
 // --- Drop -----------------------------------------------------------------------

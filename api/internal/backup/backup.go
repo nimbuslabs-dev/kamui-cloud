@@ -22,54 +22,60 @@ import (
 	"time"
 
 	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/identity"
+	"github.com/nimbuslabs-dev/kamui-cloud/api/internal/objectstore"
 )
 
 const (
 	MaxBackupBytes    = int64(8) << 30
 	MaxRestoreScan    = int64(8) << 30
 	MaxRestoreEntries = 10000
+	objectContentType = "KAMUI.content-type"
+	objectChecksum    = "KAMUI.checksum"
 )
 
 var (
 	ErrNotFound       = errors.New("backup not found")
 	ErrBadInput       = errors.New("invalid backup request")
-	ErrNotImplemented = errors.New("managed volume restore is unavailable")
+	ErrNotImplemented = errors.New("backup backend is unavailable for this operation")
+	ErrConflict       = errors.New("backup storage is not available at the recorded locality")
+	ErrBusy           = errors.New("backup operation limit reached")
 	ErrForbidden      = errors.New("coordinator metadata requires a system administrator")
 )
 
 type Store struct {
-	db        *sql.DB
-	ids       *identity.Store
-	root      string
-	volumeTar func(ctx context.Context, volume string, sink io.Writer) error
+	db      *sql.DB
+	root    string
+	volumes VolumeBackend
+	objects *objectstore.Store
+	active  chan struct{}
 }
 
-// NewStore wires the backup store. volumeTar streams one Docker volume as a
-// tar archive; the coordinator's workspace-manager path supplies it. A nil
-// volumeTar marks volume backups as unavailable rather than fake.
-func NewStore(db *sql.DB, ids *identity.Store, root string, volumeTar func(context.Context, string, io.Writer) error) *Store {
-	return &Store{db: db, ids: ids, root: root, volumeTar: volumeTar}
+func NewStore(db *sql.DB, _ *identity.Store, root string, volumes VolumeBackend) *Store {
+	return &Store{db: db, root: root, volumes: volumes, active: make(chan struct{}, 1)}
 }
+
+func (s *Store) UseObjectStore(objects *objectstore.Store) { s.objects = objects }
 
 type Backup struct {
-	ID         string     `json:"id"`
-	ProjectID  string     `json:"project_id"`
-	Kind       string     `json:"kind"`
-	Target     string     `json:"target"`
-	Status     string     `json:"status"`
-	Reason     string     `json:"reason,omitempty"`
-	SizeBytes  int64      `json:"size_bytes"`
-	Checksum   string     `json:"checksum,omitempty"`
-	CreatedBy  string     `json:"created_by"`
-	CreatedAt  time.Time  `json:"created_at"`
-	FinishedAt *time.Time `json:"finished_at,omitempty"`
+	ID            string     `json:"id"`
+	ProjectID     string     `json:"project_id"`
+	Kind          string     `json:"kind"`
+	Target        string     `json:"target"`
+	Status        string     `json:"status"`
+	Reason        string     `json:"reason,omitempty"`
+	SizeBytes     int64      `json:"size_bytes"`
+	Checksum      string     `json:"checksum,omitempty"`
+	CreatedBy     string     `json:"created_by"`
+	CreatedAt     time.Time  `json:"created_at"`
+	FinishedAt    *time.Time `json:"finished_at,omitempty"`
+	storageEngine string
 }
 
 func scanBackup(row interface{ Scan(...any) error }) (Backup, error) {
 	var b Backup
 	var createdAt, finished sql.NullInt64
 	if err := row.Scan(&b.ID, &b.ProjectID, &b.Kind, &b.Target, &b.Status, &b.Reason,
-		&b.SizeBytes, &b.Checksum, &b.CreatedBy, &createdAt, &finished); err != nil {
+		&b.SizeBytes, &b.Checksum, &b.CreatedBy, &createdAt, &finished, &b.storageEngine); err != nil {
 		return b, err
 	}
 	b.CreatedAt = time.Unix(0, createdAt.Int64).UTC()
@@ -80,7 +86,7 @@ func scanBackup(row interface{ Scan(...any) error }) (Backup, error) {
 	return b, nil
 }
 
-const backupColumns = "id,project_id,kind,target,status,reason,size_bytes,checksum,created_by,created_at,finished_at"
+const backupColumns = "id,project_id,kind,target,status,reason,size_bytes,checksum,created_by,created_at,finished_at,storage_engine_id"
 
 func (s *Store) backupPath(id string) (string, error) {
 	if len(id) < 8 || strings.ContainsAny(id, "/\\.") {
@@ -96,6 +102,13 @@ func (s *Store) backupPath(id string) (string, error) {
 // CreateMetadataBackup produces a consistent SQLite snapshot via VACUUM INTO,
 // which serializes a transactionally consistent image without touching the WAL.
 func (s *Store) CreateMetadataBackup(ctx context.Context, actor string) (Backup, error) {
+	release, err := s.acquire()
+	if err != nil {
+		return Backup{}, err
+	}
+	defer release()
+	ctx, cancel := context.WithTimeout(ctx, transferTimeout)
+	defer cancel()
 	id := newID("bck")
 	target := "coordinator-metadata"
 	record, err := s.recordStart(ctx, id, "", "metadata", target, actor)
@@ -115,6 +128,73 @@ func (s *Store) CreateMetadataBackup(ctx context.Context, actor string) (Backup,
 
 // CreateObjectBackup bundles one project's stored objects with their metadata.
 func (s *Store) CreateObjectBackup(ctx context.Context, projectID, actor string, objects []ObjectRef, openObject func(context.Context, ObjectRef) (io.ReadCloser, error)) (Backup, error) {
+	release, err := s.acquire()
+	if err != nil {
+		return Backup{}, err
+	}
+	defer release()
+	ctx, cancel := context.WithTimeout(ctx, transferTimeout)
+	defer cancel()
+	return s.createObjectBackup(ctx, projectID, actor, objects, openObject)
+}
+
+func (s *Store) CreateProjectObjectBackup(ctx context.Context, projectID, actor string) (Backup, error) {
+	if s.objects == nil {
+		return Backup{}, ErrNotImplemented
+	}
+	release, err := s.acquire()
+	if err != nil {
+		return Backup{}, err
+	}
+	defer release()
+	ctx, cancel := context.WithTimeout(ctx, transferTimeout)
+	defer cancel()
+	buckets, err := s.objects.ListBucketsLimit(ctx, projectID, MaxRestoreEntries+1)
+	if err != nil {
+		return Backup{}, err
+	}
+	if len(buckets) > MaxRestoreEntries {
+		return Backup{}, ErrTooBig
+	}
+	const pageSize = 100
+	var refs []ObjectRef
+	bucketByName := make(map[string]objectstore.Bucket, len(buckets))
+	for _, bucket := range buckets {
+		bucketByName[bucket.Name] = bucket
+		for after := ""; ; {
+			objects, err := s.objects.ListObjects(ctx, bucket, after, pageSize)
+			if err != nil {
+				return Backup{}, err
+			}
+			if after == "" && len(objects) == 0 {
+				refs = append(refs, ObjectRef{Bucket: bucket.Name})
+			}
+			if len(refs)+len(objects) > MaxRestoreEntries {
+				return Backup{}, ErrTooBig
+			}
+			for _, obj := range objects {
+				if !objectstore.ValidBackupContentType(obj.ContentType) {
+					return Backup{}, fmt.Errorf("%w: unsupported object content type", ErrBadInput)
+				}
+				refs = append(refs, ObjectRef{Bucket: bucket.Name, Key: obj.Key, Size: obj.SizeBytes, Checksum: obj.Checksum, ContentType: obj.ContentType})
+			}
+			if len(objects) < pageSize {
+				break
+			}
+			after = objects[len(objects)-1].Key
+		}
+	}
+	return s.createObjectBackup(ctx, projectID, actor, refs, func(ctx context.Context, ref ObjectRef) (io.ReadCloser, error) {
+		body, _, err := s.objects.OpenObject(ctx, bucketByName[ref.Bucket], ref.Key)
+		return body, err
+	})
+}
+
+func (s *Store) createObjectBackup(ctx context.Context, projectID, actor string, objects []ObjectRef, openObject func(context.Context, ObjectRef) (io.ReadCloser, error)) (Backup, error) {
+	limit, err := s.snapshotLimit(ctx, projectID)
+	if err != nil {
+		return Backup{}, err
+	}
 	id := newID("bck")
 	target := "objects:" + projectID
 	if projectID == "" || len(objects) > MaxRestoreEntries {
@@ -133,27 +213,44 @@ func (s *Store) CreateObjectBackup(ctx context.Context, projectID, actor string,
 		return record.failed(err), err
 	}
 	defer file.Close()
-	writer := tar.NewWriter(file)
+	writer := tar.NewWriter(&countingWriter{w: file, limit: limit})
 	var total int64
 	for _, ref := range objects {
+		if ref.Key == "" {
+			if err := writer.WriteHeader(&tar.Header{Name: ref.Bucket + "/", Typeflag: tar.TypeDir, Mode: 0700}); err != nil {
+				_ = os.Remove(path)
+				return record.failed(err), err
+			}
+			continue
+		}
+		if ref.Size < 0 || ref.Size > MaxBackupBytes-total {
+			_ = file.Close()
+			_ = os.Remove(path)
+			return record.failed(ErrTooBig), ErrTooBig
+		}
 		reader, err := openObject(ctx, ref)
 		if err != nil {
 			os.Remove(path)
 			return record.failed(err), err
 		}
 		header := &tar.Header{
-			Name:    ref.Bucket + "/" + ref.Key,
-			Mode:    0600,
-			Size:    ref.Size,
-			ModTime: time.Now().UTC(),
+			Name:       ref.Bucket + "/" + ref.Key,
+			Mode:       0600,
+			Size:       ref.Size,
+			ModTime:    time.Now().UTC(),
+			PAXRecords: map[string]string{objectContentType: ref.ContentType, objectChecksum: ref.Checksum},
 		}
 		if err := writer.WriteHeader(header); err != nil {
 			reader.Close()
 			os.Remove(path)
 			return record.failed(err), err
 		}
-		n, err := io.Copy(writer, io.LimitReader(reader, MaxBackupBytes-total+1))
-		reader.Close()
+		hash := sha256.New()
+		n, err := io.Copy(io.MultiWriter(writer, hash), io.LimitReader(contextReader{ctx, reader}, ref.Size+1))
+		err = errors.Join(err, reader.Close())
+		if err == nil && (n != ref.Size || (ref.Checksum != "" && "sha256:"+hex.EncodeToString(hash.Sum(nil)) != ref.Checksum)) {
+			err = fmt.Errorf("%w: source object changed during backup", ErrConflict)
+		}
 		total += n
 		if err != nil {
 			os.Remove(path)
@@ -179,53 +276,13 @@ func (s *Store) CreateObjectBackup(ctx context.Context, projectID, actor string,
 // ErrTooBig marks an oversized backup request.
 var ErrTooBig = errors.New("backup exceeds the size limit")
 
-// CreateVolumeBackup exports one Docker volume through the workspace-manager
-// path. Backups never write to external SSDs; blobs live on the storage root.
-func (s *Store) CreateVolumeBackup(ctx context.Context, projectID, volume, actor string) (Backup, error) {
-	if s.volumeTar == nil {
-		return Backup{}, fmt.Errorf("%w: volume backups require the workspace manager on this host", ErrBadInput)
-	}
-	if projectID == "" || !validVolumeName(volume) {
-		return Backup{}, fmt.Errorf("%w: invalid volume name", ErrBadInput)
-	}
-	id := newID("bck")
-	target := "volume:" + volume
-	record, err := s.recordStart(ctx, id, projectID, "volume", target, actor)
-	if err != nil {
-		return Backup{}, err
-	}
-	path, err := s.backupPath(id)
-	if err != nil {
-		return record.failed(err), err
-	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-	if err != nil {
-		return record.failed(err), err
-	}
-	defer file.Close()
-	counter := &countingWriter{w: file}
-	if err := s.volumeTar(ctx, volume, counter); err != nil {
-		os.Remove(path)
-		return record.failed(err), err
-	}
-	if counter.n > MaxBackupBytes {
-		os.Remove(path)
-		return record.failed(ErrTooBig), ErrTooBig
-	}
-	if err := file.Close(); err != nil {
-		_ = os.Remove(path)
-		return record.failed(err), err
-	}
-	return record.finalize(ctx, path)
-}
-
 type countingWriter struct {
-	w io.Writer
-	n int64
+	w        io.Writer
+	n, limit int64
 }
 
 func (c *countingWriter) Write(p []byte) (int, error) {
-	if int64(len(p)) > MaxBackupBytes-c.n {
+	if int64(len(p)) > c.limit-c.n {
 		return 0, ErrTooBig
 	}
 	n, err := c.w.Write(p)
@@ -233,17 +290,12 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func validVolumeName(name string) bool {
-	if name == "" || len(name) > 128 || strings.ContainsAny(name, "/\\\r\n\x00") {
-		return false
-	}
-	return true
-}
-
 type ObjectRef struct {
-	Bucket string
-	Key    string
-	Size   int64
+	Bucket      string
+	Key         string
+	Size        int64
+	Checksum    string
+	ContentType string
 }
 
 func (s *Store) recordStart(ctx context.Context, id, projectID, kind, target, actor string) (*pendingBackup, error) {
@@ -385,29 +437,24 @@ func (s *Store) RestoreMetadata(ctx context.Context, principal identity.Principa
 	if !principal.User.IsSystemAdmin {
 		return "", ErrForbidden
 	}
-	return s.restore(ctx, "", id, "metadata")
+	return s.restore(ctx, "", id, "metadata", newID("restore"))
 }
 
-// RestoreObjectBackup produces an isolated export for this project.
-func (s *Store) RestoreObjectBackup(ctx context.Context, projectID, id string) (string, error) {
+func (s *Store) ExportObjectBackup(ctx context.Context, projectID, id string) (string, error) {
 	if projectID == "" {
 		return "", ErrNotFound
 	}
-	return s.restore(ctx, projectID, id, "objects")
-}
-
-func (s *Store) RestoreVolumeBackup(ctx context.Context, projectID, id string) error {
-	record, err := s.GetBackup(ctx, projectID, id)
+	release, err := s.acquire()
 	if err != nil {
-		return err
+		return "", err
 	}
-	if record.Kind != "volume" {
-		return ErrBadInput
-	}
-	return ErrNotImplemented
+	defer release()
+	ctx, cancel := context.WithTimeout(ctx, transferTimeout)
+	defer cancel()
+	return s.restore(ctx, projectID, id, "objects", newID("restore"))
 }
 
-func (s *Store) restore(ctx context.Context, projectID, id, kind string) (location string, resultErr error) {
+func (s *Store) restore(ctx context.Context, projectID, id, kind, destinationID string) (location string, resultErr error) {
 	record, err := s.GetBackup(ctx, projectID, id)
 	if err != nil {
 		return "", err
@@ -429,7 +476,7 @@ func (s *Store) restore(ctx context.Context, projectID, id, kind string) (locati
 		return "", err
 	}
 	defer root.Close()
-	dir := filepath.Join("restores", newID("restore"))
+	dir := filepath.Join("restores", destinationID)
 	if err := root.Mkdir(dir, 0700); err != nil {
 		return "", err
 	}

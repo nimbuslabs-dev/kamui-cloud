@@ -247,7 +247,7 @@ func (a *app) storeCommand() *cobra.Command {
 				return failure(1, "upload_failed", "cannot read the file")
 			}
 			result, err := client.rawRequest(cmd.Context(), "PUT",
-				svcProjectPath("/buckets/"+args[0]+"/objects/"+args[1]), data)
+				storeObjectPath(args[0], args[1]), data)
 			if err != nil {
 				return err
 			}
@@ -262,7 +262,7 @@ func (a *app) storeCommand() *cobra.Command {
 				return err
 			}
 			data, err := client.rawRequest(cmd.Context(), "GET",
-				svcProjectPath("/buckets/"+args[0]+"/objects/"+args[1]), nil)
+				storeObjectPath(args[0], args[1]), nil)
 			if err != nil {
 				return err
 			}
@@ -276,17 +276,22 @@ func (a *app) storeCommand() *cobra.Command {
 	object.AddCommand(&cobra.Command{
 		Use: "list BUCKET", Short: "List objects", Args: usageArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return a.serviceSend(cmd, "GET", svcProjectPath("/buckets/"+args[0]+"/objects"), nil)
+			return a.serviceSend(cmd, "GET", svcProjectPath("/buckets/"+url.PathEscape(args[0])+"/objects"), nil)
 		},
 	})
 	object.AddCommand(&cobra.Command{
 		Use: "delete BUCKET KEY", Short: "Delete an object", Args: usageArgs(cobra.ExactArgs(2)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return a.serviceSend(cmd, "DELETE", svcProjectPath("/buckets/"+args[0]+"/objects/"+args[1]), nil)
+			return a.serviceSend(cmd, "DELETE", storeObjectPath(args[0], args[1]), nil)
 		},
 	})
 	group.AddCommand(object)
 	return group
+}
+
+func storeObjectPath(bucket, key string) string {
+	encodedKey := (&url.URL{Path: key}).EscapedPath()
+	return svcProjectPath("/buckets/" + url.PathEscape(bucket) + "/objects/" + encodedKey)
 }
 
 // --- Backup ------------------------------------------------------------------
@@ -306,6 +311,30 @@ func (a *app) backupCommand() *cobra.Command {
 			return a.serviceSend(cmd, "POST", svcProjectPath("/backups/objects"), map[string]any{})
 		},
 	})
+	var volume string
+	volumeBackup := &cobra.Command{
+		Use: "volume", Short: "Back up an offline managed volume on its assigned Docker engine", Args: usageArgs(cobra.NoArgs),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if volume == "" {
+				return failure(2, "usage", "--volume is required")
+			}
+			return a.serviceSend(cmd, "POST", svcProjectPath("/backups/volume"), map[string]string{"volume": volume})
+		},
+	}
+	volumeBackup.Flags().StringVar(&volume, "volume", "", "Managed volume name")
+	create.AddCommand(volumeBackup)
+	group.AddCommand(&cobra.Command{
+		Use: "restore-status ID", Short: "Inspect a durable project restore operation", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "GET", "/v1/backup-restores/"+url.PathEscape(args[0])+svcProjectSuffix(), nil)
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use: "restore-list BACKUP", Short: "List recent restore operations for a project backup", Args: usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.serviceSend(cmd, "GET", "/v1/backups/"+url.PathEscape(args[0])+"/restores"+svcProjectSuffix(), nil)
+		},
+	})
 	group.AddCommand(&cobra.Command{
 		Use: "list", Short: "List project backups, or coordinator metadata backups (admin)", Args: usageArgs(cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -316,13 +345,28 @@ func (a *app) backupCommand() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return a.serviceSend(cmd, "GET", "/v1/backups/"+url.PathEscape(args[0])+svcProjectSuffix(), nil)
 		},
-	}, &cobra.Command{
-		Use: "restore BACKUP", Aliases: []string{"restore-objects"}, Short: "Restore into a server-generated isolated export",
+	})
+	var export bool
+	restore := &cobra.Command{
+		Use: "restore BACKUP", Aliases: []string{"restore-objects"}, Short: "Restore into new project storage or export a coordinator snapshot",
 		Args: usageArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return a.serviceSend(cmd, "POST", "/v1/backups/"+url.PathEscape(args[0])+"/restore"+svcProjectSuffix(), nil)
+			query := url.Values{}
+			if project := svcProject(); project != "" {
+				query.Set("project_id", project)
+			}
+			if export {
+				query.Set("mode", "export")
+			}
+			path := "/v1/backups/" + url.PathEscape(args[0]) + "/restore"
+			if len(query) != 0 {
+				path += "?" + query.Encode()
+			}
+			return a.serviceSend(cmd, "POST", path, nil)
 		},
-	})
+	}
+	restore.Flags().BoolVar(&export, "export", false, "Export a verified object archive into coordinator storage")
+	group.AddCommand(restore)
 	return group
 }
 

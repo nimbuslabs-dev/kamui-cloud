@@ -7,24 +7,27 @@ Reviewed baseline `f15b8a81c447521fd6e9a967d1ac2f070e34e24e`. These checks use d
 | BAK-01 | Backup project and administrator authorization | PASS. Two independent users exercise inspection, content download, restore and listing. The baseline failed the isolation regression. Project-scoped queries now require an exact match. |
 | BAK-02 | Restore destination, archive and integrity safety | PASS. Fixture tests restore two isolated exports, compare SQLite snapshot bytes by SHA-256, reject link entries and a corrupt checksum, and verify cleanup. The export location is selected by the coordinator. |
 | BAK-03 | Backup identity and creation | PASS. Tests create independent object and metadata backup records. IDs now use random entropy and storage writes are exclusive. Object enumeration paginates and propagates read errors. |
-| BAK-04 | Managed Docker-volume restore and project object import | PARTIAL. Object restore produces an isolated export. Managed volume restore reports HTTP 501, and the standard coordinator has no volume export adapter. Live Docker volume and object import acceptance were not run. |
+| BAK-04 | Managed Docker-volume restore and project object import | PASS for coordinator-managed local Docker volumes and local project object storage. The authenticated manager bridge exported an offline Docker volume, restored it to a fresh volume, and reread its bytes, UID, GID and mode. Project object import into new buckets preserved the checksum, key, content type and empty buckets. |
 | ML-01 | Training, checkpoint and model artifact ownership | PASS. Store tests reject foreign training jobs, mismatched checkpoints, wrong-kind and cross-project artifacts, fabricated IDs, a conflicting client digest and a corrupt blob. Successful model registration derives bytes and digest from the artifact record. |
 | ML-02 | Model parent foreign key | PASS. A v6 migration preserves rows from v4 and v5, normalizes absent parents to SQL NULL, and verifies that FK enforcement is active after upgrade. |
 | ML-03 | Functional resume and model serving | PARTIAL. Resume validates ownership and integrity and returns HTTP 501. The deterministic resume and real model-output acceptance scenarios were not run. |
 
 ## Remaining priority order
 
-1. Implement managed volume restore and project object import. Check volume ownership, locality and operation recovery before enabling volume export or restore.
-2. Verify real deterministic checkpoint resume and remote artifact registration. Verify model-derived output from a supported CPU inference adapter.
-3. Verify Deploy Git builds and staged traffic activation, rollback and failure preservation across restart.
-4. Verify database-native backup and isolated restore, including project secret resolution, placement and same-name isolation.
-5. Verify S3 cancellation and multipart behavior against an isolated service. Audit Workspace idle and routing lifecycle, then the remaining backend modules and transaction boundaries.
+1. ML-03. Stage a verified checkpoint on the assigned executor, register remote outputs, and prove deterministic resume and model-derived CPU inference.
+2. Verify Deploy Git builds and staged traffic activation, rollback and failure preservation across restart.
+3. Verify database-native backup and isolated restore, including project secret resolution, placement and same-name isolation.
+4. Verify S3 cancellation and multipart behavior against an isolated service. Audit Workspace idle and routing lifecycle, then the remaining backend modules and transaction boundaries.
 
 ## Executed checks
 
-API and CLI package tests, race tests and vet passed. Rust agent tests reported 10 unit and 1 integration test passing. Rust formatting and strict Clippy failed on existing Rust code. The change set contains no Rust source edits. Compose configuration and isolated Docker Nginx syntax validation passed.
+The BAK-04 Docker Engine round trip produced the same SHA-256 on both volumes, `b4691d93d4b95b2e5dc39fafb62bd5b84c78458256bb1f25a934a34a788ac2d8`. The local object-store round trip produced `4ab2143d5c4592799dc26553eac9ba7252b5081d5235d3a0d546eeedfead6cc1` in both buckets. Regression tests cover project isolation, corrupt archives, links, cancellation, quota rechecks and cleanup after restart. The Docker test rejects an in-use source, a foreign project, a mismatched engine and a missing pinned volume. Unrelated workloads can start while a transfer is active. The Docker Nginx test forwarded the escaped key verbatim and rejected writes on the read-only object route.
 
-The backup and ML tests use temporary local SQLite and filesystem fixtures. The two-user backup test exercises handler authorization directly with independent principals. Physical distributed tests, isolated Docker volume restore, S3 live acceptance, deterministic training resume, real model inference, Deploy A/B/rollback, and native PostgreSQL record comparison are NOT RUN.
+API and CLI package tests, race checks and `go vet` passed. The read-only Linux Workspace Manager restored and reread the fixture through its authenticated bridge using the dedicated scratch volume. The isolated Compose workspace suite passed HTTPS, auth, CSRF, workspace isolation, Git with a disposable bare remote, restart and retention using freshly built API and Workspace Manager images.
+
+Volume backup requires a stopped source workload and a managed volume pinned to the current coordinator Docker engine. Existing unverified Docker names require operator migration before new mounts or backup. Volume archives accept regular files and directories. A manager interruption can leave a stopped export helper, reclaimed on the next export of its source. Project object import requires the local object backend. S3-backed installations can request a verified filesystem export with `mode=export`. Remote-worker volume backup and restore are outside this checkpoint.
+
+The earlier Rust checkpoint reported 10 unit and 1 integration test passing, with formatting and strict Clippy failures. Physical distributed tests, S3 live acceptance, deterministic training resume, real model inference, Deploy A/B rollback and native PostgreSQL record comparison remain NOT RUN at this checkpoint.
 
 ## Confirmed by current source and still open
 

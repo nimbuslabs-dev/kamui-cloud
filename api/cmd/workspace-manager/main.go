@@ -188,6 +188,7 @@ func managerRouter(wm *WorkspaceManager, token string) http.Handler {
 		if err != nil {
 			panic(err)
 		}
+		executor.SetBackupHelperImage(wm.image)
 		mux.Handle("/internal/core/docker/", auth.Middleware(token)(core.BridgeHandler(executor)))
 	}
 	return mux

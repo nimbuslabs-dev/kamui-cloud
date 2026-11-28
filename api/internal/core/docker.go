@@ -18,6 +18,7 @@ import (
 	"github.com/distribution/reference"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/errdefs"
@@ -39,11 +40,14 @@ type ExecutionRef struct {
 
 // VolumeBinding mounts a managed named volume at an in-container path.
 type VolumeBinding struct {
-	Name   string `json:"name"`
-	Target string `json:"target"`
+	Name            string `json:"name"`
+	Target          string `json:"target"`
+	RequireExisting bool   `json:"require_existing,omitempty"`
+	noCopy          bool
 }
 
 type ContainerSpec struct {
+	ProjectID   string            `json:"project_id,omitempty"`
 	Image       string            `json:"image"`
 	Args        []string          `json:"args"`
 	CPUMillis   int64             `json:"cpu_millis"`
@@ -66,13 +70,14 @@ type ContainerSpec struct {
 }
 
 type ExecutionStatus struct {
-	Exists     bool      `json:"exists"`
-	Started    bool      `json:"started"`
-	Running    bool      `json:"running"`
-	Unhealthy  bool      `json:"unhealthy"`
-	ExitCode   int       `json:"exit_code"`
-	StartedAt  time.Time `json:"started_at"`
-	FinishedAt time.Time `json:"finished_at"`
+	Exists         bool      `json:"exists"`
+	ManagedVolumes bool      `json:"managed_volumes,omitempty"`
+	Started        bool      `json:"started"`
+	Running        bool      `json:"running"`
+	Unhealthy      bool      `json:"unhealthy"`
+	ExitCode       int       `json:"exit_code"`
+	StartedAt      time.Time `json:"started_at"`
+	FinishedAt     time.Time `json:"finished_at"`
 }
 
 type DockerCapacity struct {
@@ -87,9 +92,12 @@ type DockerExecutor struct {
 	client *client.Client
 	scope  string
 	// outputRoot stages declared workload outputs; nil disables output mounts.
-	outputRoot string
+	outputRoot        string
+	backupHelperImage string
 	// Serialize inspect-and-mutate operations so a second Start cannot restart a completed attempt.
 	mutations sync.Mutex
+	// Guarded by mutations. No mutex is held while the archive streams.
+	volumeInTransfer string
 }
 
 func NewDockerExecutor(cli *client.Client, scope string) (*DockerExecutor, error) {
@@ -259,6 +267,23 @@ func (d *DockerExecutor) Create(ctx context.Context, ref ExecutionRef, spec Cont
 			}
 		}
 	}
+	if len(spec.Volumes) != 0 {
+		physical := make([]VolumeBinding, 0, len(spec.Volumes))
+		for _, binding := range spec.Volumes {
+			name, err := d.prepareWorkloadVolume(ctx, BackupVolumeRef{ProjectID: spec.ProjectID, Name: binding.Name}, binding.RequireExisting)
+			if err != nil {
+				if errors.Is(err, errVolumeTransferBusy) {
+					return err
+				}
+				if errors.Is(err, ErrBackupVolumeConflict) || errors.Is(err, ErrBackupVolumeNotFound) {
+					return fmt.Errorf("%w: prepare managed volume: %w", ErrInvalidContainer, err)
+				}
+				return fmt.Errorf("prepare managed volume: %w", err)
+			}
+			physical = append(physical, VolumeBinding{Name: name, Target: binding.Target, noCopy: binding.RequireExisting || restoreVolumeRE.MatchString(binding.Name)})
+		}
+		spec.Volumes = physical
+	}
 	cfg, host := d.containerConfig(ref, spec, image.ID)
 	// The engine computes the user: forced nonroot for user workloads, the
 	// image default for declared managed infrastructure.
@@ -301,9 +326,13 @@ func (d *DockerExecutor) containerConfig(ref ExecutionRef, spec ContainerSpec, i
 			scopeLabel: d.scope, workloadLabel: ref.WorkloadID, attemptLabel: strconv.Itoa(ref.Attempt),
 		},
 	}
-	volumeBinds := []string{}
+	if len(spec.Volumes) != 0 {
+		cfg.Labels[managedVolumeMountLabel] = "1"
+	}
+	volumeMounts := make([]mount.Mount, 0, len(spec.Volumes))
 	for _, volume := range spec.Volumes {
-		volumeBinds = append(volumeBinds, fmt.Sprintf("%s:%s", volume.Name, volume.Target))
+		volumeMounts = append(volumeMounts, mount.Mount{Type: mount.TypeVolume, Source: volume.Name, Target: volume.Target,
+			VolumeOptions: &mount.VolumeOptions{NoCopy: volume.noCopy}})
 	}
 	outputBinds := []string{}
 	if len(spec.Outputs) > 0 && d.outputRoot != "" {
@@ -320,7 +349,8 @@ func (d *DockerExecutor) containerConfig(ref ExecutionRef, spec ContainerSpec, i
 		ReadonlyRootfs: true,
 		CapDrop:        []string{"ALL"},
 		SecurityOpt:    []string{"no-new-privileges:true"},
-		Binds:          append(volumeBinds, outputBinds...),
+		Binds:          outputBinds,
+		Mounts:         volumeMounts,
 		Tmpfs:          map[string]string{"/tmp": "rw,nosuid,nodev,noexec,size=32m,mode=1777"},
 		Resources: container.Resources{
 			NanoCPUs: spec.CPUMillis * 1_000_000, Memory: spec.MemoryBytes, MemorySwap: spec.MemoryBytes,
@@ -344,6 +374,11 @@ func (d *DockerExecutor) Start(ctx context.Context, ref ExecutionRef) error {
 	if inspected.State.Running || inspected.State.Status != "created" {
 		return nil
 	}
+	for _, attached := range inspected.Mounts {
+		if attached.Type == mount.TypeVolume && attached.Name == d.volumeInTransfer {
+			return errVolumeTransferBusy
+		}
+	}
 	if err := d.client.ContainerStart(ctx, inspected.ID, container.StartOptions{}); err != nil {
 		return fmt.Errorf("start workload container: %w", err)
 	}
@@ -359,7 +394,8 @@ func (d *DockerExecutor) Inspect(ctx context.Context, ref ExecutionRef) (Executi
 	startedAt, _ := time.Parse(time.RFC3339Nano, state.StartedAt)
 	finishedAt, _ := time.Parse(time.RFC3339Nano, state.FinishedAt)
 	return ExecutionStatus{
-		Exists: true, Started: state.Status != "created", Running: state.Running,
+		Exists: true, ManagedVolumes: inspected.Config.Labels[managedVolumeMountLabel] == "1",
+		Started: state.Status != "created", Running: state.Running,
 		Unhealthy: state.Paused || state.Restarting || (state.Health != nil && state.Health.Status == container.Unhealthy),
 		ExitCode:  state.ExitCode, StartedAt: startedAt, FinishedAt: finishedAt,
 	}, nil

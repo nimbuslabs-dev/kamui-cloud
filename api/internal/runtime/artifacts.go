@@ -519,6 +519,38 @@ func (s *Store) VolumeOwner(ctx context.Context, projectID, name string) (string
 	return workerID, err
 }
 
+func (s *Store) VolumeEngine(ctx context.Context, projectID, name string) (string, error) {
+	var engine string
+	err := s.db.QueryRowContext(ctx, "SELECT engine_id FROM volume_placements WHERE project_id=? AND name=?", projectID, name).Scan(&engine)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return engine, err
+}
+
+func (s *Store) RecordLocalVolumePlacement(ctx context.Context, projectID, name, engineID string, sizeBytes int64) error {
+	if engineID == "" {
+		return ErrBadInput
+	}
+	now := s.now().UnixNano()
+	result, err := s.db.ExecContext(ctx, `INSERT INTO volume_placements(project_id,name,worker_id,size_bytes,created_at,last_used_at,engine_id)
+	  VALUES(?,?,?,?,?,?,?) ON CONFLICT(project_id,name) DO UPDATE SET
+	  last_used_at=excluded.last_used_at, size_bytes=MAX(volume_placements.size_bytes,excluded.size_bytes),engine_id=excluded.engine_id
+	  WHERE volume_placements.worker_id=excluded.worker_id AND volume_placements.engine_id IN ('',excluded.engine_id)`,
+		projectID, name, core.LocalWorker, sizeBytes, now, now, engineID)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return ErrConflict
+	}
+	return nil
+}
+
 // RecordVolumePlacement pins a volume to a worker on first use and refreshes
 // last_used on subsequent assignments.
 func (s *Store) RecordVolumePlacement(ctx context.Context, projectID, name, workerID string, sizeBytes int64) error {
@@ -526,11 +558,21 @@ func (s *Store) RecordVolumePlacement(ctx context.Context, projectID, name, work
 		return fmt.Errorf("%w: volume placement requires a name and worker", ErrBadInput)
 	}
 	now := s.now().UnixNano()
-	_, err := s.db.ExecContext(ctx,
+	result, err := s.db.ExecContext(ctx,
 		"INSERT INTO volume_placements(project_id,name,worker_id,size_bytes,created_at,last_used_at) VALUES(?,?,?,?,?,?) "+
-			"ON CONFLICT(project_id,name) DO UPDATE SET last_used_at=excluded.last_used_at, size_bytes=MAX(COALESCE(size_bytes,0), excluded.size_bytes)",
+			"ON CONFLICT(project_id,name) DO UPDATE SET last_used_at=excluded.last_used_at, size_bytes=MAX(COALESCE(size_bytes,0), excluded.size_bytes) WHERE volume_placements.worker_id=excluded.worker_id",
 		projectID, name, workerID, sizeBytes, now, now)
-	return err
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return fmt.Errorf("%w: volume placement belongs to another worker", ErrConflict)
+	}
+	return nil
 }
 
 // ListVolumePlacements returns placement records for a project.

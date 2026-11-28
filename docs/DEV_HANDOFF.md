@@ -8,7 +8,7 @@
 
 ## Independent backend audit checkpoint
 
-See [backend acceptance](BACKEND_ACCEPTANCE.md) for current results and the ordered remediation backlog. Backup inspection, download, listing and restore require an explicit project scope. Omitting it selects administrator-only coordinator metadata. Restore publishes a checksum-verified isolated filesystem export and returns a path relative to the coordinator storage root. Project object import and actual volume restore remain open.
+BAK-04 adds checksum-verified restore into new local project buckets or a fresh managed Docker volume on the original engine. Backup inspection, download, listing and restore require `project_id` for project records. Omitting it selects administrator-only coordinator metadata. Metadata restore and `backup restore --export` publish a verified filesystem export and return a path relative to coordinator storage. The ordered backlog resumes with ML-03. See [backend acceptance](BACKEND_ACCEPTANCE.md).
 
 ## Completed Phases
 
@@ -22,7 +22,7 @@ See [backend acceptance](BACKEND_ACCEPTANCE.md) for current results and the orde
 | Shared prerequisites | ✅ Complete | Artifacts, secrets, registry scoping, volume locality, routes |
 | **08: Workspace backend** | ✅ **Complete** | MVP retained; bounded logs added; remote IDE routing via tunnel ✅ |
 | **09: Deploy** | PARTIAL | Build and release code exists. Candidate readiness, Git-source release and rollback remain under audit. |
-| **10: Store + Backup** | PARTIAL | Scoped, isolated backup exports. Managed volume restore, live object import and native database restore acceptance are pending. |
+| **10: Store + Backup** | PARTIAL | Local project object import and managed Docker volume restore verified. Live S3 and assigned-worker PostgreSQL restore acceptance remain pending. |
 | **11: Train** | PARTIAL | Artifact ownership and integrity verified. Checkpoint resume execution is unavailable. |
 | **12: Infer** | PARTIAL | Authenticated proxy transport exists. Runtime-specific model loading remains unverified. |
 | **13: Collaboration** | ✅ **Complete** | Quotas with enforcement, usage accounting, role-preserving sharing |
@@ -129,11 +129,11 @@ forwards the inference proxy only. For JSON endpoints, use
 **Completed this checkpoint (Phase 10):**
 - S3-compatible object storage backend (AWS SDK v2, MinIO compatible)
 - Automated object backup (tar bundles with SHA-256) and restore to isolated directories
-- Docker-volume backup has no coordinator adapter. Volume restore is unavailable.
+- Managed volumes can be backed up while offline and restored to a new logical `rst-…` volume on the original coordinator Docker engine. The manager has a dedicated archive scratch volume in Compose. Raw legacy named volumes stay in place and require an explicit migration before new mounts or backup.
 - PostgreSQL-native backup (pg_dump -Fc) and restore (pg_restore -Fc) via docker exec
 - **VERIFIED**: Database restore defaults to ISOLATED restore (creates restore_<name>_<timestamp>, runs pg_restore -Fc -d <isolated>, verifies table count)
 - **VERIFIED**: Force restore (?force=true) requires system admin authorization, runs pg_restore -Fc -c -d <existing>
-- CLI command: `kamui-cloud backup restore BACKUP --project PROJECT` exports a project archive.
+- CLI commands: `kamui-cloud backup create volume --volume NAME --project PROJECT`, `backup restore BACKUP --project PROJECT`, `backup restore-status RESTORE --project PROJECT`, and `backup restore-list BACKUP --project PROJECT`. Use `backup restore BACKUP --project PROJECT --export` for a verified filesystem export of an object archive. Native volume backup defaults to the locally available `busybox:1.37` helper, or an operator can set `KAMUI_BACKUP_HELPER_IMAGE`.
 - CLI commands: `kamui-cloud database backup`, `kamui-cloud database restore [--force]`
 - OpenAPI contracts updated for new backup/restore endpoints with force parameter
 - All tests pass (unit + integration)
@@ -330,7 +330,7 @@ These are marked **BLOCKED** per requirements — implementation is complete, li
 ### Phase 10: Store + Backup (this checkpoint)
 - `api/internal/objectstore/s3.go` — New: S3-compatible backend using AWS SDK v2 (MinIO, AWS S3 compatible)
 - `api/internal/objectstore/store.go` — Added `NewS3BackendFromConfig`, `S3Config` types
-- `api/internal/backup/backup.go` — Object backups are tar bundles with SHA-256; object restore creates an isolated export, and managed volume restore returns HTTP 501
+- `api/internal/backup/backup.go` and `operations.go` — Verified filesystem exports and durable local project imports and Docker volume restores. Partially staged data is cleaned after failure or restart.
 - `api/internal/ops/ops.go` — Added `DatabaseBackup` (pg_dump -Fc), `DatabaseRestore` (pg_restore -Fc) via docker exec; **verified: defaults to isolated restore, force parameter for destructive overwrite**
 - `api/internal/http/services.go` — Added `BackupDatabase`, `RestoreDatabase`, `RestoreBackup` handlers; force parameter for destructive restore requires system admin
 - `api/internal/config/config.go` — Added S3 config: `S3Region`, `S3Endpoint`, `S3Bucket`, `S3AccessKeyID`, `S3SecretAccessKey`, `S3UsePathStyle`, `S3RootPrefix`
@@ -525,9 +525,7 @@ Phase 15: Drop — Approval-gated transfers with checksums and expiry.
 
 ## Remote Commit SHA
 
-```
-ff16aa591c4afb8207bc8daae8b2ac31e8d613b1 (HEAD -> feat/mobile-workspace-mvp, origin/feat/mobile-workspace-mvp)
-```
+Use `git ls-remote origin refs/heads/feat/mobile-workspace-mvp` to read the current verified remote ref. The independent recovery baseline for this remediation was `d2c11f79e8ce3e5d153ef374e674bc338223b40b`.
 
 ---
 
@@ -541,4 +539,4 @@ To resume work:
 5. Install Tailscale daemon to unblock remote connectivity verification
 6. Commit and push coherent checkpoints to `feat/mobile-workspace-mvp`
 
-All implementation is complete and tested. Ready for commit/push.
+Continue from the first open item in [backend acceptance](BACKEND_ACCEPTANCE.md).
