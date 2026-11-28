@@ -16,7 +16,7 @@
 | 06: Distributed Worker Agent | ✅ Complete | Enrollment, worker protocol, real Docker execution |
 | 07: Intelligent Scheduler | ✅ Complete | Placement modes, explainable scoring, durable scheduling |
 | Shared prerequisites | ✅ Complete | Artifacts, secrets, registry scoping, volume locality, routes |
-| **08: Workspace backend** | ✅ **Complete** | MVP retained; bounded logs added; remote IDE routing BLOCKED |
+| **08: Workspace backend** | ✅ **Complete** | MVP retained; bounded logs added; remote IDE routing via tunnel ✅ |
 | **09: Deploy** | ✅ **Complete** | Real builds, revisions, rollback, HMAC webhooks; runtime releases |
 | **10: Store + Backup** | ✅ **Complete** | Object storage with quotas; consistent metadata snapshots |
 | **11: Train** | ✅ **Complete** | Real CPU training verified; metrics from the process only |
@@ -24,6 +24,7 @@
 | **13: Collaboration** | ✅ **Complete** | Quotas with enforcement, usage accounting, role-preserving sharing |
 | **14: SRE + Databases** | ✅ **Complete** | Alert rules with dedup; PostgreSQL lifecycle verified live |
 | **15: Drop** | ✅ **Complete** | Approval-gated transfers with checksums and expiry |
+| **Routing completion** | ✅ **Complete** | Deploy HTTP proxy + Workspace IDE WebSocket proxy over authenticated tunnel |
 | 16 (UI) | Deferred | Frontend freeze; see docs/UI_INTEGRATION_HANDOFF.md |
 | 17 (checkpoint) | ✅ This commit | Backend-only integration checkpoint |
 
@@ -101,7 +102,7 @@ forwards the inference proxy only. For JSON endpoints, use
 
 ## Known limitations and BLOCKED items
 
-1. Inference GET/POST proxying now uses the outbound worker service tunnel. Tests cover framed HTTP and fence rejection. A separate-host Docker run over TLS remains BLOCKED pending a reachable worker test deployment. Workspace IDE and Deploy HTTP routes and Workspace idle shutdown remain open.
+1. Inference GET/POST proxying now uses the outbound worker service tunnel. Tests cover framed HTTP and fence rejection. A separate-host Docker run over TLS remains BLOCKED pending a reachable worker test deployment.
 2. Remote worker output registration is PARTIAL: the agent stages outputs
    locally; `/collect` covers local-executor workloads.
 3. Real model serving (Infer) needs an actual model runtime/model — BLOCKED
@@ -113,6 +114,11 @@ forwards the inference proxy only. For JSON endpoints, use
 7. Managed databases intentionally run their official image user with narrow
    CHOWN/FOWNER/DAC_OVERRIDE/SETUID/SETGID capabilities for state
    initialization; ordinary workloads remain fully hardened nonroot.
+
+**Completed this checkpoint:**
+- Workspace IDE WebSocket proxy over authenticated worker tunnel ✅
+- Deploy HTTP routing over authenticated worker tunnel ✅
+- Configurable workspace idle shutdown (auto + manual trigger) ✅
 
 
 ---
@@ -281,6 +287,15 @@ These are marked **BLOCKED** per requirements — implementation is complete, li
 ### Ops/Config
 - `ops/docker-compose.yml` — KAMUI_ADMIN_PASSWORD, KAMUI_CLI_PORT env vars
 - `ops/nginx/cli-proxy.conf` — Added identity/connect route patterns to allowlist
+
+### Routing completion (this checkpoint)
+- `api/internal/http/deploy.go` — Added `ProxyDeployment` handler for remote deploy service proxy via worker tunnel
+- `api/internal/http/workspaces.go` — Added `ProxyIDE` handler for workspace IDE WebSocket/HTTP proxy via worker tunnel; added `IdleShutdown` and background idle checker with `KAMUI_WORKSPACE_IDLE_TIMEOUT`
+- `api/internal/http/router.go` — Registered deploy proxy, workspace IDE proxy, and idle shutdown routes; hub created at top level for shared tunnel access
+- `api/internal/config/config.go` — Added `WorkspaceIdleTimeout` config
+- `api/internal/deploy/deploy.go` — Added `GetDeploymentByPath` method
+- `cli/cmd/kamui-cloud/services.go` — Added `deploy proxy` command with `--method --path --data` flags
+- `cli/cmd/kamui-cloud/workspaces.go` — Added `workspace ide open|request` and `workspace idle-shutdown` commands
 
 ---
 
